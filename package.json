@@ -1,0 +1,29 @@
+{
+  "name": "meshkeep",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted MeshCore companion web client — chat, contacts, channels, and map for your LoRa mesh.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @meshkeep/server",
+    "dev:web": "npm run dev --workspace @meshkeep/web",
+    "dev:mock": "npm run dev:mock --workspace @meshkeep/server",
+    "mock-radio": "npm run mock-radio --workspace @meshkeep/server",
+    "build": "npm run build --workspace @meshkeep/shared && npm run build --workspace @meshkeep/server && npm run build --workspace @meshkeep/web",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "allowScripts": {
+    "@serialport/bindings-cpp@13.0.0": true,
+    "better-sqlite3@12.11.1": true,
+    "esbuild@0.28.1": true,
+    "esbuild@0.25.12": true
+  }
+}

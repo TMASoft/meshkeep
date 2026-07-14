@@ -1,0 +1,24 @@
+# Recommended setup: the companion radio is plugged into this host over USB.
+# Find a stable device path with: ls -l /dev/serial/by-id/
+services:
+  meshkeep:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: meshkeep:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    devices:
+      # replace with your radio's /dev/serial/by-id/... path
+      - /dev/serial/by-id/usb-RAKwireless_WisCore_RAK4631_Board-if00:/dev/ttyMESH
+    environment:
+      MESHKEEP_CONNECTION: serial
+      MESHKEEP_SERIAL_PORT: /dev/ttyMESH
+      # MESHKEEP_UI_PASSWORD: change-me        # optional: require login
+      # MESHKEEP_MAP_REFRESH_MINUTES: "10"
+    volumes:
+      - meshkeep-data:/data
+
+volumes:
+  meshkeep-data:

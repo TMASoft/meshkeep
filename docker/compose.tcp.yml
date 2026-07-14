@@ -1,0 +1,21 @@
+# The radio is attached to another machine (e.g. a Pi) running ser2net,
+# or a WiFi companion firmware exposing TCP. See ser2net.yaml.example.
+services:
+  meshkeep:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: meshkeep:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      MESHKEEP_CONNECTION: tcp
+      MESHKEEP_TCP_HOST: 192.168.1.50   # host running ser2net / WiFi companion
+      MESHKEEP_TCP_PORT: "5000"
+      # MESHKEEP_UI_PASSWORD: change-me
+    volumes:
+      - meshkeep-data:/data
+
+volumes:
+  meshkeep-data:

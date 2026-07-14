@@ -1,0 +1,25 @@
+# BEST-EFFORT: server-side BLE requires a Linux host running BlueZ
+# (bluetoothd) and does NOT work on Docker Desktop for macOS/Windows.
+# Server-side BLE support is planned but not implemented yet — prefer USB
+# (compose.usb.yml) or ser2net/TCP (compose.tcp.yml). Browser-direct
+# Web Bluetooth from Chrome is the recommended way to use a BLE radio.
+services:
+  meshkeep:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: meshkeep:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      MESHKEEP_CONNECTION: ble
+      MESHKEEP_BLE_ADDRESS: "AA:BB:CC:DD:EE:FF"  # radio's BLE MAC
+      # MESHKEEP_UI_PASSWORD: change-me
+    volumes:
+      - meshkeep-data:/data
+      # BlueZ is reached over the host's system D-Bus
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket:ro
+
+volumes:
+  meshkeep-data:

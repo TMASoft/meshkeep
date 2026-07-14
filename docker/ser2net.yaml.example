@@ -1,0 +1,10 @@
+# ser2net config for network-attaching a USB companion radio.
+# Install ser2net on whatever machine the radio is plugged into
+# (apt install ser2net), drop this at /etc/ser2net.yaml, then point
+# MeshKeep at it with MESHKEEP_CONNECTION=tcp MESHKEEP_TCP_HOST=<that host>.
+connection: &meshcore
+  accepter: tcp,5000
+  enable: on
+  options:
+    kickolduser: true
+  connector: serialdev,/dev/serial/by-id/usb-RAKwireless_WisCore_RAK4631_Board-if00,115200n81,local
