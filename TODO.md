@@ -15,8 +15,10 @@ room server login + posts, and repeater admin (login, status readout, remote CLI
 - [ ] Map page: global nodes load, own node + positioned contacts overlaid
 - [ ] Leave running 24h: reconnect-after-unplug works, no drift/memory issues
 - [ ] RF params round-trip on real firmware; contact export/import against the phone app's
-      meshcore:// links; battery chart fills in over a day; login flow with
-      MESHKEEP_UI_PASSWORD; connection override + reset
+      meshcore:// links; login flow with MESHKEEP_UI_PASSWORD in the container
+- [x] Connection override + reset on real hardware (2026-07-15: container switched
+      serial→BLE→serial at runtime); battery telemetry accumulating (198 points/15 h);
+      real-firmware contact export (meshcore:// URI) works
 - [ ] Browser-direct: open via localhost or HTTPS (docs/https.md) in Chromium, Radio →
       Radio source → USB (WebSerial) with the RAK4631 on the browsing machine; verify
       DM send/receive, delivery ticks via sync-back, private session, offline queue
@@ -26,8 +28,8 @@ room server login + posts, and repeater admin (login, status readout, remote CLI
       over BLE — self info (MCTA-Rak, RAK 4631 v1.16.0), battery, channel read. Pairing
       required a reflash first; the radio's PIN was per-device (506819), not 123456.
       Note: firmware reports radioFreq in kHz — unit fix applied to UI + mock.
-- [ ] Server BLE from INSIDE the container (compose.ble.yml with the D-Bus mount) — only
-      validated on the host so far
+- [x] Server BLE from INSIDE the container (2026-07-15: D-Bus mount + runtime override
+      connected to the bonded radio and synced; same mount works for compose.ble.yml)
 - [ ] Server BLE reconnect: power-cycle the radio mid-session, verify it reattaches
 - [ ] DM round-trip over the BLE server link once the reflashed radio has peers again
 - [ ] Room/repeater against real nodes: login to a real repeater (Request status via ⓘ,
