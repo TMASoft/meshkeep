@@ -42,7 +42,9 @@ room server login + posts, and repeater admin (login, status readout, remote CLI
 
 ## Infra / release
 
-- [ ] GitHub repo + CI (typecheck, vitest, docker build)
-- [ ] Publish image to ghcr.io; pin meshcore.js version and add renovate/dependabot
-- [x] Verify the Dockerfile builds clean (`docker build -f docker/Dockerfile .`)
-- [ ] Rebuild the Docker image (node-ble + meshcore.js-in-web were added since the last build)
+- [x] GitHub repo (github.com/TMASoft/meshkeep) — v0.1.0-Beta released 2026-07-15
+- [ ] CI (typecheck, vitest, docker build)
+- [ ] Publish image to ghcr.io; add renovate/dependabot
+- [x] Docker image builds and runs clean (verified at 0.1.0-beta)
+- [ ] NOTE: /mnt/storage is ntfs3 — npm installs hang on it; run npm in a tmpfs dir
+      and copy package-lock.json back (see project memory)
