@@ -1,8 +1,8 @@
 {
   "name": "meshkeep",
-  "version": "0.1.0",
+  "version": "0.1.0-beta",
   "private": true,
-  "description": "Self-hosted MeshCore companion web client — chat, contacts, channels, and map for your LoRa mesh.",
+  "description": "Self-hosted MeshCore companion web client \u2014 chat, contacts, channels, and map for your LoRa mesh.",
   "license": "MIT",
   "type": "module",
   "engines": {

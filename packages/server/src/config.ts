@@ -10,6 +10,7 @@ export interface ServerConfig {
   tcpPort: number;
   bleAddress: string | null;
   uiPassword: string | null;
+  telemetryRetentionDays: number;
   mapRefreshMinutes: number;
   mapUpstream: string;
   mapEnabled: boolean;
@@ -45,6 +46,7 @@ export function loadConfig(): ServerConfig {
     tcpPort: envInt("MESHKEEP_TCP_PORT", 5000),
     bleAddress: env("MESHKEEP_BLE_ADDRESS"),
     uiPassword: env("MESHKEEP_UI_PASSWORD"),
+    telemetryRetentionDays: envInt("MESHKEEP_TELEMETRY_RETENTION_DAYS", 30),
     mapRefreshMinutes: envInt("MESHKEEP_MAP_REFRESH_MINUTES", 10),
     mapUpstream: env("MESHKEEP_MAP_UPSTREAM") ?? "https://map.meshcore.io/api/v1/nodes",
     mapEnabled: env("MESHKEEP_MAP_ENABLED") !== "false",

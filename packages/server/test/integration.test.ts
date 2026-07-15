@@ -17,6 +17,7 @@ function testConfig(port: number): ServerConfig {
     tcpPort: port,
     bleAddress: null,
     uiPassword: null,
+    telemetryRetentionDays: 30,
     mapRefreshMinutes: 10,
     mapUpstream: "https://map.meshcore.io/api/v1/nodes",
     mapEnabled: true,
@@ -76,12 +77,14 @@ describe("mock radio end-to-end", () => {
     expect(status.connection.state).toBe("connected");
     expect(status.self?.name).toBe("MockKeep RAK4631");
     expect(status.self?.firmwareVer).toBe(3);
+    expect(status.self?.manufacturerModel).toBe("MockKeep,RAK4631 firmware");
     expect(status.batteryMilliVolts).toBe(4111);
 
     const contacts = manager.store.getContacts();
-    expect(contacts).toHaveLength(3);
+    expect(contacts).toHaveLength(4);
     expect(contacts.map((c) => c.name)).toContain("Mock Alice");
     expect(contacts.find((c) => c.name === "Mock Repeater")?.type).toBe("repeater");
+    expect(contacts.find((c) => c.name === "Mock Room")?.type).toBe("room");
     expect(contacts.find((c) => c.name === "Mock Alice")?.lat).toBeCloseTo(44.265);
 
     const channels = manager.store.getChannels();
@@ -158,6 +161,113 @@ describe("mock radio end-to-end", () => {
     await waitForState(manager, "connected");
     expect(manager.isStandby()).toBe(false);
   });
+
+  it("round-trips a contact through export and import URIs", async () => {
+    const alice = manager.store.getContacts().find((c) => c.name === "Mock Alice")!;
+
+    const uri = await manager.exportContactUri(alice.publicKey);
+    expect(uri).toMatch(/^meshcore:\/\/[0-9a-f]+$/);
+
+    await manager.removeContact(alice.publicKey);
+    expect(manager.store.getContacts().some((c) => c.publicKey === alice.publicKey)).toBe(false);
+
+    const contacts = await manager.importContactUri(uri);
+    const restored = contacts.find((c) => c.publicKey === alice.publicKey);
+    expect(restored?.name).toBe("Mock Alice");
+    expect(restored?.lat).toBeCloseTo(44.265);
+    expect(manager.store.getContacts().some((c) => c.publicKey === alice.publicKey)).toBe(true);
+  });
+
+  it("rejects malformed contact import URIs", async () => {
+    await expect(manager.importContactUri("meshcore://not-hex")).rejects.toThrow(/not a valid/);
+  });
+
+  it("exports our own identity as a share URI", async () => {
+    const uri = await manager.exportContactUri(null);
+    expect(uri).toMatch(/^meshcore:\/\/[0-9a-f]+$/);
+    // self key is embedded in the advert packet
+    expect(uri).toContain(manager.status().self!.publicKey);
+  });
+
+  it("records telemetry, serves history, and trims old rows", () => {
+    const nowTs = Math.floor(Date.now() / 1000);
+    // battery snapshot from initial sync
+    const points = manager.store.getTelemetry(nowTs - 3600);
+    expect(points.length).toBeGreaterThanOrEqual(1);
+    expect(points.at(-1)?.batteryMv).toBe(4111);
+
+    // a row far outside the retention window is trimmed
+    db.prepare("INSERT INTO telemetry (ts, battery_mv, raw_json) VALUES (?, ?, NULL)").run(
+      nowTs - 90 * 86_400,
+      3900,
+    );
+    const removed = manager.store.trimTelemetry(30);
+    expect(removed).toBe(1);
+    expect(manager.store.getTelemetry(0).every((p) => p.ts > nowTs - 31 * 86_400)).toBe(true);
+  });
+
+  it("applies and clears connection overrides", async () => {
+    const before = manager.connectionSettings();
+    expect(before.override).toBeNull();
+    expect(before.effective.tcpPort).toBe(mock.port);
+
+    // an override pointing at the same mock exercises the reconnect path
+    await manager.setConnectionOverride({ connection: "tcp", tcpHost: "127.0.0.1", tcpPort: mock.port });
+    await waitForState(manager, "connected");
+    const withOverride = manager.connectionSettings();
+    expect(withOverride.override).toEqual({ connection: "tcp", tcpHost: "127.0.0.1", tcpPort: mock.port });
+    expect(manager.status().connection.transport).toBe("tcp");
+
+    await manager.setConnectionOverride(null);
+    await waitForState(manager, "connected");
+    expect(manager.connectionSettings().override).toBeNull();
+  });
+
+  it("logs in to a repeater, reads status, and runs CLI commands", async () => {
+    const repeater = manager.store.getContacts().find((c) => c.name === "Mock Repeater")!;
+
+    // wrong password: no LoginSuccess push, the request times out → false
+    await expect(manager.loginToNode(repeater.publicKey, "wrong")).resolves.toBe(false);
+    // status before login: no response → helpful error
+    await expect(manager.getNodeStatus(repeater.publicKey)).rejects.toThrow(/status request failed/);
+
+    await expect(manager.loginToNode(repeater.publicKey, "letmein")).resolves.toBe(true);
+
+    const status = await manager.getNodeStatus(repeater.publicKey);
+    expect(status.battMilliVolts).toBe(4020);
+    expect(status.noiseFloor).toBe(-105);
+    expect(status.lastRssi).toBe(-78);
+    expect(status.totalUpTimeSecs).toBe(86_400);
+
+    const reply = waitForEvent(
+      bus,
+      (e) => e.type === "message.new" && e.message.direction === "in" && e.message.contactName === "Mock Repeater",
+    );
+    await manager.sendDirectMessage(repeater.publicKey, "ver", true);
+    const event = (await reply) as Extract<WsEvent, { type: "message.new" }>;
+    expect(event.message.text).toContain("MockCore v1.16");
+  }, 15_000);
+
+  it("posts to a room server after login", async () => {
+    const room = manager.store.getContacts().find((c) => c.name === "Mock Room")!;
+
+    // unauthenticated posts are accepted on air but the room stays silent
+    await manager.sendDirectMessage(room.publicKey, "anyone here?");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(
+      manager.store.getConversation({ contactKey: room.publicKey, limit: 10 }).filter((m) => m.direction === "in"),
+    ).toHaveLength(0);
+
+    await expect(manager.loginToNode(room.publicKey, "letmein")).resolves.toBe(true);
+
+    const echoed = waitForEvent(
+      bus,
+      (e) => e.type === "message.new" && e.message.direction === "in" && e.message.contactName === "Mock Room",
+    );
+    await manager.sendDirectMessage(room.publicKey, "hello room");
+    const event = (await echoed) as Extract<WsEvent, { type: "message.new" }>;
+    expect(event.message.text).toBe("room echo: hello room");
+  }, 15_000);
 
   it("persists history across a manager restart", async () => {
     const alice = manager.store.getContacts().find((c) => c.name === "Mock Alice")!;

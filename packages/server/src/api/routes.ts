@@ -3,7 +3,17 @@ import { z } from "zod";
 import type { ConnectionManager } from "../radio/manager.js";
 import { RadioUnavailableError } from "../radio/manager.js";
 import type { MapCache } from "../map/cache.js";
+import type { Bus } from "../bus.js";
 import type { Auth } from "./auth.js";
+import { messagesToCsv } from "./export.js";
+import {
+  ingestContactSchema,
+  ingestContacts,
+  ingestMessageSchema,
+  ingestMessages,
+  ingestSelf,
+  ingestSelfSchema,
+} from "./ingest.js";
 
 function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
   return async (req: Request, res: Response) => {
@@ -22,7 +32,7 @@ function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
   };
 }
 
-export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: Auth): Router {
+export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: Auth, bus: Bus): Router {
   const api = Router();
   api.use(json({ limit: "1mb" }));
 
@@ -90,6 +100,45 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
       res.json({ ok: true });
     }),
   );
+  api.get(
+    "/contacts/:key/export",
+    handle(async (req, res) => {
+      res.json({ uri: await manager.exportContactUri(hexKey(req.params.key)) });
+    }),
+  );
+  api.post(
+    "/contacts/:key/login",
+    handle(async (req, res) => {
+      const { password } = z.object({ password: z.string().min(1).max(15) }).parse(req.body);
+      const ok = await manager.loginToNode(hexKey(req.params.key), password);
+      if (ok) {
+        res.json({ ok: true });
+      } else {
+        res.status(401).json({ error: "login rejected (wrong password or node unreachable)" });
+      }
+    }),
+  );
+  api.get(
+    "/contacts/:key/status",
+    handle(async (req, res) => {
+      res.json({ status: await manager.getNodeStatus(hexKey(req.params.key)) });
+    }),
+  );
+  api.post(
+    "/contacts/:key/cli",
+    handle(async (req, res) => {
+      const { command } = z.object({ command: z.string().min(1).max(2000) }).parse(req.body);
+      const message = await manager.sendDirectMessage(hexKey(req.params.key), command, true);
+      res.status(201).json({ message });
+    }),
+  );
+  api.post(
+    "/contacts/import",
+    handle(async (req, res) => {
+      const { uri } = z.object({ uri: z.string().min(8).max(2048) }).parse(req.body);
+      res.json({ contacts: await manager.importContactUri(uri) });
+    }),
+  );
 
   // ---- messages ----
   api.get(
@@ -97,6 +146,31 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
     handle((req, res) => {
       const limit = z.coerce.number().int().min(1).max(50).default(20).parse(req.query.limit ?? 20);
       res.json({ messages: manager.store.getRecentMessages(limit) });
+    }),
+  );
+  api.get(
+    "/messages/export",
+    handle((req, res) => {
+      const query = z
+        .object({
+          format: z.enum(["csv", "json"]).default("csv"),
+          contact: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
+          channel: z.coerce.number().int().min(0).max(255).optional(),
+        })
+        .parse(req.query);
+      const messages = manager.store.getMessagesForExport({
+        contactKey: query.contact?.toLowerCase(),
+        channelIdx: query.channel,
+      });
+      const stamp = new Date().toISOString().slice(0, 10);
+      if (query.format === "json") {
+        res.setHeader("Content-Disposition", `attachment; filename="meshkeep-messages-${stamp}.json"`);
+        res.json({ exportedAt: Math.floor(Date.now() / 1000), messages });
+      } else {
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename="meshkeep-messages-${stamp}.csv"`);
+        res.send(messagesToCsv(messages));
+      }
     }),
   );
   api.get(
@@ -208,6 +282,23 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
     }),
   );
 
+  api.get(
+    "/device/share",
+    handle(async (_req, res) => {
+      res.json({ uri: await manager.exportContactUri(null) });
+    }),
+  );
+
+  // ---- telemetry ----
+  api.get(
+    "/telemetry",
+    handle((req, res) => {
+      const hours = z.coerce.number().int().min(1).max(24 * 30).default(24).parse(req.query.hours ?? 24);
+      const since = Math.floor(Date.now() / 1000) - hours * 3600;
+      res.json({ points: manager.store.getTelemetry(since) });
+    }),
+  );
+
   // ---- connection ownership ----
   api.post(
     "/connection/release",
@@ -221,6 +312,53 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
     handle(async (_req, res) => {
       await manager.claim();
       res.json({ ok: true, state: manager.getState() });
+    }),
+  );
+  api.get(
+    "/connection/config",
+    handle((_req, res) => {
+      res.json(manager.connectionSettings());
+    }),
+  );
+  api.put(
+    "/connection/config",
+    handle(async (req, res) => {
+      const override = z
+        .object({
+          connection: z.enum(["serial", "tcp", "ble", "none"]),
+          serialPort: z.string().min(1).max(256).nullish(),
+          tcpHost: z.string().min(1).max(256).nullish(),
+          tcpPort: z.number().int().min(1).max(65535).optional(),
+          bleAddress: z.string().regex(/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i).nullish(),
+        })
+        .nullable()
+        .parse(req.body?.override ?? null);
+      await manager.setConnectionOverride(override);
+      res.json({ ...manager.connectionSettings(), state: manager.getState() });
+    }),
+  );
+
+  // ---- ingest (browser-direct sessions sync what they saw back to the server) ----
+  api.post(
+    "/ingest/messages",
+    handle((req, res) => {
+      const { messages } = z.object({ messages: z.array(ingestMessageSchema).max(500) }).parse(req.body);
+      res.json(ingestMessages(manager.store, bus, messages));
+    }),
+  );
+  api.post(
+    "/ingest/contacts",
+    handle((req, res) => {
+      const { contacts } = z.object({ contacts: z.array(ingestContactSchema).max(500) }).parse(req.body);
+      res.json({ upserted: ingestContacts(manager.store, bus, contacts) });
+    }),
+  );
+  api.post(
+    "/ingest/self",
+    handle((req, res) => {
+      const { self } = z.object({ self: ingestSelfSchema }).parse(req.body);
+      ingestSelf(manager.store, bus, self);
+      res.json({ ok: true });
     }),
   );
 

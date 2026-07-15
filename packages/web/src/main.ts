@@ -7,6 +7,24 @@ import MapView from "./views/MapView.vue";
 import DeviceView from "./views/DeviceView.vue";
 import "./style.css";
 
+function savedPreference(key: string, fallback: string): string {
+  try {
+    return localStorage.getItem(key) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+const savedTheme = savedPreference("meshkeep-theme", "system");
+const savedDensity = savedPreference("meshkeep-density", "comfortable");
+document.documentElement.dataset.theme =
+  savedTheme === "system"
+    ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      ? "dark"
+      : "light"
+    : savedTheme;
+document.documentElement.dataset.density = savedDensity;
+
 const router = createRouter({
   history: createWebHistory(),
   routes: [

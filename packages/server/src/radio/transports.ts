@@ -1,34 +1,38 @@
 import { NodeJSSerialConnection, TCPConnection, type Connection } from "@liamcottle/meshcore.js";
-import type { ServerConfig } from "../config.js";
+import type { ConnectionSettings } from "@meshkeep/shared";
+import { BleNodeConnection } from "./ble-connection.js";
 
 export interface TransportTarget {
   transport: "serial" | "tcp" | "ble";
   target: string;
 }
 
-export function describeTarget(config: ServerConfig): TransportTarget | null {
-  switch (config.connection) {
+export function describeTarget(settings: ConnectionSettings): TransportTarget | null {
+  switch (settings.connection) {
     case "serial":
-      if (!config.serialPort) throw new Error("MESHKEEP_SERIAL_PORT is required for serial connections");
-      return { transport: "serial", target: config.serialPort };
+      if (!settings.serialPort) throw new Error("a serial device path is required for serial connections");
+      return { transport: "serial", target: settings.serialPort };
     case "tcp":
-      if (!config.tcpHost) throw new Error("MESHKEEP_TCP_HOST is required for tcp connections");
-      return { transport: "tcp", target: `${config.tcpHost}:${config.tcpPort}` };
+      if (!settings.tcpHost) throw new Error("a TCP host is required for tcp connections");
+      return { transport: "tcp", target: `${settings.tcpHost}:${settings.tcpPort}` };
     case "ble":
-      throw new Error("Server-side BLE is not implemented yet (planned: node-ble over the host D-Bus socket)");
+      if (!settings.bleAddress) throw new Error("a BLE MAC address is required for ble connections");
+      return { transport: "ble", target: settings.bleAddress };
     default:
       return null;
   }
 }
 
-export function createConnection(config: ServerConfig): Connection {
-  switch (config.connection) {
+export function createConnection(settings: ConnectionSettings): Connection {
+  switch (settings.connection) {
     case "serial":
       // baud rate is fixed at 115200 by the companion firmware / meshcore.js
-      return new NodeJSSerialConnection(config.serialPort!);
+      return new NodeJSSerialConnection(settings.serialPort!);
     case "tcp":
-      return new TCPConnection(config.tcpHost!, config.tcpPort);
+      return new TCPConnection(settings.tcpHost!, settings.tcpPort);
+    case "ble":
+      return new BleNodeConnection(settings.bleAddress!);
     default:
-      throw new Error(`Cannot create a connection for transport "${config.connection}"`);
+      throw new Error(`Cannot create a connection for transport "${settings.connection}"`);
   }
 }

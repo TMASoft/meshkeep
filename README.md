@@ -1,22 +1,32 @@
-# 🏰 MeshKeep
+# MeshKeep
 
 A self-hosted, Dockerized web client for [MeshCore](https://meshcore.co.uk) LoRa mesh networks.
 Chat over your mesh from any browser, keep a persistent message history, and see the global
 [map.meshcore.io](https://map.meshcore.io) node map — all served from your own home lab.
 
-Pairs with [hll-meshkeep](https://github.com/anthropic-arroyo/hll-meshkeep), a
-[home-lab-launcher](https://github.com/anthropic-arroyo/home-lab-launcher) plugin that shows
+Pairs with [hll-meshkeep](https://github.com/TMASoft/hll-meshkeep), a
+[home-lab-launcher](https://github.com/TMASoft/home-lab-launcher) plugin that shows
 your recent mesh messages and node status on the launcher dashboard.
 
 ## Features
 
-- **Chat** — direct messages and channels, delivery acks, unread counts, live updates over WebSocket
+- **Responsive interface** — field-ready desktop and mobile layouts with light/dark themes and adjustable density
+- **Comms** — direct messages and channels, delivery acks, unread counts, live updates over WebSocket
+- **Channels** — create, join (paste a shared key), and edit encrypted group channels in-app
+- **Room servers & repeaters** — password login, room posts, repeater status readout, and a
+  remote CLI console (message a repeater to send CLI commands, like the official app)
 - **Persistent history** — messages, contacts, and telemetry stored in SQLite; survives restarts
-- **Map** — global map.meshcore.io mirror (server-side cached, rate-friendly) with your local mesh overlaid
-- **Device control** — node name, location, TX power, adverts, channel config
-- **API tokens** — Bearer-token REST API for integrations (used by the hll-meshkeep plugin)
-- **Radio anywhere** — USB serial on the server, a remote radio via ser2net/TCP, or (planned)
-  browser-direct WebSerial/WebBluetooth
+- **Contact sharing** — copy/import `meshcore://` contact links; remove contacts and reset routes
+- **Network map** — global map.meshcore.io mirror (server-side cached, rate-friendly) with your local mesh overlaid
+- **Radio control** — node identity, RF parameters (freq/BW/SF/CR), location, TX power, adverts,
+  battery history chart, connection ownership, and in-app connection settings
+- **Message export** — download full or per-conversation history as CSV/JSON
+- **Access control** — optional password login plus Bearer-token REST API for integrations
+  (used by the hll-meshkeep plugin)
+- **Radio anywhere** — USB serial on the server, a remote radio via ser2net/TCP, experimental
+  server-side BLE, or **browser-direct**: drive a radio attached to the device you're browsing
+  from (WebSerial/WebBluetooth, Chromium + HTTPS/localhost — see `docs/https.md`), with
+  history synced back to the server or kept private to the session
 
 ## Quick start (USB radio on the Docker host)
 
@@ -25,40 +35,80 @@ A node flashed with MeshCore **Companion (USB serial)** firmware — e.g. a RAK4
 ```sh
 ls -l /dev/serial/by-id/          # find your radio's stable device path
 cp docker/compose.usb.yml compose.yml
-# edit compose.yml: set the devices: entry to your radio's by-id path
+# edit compose.yml: set the devices entry and group_add GID for this host
 docker compose up -d
 ```
 
 Open http://localhost:8080.
+
+The container runs as a non-root user. Set `group_add` to the numeric group that owns the
+serial device on the Docker host:
+
+```sh
+stat -c '%g' /dev/serial/by-id/usb-your-radio
+```
+
+Both values are host-specific — the checked-in file ships placeholders.
+
+## Interface
+
+- **Comms** contains channels and direct-message contacts. On phones, selecting a conversation
+  opens a dedicated thread; use the back control to return to the conversation list. The ⓘ
+  control in a thread shows contact details with share-link, route-reset, CSV-export, and
+  remove actions; the + control above **Contacts** imports a `meshcore://` link, and the +
+  above **Channels** creates or joins a channel (pick a slot, name it, and generate a fresh
+  secret or paste one you were given — copy a channel's secret from its ⓘ panel to invite
+  others). For room servers and repeaters, ⓘ also holds the password login and a live
+  status readout; messages you type to a **repeater** are sent as remote CLI commands.
+- **Network** plots this node and positioned contacts over the cached global MeshCore map.
+- **Radio** shows companion hardware and link status, edits node settings and RF parameters,
+  charts battery history, sends adverts, shares this node as a `meshcore://` link, edits the
+  radio connection, releases or claims the radio, manages API tokens, and exports history.
+  **Radio source** switches between the server's radio and one attached to this browser
+  (WebSerial/WebBLE); browser sessions sync traffic back to the server unless marked private,
+  and queue the sync in IndexedDB while the server is unreachable.
+- **Display settings** are available from the gear control in the desktop rail or mobile header.
+  Theme (`system`, `dark`, or `light`) and density (`comfortable` or `compact`) are saved in
+  the current browser.
+
+In Comms, `Enter` sends a message and `Shift+Enter` inserts a line break.
 
 ### Remote radio (ser2net / WiFi companion)
 
 Radio plugged into a Pi elsewhere? Run ser2net there (see `docker/ser2net.yaml.example`)
 and use `docker/compose.tcp.yml`. WiFi companion firmware works the same way.
 
-### Bluetooth
+### Bluetooth (experimental)
 
-Server-side BLE is planned (Linux/BlueZ hosts only — see `docker/compose.ble.yml` for the caveats).
-For now, use USB or TCP for the server connection; BLE radios are best used with the
-browser-direct mode (coming) or the official mobile app.
+Server-side BLE works on Linux/BlueZ hosts only, over the host's D-Bus socket — see
+`docker/compose.ble.yml`. Pair the radio once on the host with `bluetoothctl` first
+(companion BLE firmware defaults to PIN `123456`); the container reuses the bond.
+Pairing needs a solid signal (RSSI better than about −80 dBm) — connections die before
+the PIN prompt on marginal links. USB and TCP remain the recommended server transports;
+a BLE radio near your *browsing* device is often better served by browser-direct WebBLE.
 
 ## Configuration
 
 | Env var | Default | Purpose |
 | --- | --- | --- |
-| `MESHKEEP_CONNECTION` | – | `serial`, `tcp`, `ble`, or `none` |
+| `MESHKEEP_CONNECTION` | – | `serial`, `tcp`, `ble` (experimental), or `none` |
 | `MESHKEEP_SERIAL_PORT` | – | device path for `serial` |
 | `MESHKEEP_TCP_HOST` / `MESHKEEP_TCP_PORT` | – / `5000` | ser2net or WiFi companion address |
+| `MESHKEEP_BLE_ADDRESS` | – | radio MAC address for `ble` |
 | `MESHKEEP_PORT` | `8080` | HTTP listen port |
 | `MESHKEEP_DATA_DIR` | `/data` | SQLite + caches |
 | `MESHKEEP_UI_PASSWORD` | unset | require login when set; unset = open (LAN use) |
+| `MESHKEEP_TELEMETRY_RETENTION_DAYS` | `30` | trim battery telemetry older than this |
 | `MESHKEEP_MAP_REFRESH_MINUTES` | `10` | min interval between upstream map fetches |
 | `MESHKEEP_MAP_ENABLED` | `true` | set `false` to disable the global map layer |
+
+Connection settings can also be changed at runtime from Radio → Connection; a saved
+override wins over the environment until you reset it.
 
 ## API
 
 REST under `/api/v1` (see `packages/server/src/api/routes.ts`), WebSocket events at `/api/v1/ws`.
-Authenticate with `Authorization: Bearer <token>` — mint tokens on the Device page.
+Authenticate with `Authorization: Bearer <token>` — mint tokens in Radio → API access.
 The two endpoints the hll-meshkeep plugin consumes:
 
 - `GET /api/v1/status` — connection state, node info, battery, counts

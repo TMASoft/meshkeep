@@ -10,8 +10,14 @@ services:
     ports:
       - "8080:8080"
     devices:
-      # replace with your radio's /dev/serial/by-id/... path
-      - /dev/serial/by-id/usb-RAKwireless_WisCore_RAK4631_Board-if00:/dev/ttyMESH
+      # replace with your radio's /dev/serial/by-id/... path, e.g.
+      # /dev/serial/by-id/usb-RAKwireless_WisCore_RAK4631_Board_XXXXXXXXXXXXXXXX-if00
+      - /dev/serial/by-id/usb-your-radio-if00:/dev/ttyMESH
+    # numeric group that owns the serial device on THIS host:
+    #   stat -c '%g' /dev/serial/by-id/usb-your-radio-if00
+    # (often dialout=20 on Debian/Ubuntu, uucp on Arch)
+    group_add:
+      - "20"
     environment:
       MESHKEEP_CONNECTION: serial
       MESHKEEP_SERIAL_PORT: /dev/ttyMESH

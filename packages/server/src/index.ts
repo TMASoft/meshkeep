@@ -36,7 +36,7 @@ app.disable("x-powered-by");
 app.get("/api/healthz", (_req, res) => {
   res.json({ ok: true, version });
 });
-app.use("/api/v1", buildApi(manager, mapCache, auth));
+app.use("/api/v1", buildApi(manager, mapCache, auth, bus));
 
 // serve the built web app when present (production image); dev uses vite
 const webDist = [join(here, "..", "..", "web", "dist"), join(here, "..", "public")].find((dir) =>

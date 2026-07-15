@@ -26,7 +26,11 @@ const CMD = {
   ResetPath: 13,
   SetAdvertLatLon: 14,
   RemoveContact: 15,
+  ExportContact: 17,
+  ImportContact: 18,
   GetBatteryVoltage: 20,
+  SendLogin: 26,
+  SendStatusReq: 27,
   DeviceQuery: 22,
   GetChannel: 31,
   SetChannel: 32,
@@ -45,6 +49,7 @@ const RESP = {
   ChannelMsgRecv: 8,
   CurrTime: 9,
   NoMoreMessages: 10,
+  ExportContact: 11,
   BatteryVoltage: 12,
   DeviceInfo: 13,
   ChannelInfo: 18,
@@ -54,6 +59,8 @@ const PUSH = {
   Advert: 0x80,
   SendConfirmed: 0x82,
   MsgWaiting: 0x83,
+  LoginSuccess: 0x85,
+  StatusResponse: 0x87,
 } as const;
 
 class FrameWriter {
@@ -71,6 +78,10 @@ class FrameWriter {
   u16(value: number): this {
     this.bytes.push(value & 0xff, (value >> 8) & 0xff);
     return this;
+  }
+
+  i16(value: number): this {
+    return this.u16(value < 0 ? value + 0x10000 : value);
   }
 
   u32(value: number): this {
@@ -116,6 +127,8 @@ interface MockContact {
   advLat: number; // degrees * 1e6
   advLon: number;
   echoes: boolean;
+  /** repeater/room admin password; login required before CLI/status/room posts */
+  password?: string;
 }
 
 interface MockChannel {
@@ -157,7 +170,7 @@ export class MockRadio {
   txPower = 22;
   advLat = 44_260_000; // Montpelier-ish, degrees * 1e6
   advLon = -72_580_000;
-  radioFreq = 910_525_000;
+  radioFreq = 910_525; // kHz — real companion firmware reports frequency in kHz
   radioBw = 250_000;
   radioSf = 10;
   radioCr = 5;
@@ -196,8 +209,24 @@ export class MockRadio {
       advLat: 44_300_000,
       advLon: -72_600_000,
       echoes: false,
+      password: "letmein",
+    },
+    {
+      publicKey: keyFromSeed(5),
+      type: 3,
+      flags: 0,
+      outPathLen: 1,
+      name: "Mock Room",
+      lastAdvert: nowSecs() - 120,
+      advLat: 0,
+      advLon: 0,
+      echoes: false,
+      password: "letmein",
     },
   ];
+
+  /** contacts (by pubkey hex) the app has successfully logged in to */
+  private loggedIn = new Set<string>();
 
   channels = new Map<number, MockChannel>([[0, { name: "Public", secret: keyFromSeed(9).subarray(0, 16) }]]);
 
@@ -318,7 +347,7 @@ export class MockRadio {
             .int8(3) // firmwareVer
             .raw(new Uint8Array(6))
             .cstr("1 Jul 2026", 12)
-            .str("MockKeep,RAK4631"),
+            .str("MockKeep,RAK4631\0\0firmware"),
         );
         break;
       case CMD.GetContacts: {
@@ -365,6 +394,45 @@ export class MockRadio {
         this.send(socket, new FrameWriter().byte(RESP.Ok));
         break;
       }
+      case CMD.ExportContact: {
+        // empty body exports our own identity; 32-byte body exports that contact
+        let packet: FrameWriter;
+        if (body.length >= 32) {
+          const key = body.subarray(0, 32);
+          const contact = this.contacts.find((c) => Buffer.from(c.publicKey).equals(key));
+          if (!contact) {
+            this.send(socket, new FrameWriter().byte(RESP.Err).byte(2));
+            break;
+          }
+          packet = this.advertPacket(contact.publicKey, contact.type, contact.advLat, contact.advLon, contact.name);
+        } else {
+          packet = this.advertPacket(this.publicKey, 1, this.advLat, this.advLon, this.name);
+        }
+        this.send(socket, new FrameWriter().byte(RESP.ExportContact).raw(packet.toBuffer()));
+        break;
+      }
+      case CMD.ImportContact: {
+        // parse the mock advert-packet layout produced by ExportContact above
+        if (body.length < 41) {
+          this.send(socket, new FrameWriter().byte(RESP.Err).byte(3));
+          break;
+        }
+        const imported: MockContact = {
+          publicKey: Uint8Array.from(body.subarray(0, 32)),
+          type: body[32],
+          flags: 0,
+          outPathLen: -1,
+          name: body.subarray(41).toString("utf8"),
+          lastAdvert: nowSecs(),
+          advLat: body.readInt32LE(33),
+          advLon: body.readInt32LE(37),
+          echoes: false,
+        };
+        this.contacts = this.contacts.filter((c) => !Buffer.from(c.publicKey).equals(body.subarray(0, 32)));
+        this.contacts.push(imported);
+        this.send(socket, new FrameWriter().byte(RESP.Ok));
+        break;
+      }
       case CMD.GetBatteryVoltage:
         this.send(socket, new FrameWriter().byte(RESP.BatteryVoltage).u16(this.batteryMv));
         break;
@@ -399,6 +467,7 @@ export class MockRadio {
       }
       case CMD.SendTxtMsg: {
         // [txtType, attempt, u32 senderTimestamp, 6b pubKeyPrefix, text]
+        const txtType = body[0];
         const senderTimestamp = body.readUInt32LE(2);
         const prefix = body.subarray(6, 12);
         const text = body.subarray(12).toString("utf8");
@@ -407,12 +476,13 @@ export class MockRadio {
         const contact = this.contacts.find((c) => Buffer.from(c.publicKey.subarray(0, 6)).equals(prefix));
         this.later(this.echoDelayMs, () => {
           this.pushToAll(new FrameWriter().byte(PUSH.SendConfirmed).u32(ackCrc).u32(this.echoDelayMs));
-          if (contact?.echoes) {
+          const reply = contact ? this.replyFor(contact, txtType, text) : null;
+          if (contact && reply !== null) {
             this.later(this.echoDelayMs, () => {
               this.queue.push({
                 kind: "dm",
                 from: contact,
-                text: `echo: ${text}`,
+                text: reply,
                 senderTimestamp: nowSecs(),
                 pathLen: 0xff,
               });
@@ -420,6 +490,55 @@ export class MockRadio {
             });
           }
         });
+        break;
+      }
+      case CMD.SendLogin: {
+        // [32B pubkey][password]
+        const key = body.subarray(0, 32);
+        const password = body.subarray(32).toString("utf8");
+        const contact = this.contacts.find((c) => Buffer.from(c.publicKey).equals(key));
+        this.send(socket, new FrameWriter().byte(RESP.Sent).int8(0).u32(0).u32(600));
+        if (contact?.password !== undefined && contact.password === password) {
+          this.loggedIn.add(Buffer.from(contact.publicKey).toString("hex"));
+          this.later(120, () => {
+            this.pushToAll(
+              new FrameWriter().byte(PUSH.LoginSuccess).byte(0).raw(contact.publicKey.subarray(0, 6)),
+            );
+          });
+        }
+        // wrong password: real servers stay silent and the app times out
+        break;
+      }
+      case CMD.SendStatusReq: {
+        const key = body.subarray(0, 32);
+        const contact = this.contacts.find((c) => Buffer.from(c.publicKey).equals(key));
+        this.send(socket, new FrameWriter().byte(RESP.Sent).int8(0).u32(0).u32(600));
+        if (contact && this.loggedIn.has(Buffer.from(contact.publicKey).toString("hex"))) {
+          this.later(120, () => {
+            this.pushToAll(
+              new FrameWriter()
+                .byte(PUSH.StatusResponse)
+                .byte(0)
+                .raw(contact.publicKey.subarray(0, 6))
+                .u16(4020) // batt mV
+                .u16(0) // tx queue
+                .i16(-105) // noise floor
+                .i16(-78) // last rssi
+                .u32(1234) // packets recv
+                .u32(2345) // packets sent
+                .u32(678) // air time secs
+                .u32(86_400) // uptime secs
+                .u32(100) // sent flood
+                .u32(200) // sent direct
+                .u32(300) // recv flood
+                .u32(400) // recv direct
+                .u16(2) // err events
+                .i16(26) // last snr
+                .u16(5) // direct dups
+                .u16(7), // flood dups
+            );
+          });
+        }
         break;
       }
       case CMD.SendChannelTxtMsg: {
@@ -482,6 +601,29 @@ export class MockRadio {
       .byte(this.radioSf)
       .byte(this.radioCr)
       .str(this.name);
+  }
+
+  /** What a contact sends back for an incoming message, or null for silence. */
+  private replyFor(contact: MockContact, txtType: number, text: string): string | null {
+    const isLoggedIn = this.loggedIn.has(Buffer.from(contact.publicKey).toString("hex"));
+    if (txtType === 1) {
+      // CLI data — repeaters/rooms answer only when authenticated
+      if (contact.password === undefined) return null;
+      if (!isLoggedIn) return "error: not logged in";
+      if (text === "ver") return "MockCore v1.16 (mock repeater)";
+      if (text === "clock") return new Date().toUTCString();
+      return `ok: ${text}`;
+    }
+    if (contact.type === 3) {
+      // room server re-broadcasts posts from authenticated members
+      return isLoggedIn ? `room echo: ${text}` : null;
+    }
+    return contact.echoes ? `echo: ${text}` : null;
+  }
+
+  /** Mock advert-packet bytes: [32B pubkey][type][i32 lat][i32 lon][name]. */
+  private advertPacket(publicKey: Uint8Array, type: number, advLat: number, advLon: number, name: string): FrameWriter {
+    return new FrameWriter().raw(publicKey).byte(type).i32(advLat).i32(advLon).str(name);
   }
 
   private contactFrame(contact: MockContact): FrameWriter {

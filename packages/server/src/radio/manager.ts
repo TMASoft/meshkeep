@@ -3,9 +3,11 @@ import {
   CONTACT_TYPE_FROM_ADV,
   type AppStatus,
   type Channel,
+  type ConnectionSettings,
   type ConnectionState,
   type Contact,
   type Message,
+  type NodeStats,
   type SelfInfo,
 } from "@meshkeep/shared";
 import type { ServerConfig } from "../config.js";
@@ -17,15 +19,26 @@ import { createConnection, describeTarget } from "./transports.js";
 const RECONNECT_MIN_MS = 2_000;
 const RECONNECT_MAX_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 15_000;
+// BLE needs discovery + GATT enumeration (and possibly a pairing handshake)
+const BLE_CONNECT_TIMEOUT_MS = 45_000;
 const CLOCK_DRIFT_TOLERANCE_SECS = 30;
 const BATTERY_POLL_MS = 5 * 60_000;
 const MAX_CHANNELS = 8;
+const CONNECTION_OVERRIDE_KEY = "connection.override";
 
 /** Latitude/longitude are transported as degrees * 1e6 signed integers. */
 const GEO_SCALE = 1e6;
 function fromGeoInt(value: number): number | null {
   if (value === 0) return null;
   return value / GEO_SCALE;
+}
+
+function normalizeDeviceText(value: string): string {
+  return value
+    .split("\0")
+    .filter(Boolean)
+    .join(" ")
+    .trim();
 }
 
 /**
@@ -62,12 +75,52 @@ export class ConnectionManager {
     return getSetting<boolean>(this.db, "connection.standby") === true;
   }
 
+  /**
+   * Connection settings come from env, but a runtime override saved through
+   * the UI (settings table) wins — env is fixed for the container's lifetime,
+   * so it acts as the default the override falls back to.
+   */
+  connectionSettings(): {
+    env: ConnectionSettings;
+    override: Partial<ConnectionSettings> | null;
+    effective: ConnectionSettings;
+  } {
+    const env: ConnectionSettings = {
+      connection: this.config.connection ?? "none",
+      serialPort: this.config.serialPort,
+      serialBaud: this.config.serialBaud,
+      tcpHost: this.config.tcpHost,
+      tcpPort: this.config.tcpPort,
+      bleAddress: this.config.bleAddress,
+    };
+    const override = getSetting<Partial<ConnectionSettings>>(this.db, CONNECTION_OVERRIDE_KEY) ?? null;
+    return { env, override, effective: override ? { ...env, ...override } : env };
+  }
+
+  /** Persist (or clear) a connection override and reconnect with the new settings. */
+  async setConnectionOverride(override: Partial<ConnectionSettings> | null): Promise<void> {
+    setSetting(this.db, CONNECTION_OVERRIDE_KEY, override);
+    await this.teardown();
+    if (this.stopped) return;
+    if (this.isStandby()) {
+      this.setState("standby", null);
+      return;
+    }
+    if (this.connectionSettings().effective.connection === "none") {
+      this.setState("disconnected", "no radio transport configured");
+      return;
+    }
+    this.reconnectDelay = RECONNECT_MIN_MS;
+    await this.connect();
+  }
+
   status(): AppStatus {
-    const target = this.config.connection && this.config.connection !== "none" ? describeTargetSafe(this.config) : null;
+    const { effective } = this.connectionSettings();
+    const target = effective.connection !== "none" ? describeTargetSafe(effective) : null;
     return {
       connection: {
         state: this.state,
-        transport: this.config.connection ?? "none",
+        transport: effective.connection,
         target,
         lastError: this.lastError,
         connectedAt: this.connectedAt,
@@ -80,7 +133,7 @@ export class ConnectionManager {
   }
 
   async start(): Promise<void> {
-    if (!this.config.connection || this.config.connection === "none") {
+    if (this.connectionSettings().effective.connection === "none") {
       this.setState("disconnected", "no radio transport configured");
       return;
     }
@@ -143,14 +196,16 @@ export class ConnectionManager {
     if (this.stopped || this.connection) return;
     this.setState("connecting", null);
     try {
-      const connection = createConnection(this.config);
+      const effective = this.connectionSettings().effective;
+      const connectTimeoutMs = effective.connection === "ble" ? BLE_CONNECT_TIMEOUT_MS : CONNECT_TIMEOUT_MS;
+      const connection = createConnection(effective);
       this.connection = connection;
       this.attachListeners(connection);
 
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(
-          () => reject(new Error(`timed out connecting after ${CONNECT_TIMEOUT_MS}ms`)),
-          CONNECT_TIMEOUT_MS,
+          () => reject(new Error(`timed out connecting after ${connectTimeoutMs}ms`)),
+          connectTimeoutMs,
         );
         connection.once("connected", () => {
           clearTimeout(timeout);
@@ -256,7 +311,7 @@ export class ConnectionManager {
       radioCr: rawSelf.radioCr,
       firmwareVer: device?.firmwareVer ?? null,
       firmwareBuildDate: device?.firmware_build_date ?? null,
-      manufacturerModel: device?.manufacturerModel ?? null,
+      manufacturerModel: device?.manufacturerModel ? normalizeDeviceText(device.manufacturerModel) : null,
     };
     this.store.saveSelf(self);
     this.bus.publish({ type: "self.updated", self });
@@ -372,7 +427,7 @@ export class ConnectionManager {
     }
   }
 
-  async sendDirectMessage(contactKey: string, text: string): Promise<Message> {
+  async sendDirectMessage(contactKey: string, text: string, cli = false): Promise<Message> {
     const connection = this.requireConnection();
     const pubKey = BufferUtils.hexToBytes(contactKey);
     const senderTimestamp = Math.floor(Date.now() / 1000);
@@ -386,7 +441,8 @@ export class ConnectionManager {
     });
     if (!stored) throw new Error("duplicate message");
     try {
-      const sent = await connection.sendTextMessage(pubKey, text, Constants.TxtTypes.Plain);
+      const txtType = cli ? Constants.TxtTypes.CliData : Constants.TxtTypes.Plain;
+      const sent = await connection.sendTextMessage(pubKey, text, txtType);
       this.db_setAck(stored.id, sent.expectedAckCrc);
       this.store.setMessageStatus(stored.id, "sent");
       this.bus.publish({ type: "message.status", id: stored.id, status: "sent" });
@@ -496,11 +552,72 @@ export class ConnectionManager {
     const connection = this.requireConnection();
     await connection.removeContact(BufferUtils.hexToBytes(contactKey));
     this.store.removeContact(contactKey);
+    this.bus.publish({ type: "contact.removed", publicKey: contactKey });
+  }
+
+  /** Export a contact (or our own identity when key is null) as a meshcore:// URI. */
+  async exportContactUri(contactKey: string | null): Promise<string> {
+    const connection = this.requireConnection();
+    const pubKey = contactKey ? BufferUtils.hexToBytes(contactKey) : null;
+    const result = await connection.exportContact(pubKey).catch(() => {
+      throw new Error("radio could not export the contact");
+    });
+    return `meshcore://${BufferUtils.bytesToHex(result.advertPacketBytes)}`;
+  }
+
+  /** Import a contact from a meshcore:// URI (raw advert packet hex also accepted). */
+  async importContactUri(uri: string): Promise<Contact[]> {
+    const hex = uri.trim().replace(/^meshcore:\/\//i, "");
+    if (!/^([0-9a-f]{2}){4,}$/i.test(hex)) {
+      throw new Error("not a valid meshcore:// contact URI");
+    }
+    const connection = this.requireConnection();
+    await connection.importContact(BufferUtils.hexToBytes(hex.toLowerCase())).catch(() => {
+      throw new Error("radio rejected the contact import");
+    });
+    return this.refreshContacts();
   }
 
   async resetContactPath(contactKey: string): Promise<void> {
     const connection = this.requireConnection();
     await connection.resetPath(BufferUtils.hexToBytes(contactKey));
+  }
+
+  /** Authenticate with a room server or repeater. Resolves false on wrong password/timeout. */
+  async loginToNode(contactKey: string, password: string): Promise<boolean> {
+    const connection = this.requireConnection();
+    try {
+      await connection.login(BufferUtils.hexToBytes(contactKey), password);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Request live stats from a repeater or room server (requires prior login on most nodes). */
+  async getNodeStatus(contactKey: string): Promise<NodeStats> {
+    const connection = this.requireConnection();
+    const raw = await connection.getStatus(BufferUtils.hexToBytes(contactKey)).catch(() => {
+      throw new Error("status request failed — is the node reachable and are you logged in?");
+    });
+    return {
+      battMilliVolts: raw.batt_milli_volts,
+      currTxQueueLen: raw.curr_tx_queue_len,
+      noiseFloor: raw.noise_floor,
+      lastRssi: raw.last_rssi,
+      nPacketsRecv: raw.n_packets_recv,
+      nPacketsSent: raw.n_packets_sent,
+      totalAirTimeSecs: raw.total_air_time_secs,
+      totalUpTimeSecs: raw.total_up_time_secs,
+      nSentFlood: raw.n_sent_flood,
+      nSentDirect: raw.n_sent_direct,
+      nRecvFlood: raw.n_recv_flood,
+      nRecvDirect: raw.n_recv_direct,
+      errEvents: raw.err_events,
+      lastSnr: raw.last_snr,
+      nDirectDups: raw.n_direct_dups,
+      nFloodDups: raw.n_flood_dups,
+    };
   }
 
   private async pollBattery(): Promise<void> {
@@ -509,6 +626,7 @@ export class ConnectionManager {
     try {
       const battery = await connection.getBatteryVoltage();
       this.store.recordTelemetry(battery.batteryMilliVolts);
+      this.store.trimTelemetry(this.config.telemetryRetentionDays);
       this.bus.publish({
         type: "telemetry",
         batteryMilliVolts: battery.batteryMilliVolts,
@@ -614,9 +732,9 @@ function sendSetChannel(connection: Connection, idx: number, name: string, secre
   });
 }
 
-function describeTargetSafe(config: ServerConfig): string | null {
+function describeTargetSafe(settings: ConnectionSettings): string | null {
   try {
-    return describeTarget(config)?.target ?? null;
+    return describeTarget(settings)?.target ?? null;
   } catch {
     return null;
   }

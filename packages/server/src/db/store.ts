@@ -7,6 +7,7 @@ import type {
   MessageKind,
   MessageStatus,
   SelfInfo,
+  TelemetryPoint,
 } from "@meshkeep/shared";
 import type { Db } from "./index.js";
 
@@ -203,6 +204,30 @@ export class Store {
     return row ? rowToMessage(row) : null;
   }
 
+  /**
+   * Late status update for a message that already exists (matched by content
+   * hash) — how browser-direct sessions report delivery acks after sync-back.
+   * Only moves status forward from pending/sent.
+   */
+  updateMessageStatusByContent(input: {
+    kind: MessageKind;
+    contactKey?: string | null;
+    channelIdx?: number | null;
+    direction: MessageDirection;
+    text: string;
+    senderTimestamp: number;
+    status: MessageStatus;
+  }): Message | null {
+    const counterparty = input.kind === "dm" ? input.contactKey ?? "" : String(input.channelIdx ?? "");
+    const hash = dedupeHash(input.kind, counterparty, input.senderTimestamp, input.direction, input.text);
+    const row = this.db
+      .prepare("SELECT id FROM messages WHERE dedupe_hash = ? AND status IN ('pending','sent')")
+      .get(hash) as { id: number } | undefined;
+    if (!row) return null;
+    this.db.prepare("UPDATE messages SET status = ? WHERE id = ?").run(input.status, row.id);
+    return this.getMessage(row.id);
+  }
+
   markDeliveredByAck(ackCrc: number): Message | null {
     const row = this.db
       .prepare("SELECT id FROM messages WHERE ack_crc = ? AND status IN ('pending','sent') ORDER BY id DESC LIMIT 1")
@@ -249,6 +274,22 @@ export class Store {
     return rows.map(rowToMessage).reverse();
   }
 
+  /** Every message of a conversation (or everything), oldest first, for export. */
+  getMessagesForExport(opts: { contactKey?: string; channelIdx?: number } = {}): Message[] {
+    const clauses: string[] = [];
+    const params: Record<string, unknown> = {};
+    if (opts.contactKey !== undefined) {
+      clauses.push("m.kind = 'dm' AND m.contact_key = @contactKey");
+      params.contactKey = opts.contactKey;
+    } else if (opts.channelIdx !== undefined) {
+      clauses.push("m.kind = 'channel' AND m.channel_idx = @channelIdx");
+      params.channelIdx = opts.channelIdx;
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.db.prepare(`${MESSAGE_SELECT} ${where} ORDER BY m.id ASC`).all(params) as MessageRow[];
+    return rows.map(rowToMessage);
+  }
+
   markConversationRead(opts: { contactKey?: string; channelIdx?: number }): void {
     if (opts.contactKey !== undefined) {
       this.db
@@ -274,6 +315,20 @@ export class Store {
     this.db
       .prepare("INSERT INTO telemetry (ts, battery_mv, raw_json) VALUES (?, ?, ?)")
       .run(now(), batteryMv, raw === undefined ? null : JSON.stringify(raw));
+  }
+
+  getTelemetry(sinceTs: number): TelemetryPoint[] {
+    const rows = this.db
+      .prepare("SELECT ts, battery_mv FROM telemetry WHERE ts >= ? ORDER BY ts ASC")
+      .all(sinceTs) as Array<{ ts: number; battery_mv: number | null }>;
+    return rows.map((r) => ({ ts: r.ts, batteryMv: r.battery_mv }));
+  }
+
+  /** Delete telemetry rows older than the retention window. Returns rows removed. */
+  trimTelemetry(retentionDays: number): number {
+    if (!Number.isFinite(retentionDays) || retentionDays <= 0) return 0;
+    const cutoff = now() - Math.floor(retentionDays * 86_400);
+    return this.db.prepare("DELETE FROM telemetry WHERE ts < ?").run(cutoff).changes;
   }
 
   latestBatteryMv(): number | null {

@@ -84,6 +84,41 @@ export interface AppStatus {
   version: string;
 }
 
+/** Remote node stats returned by a repeater/room server status request. */
+export interface NodeStats {
+  battMilliVolts: number;
+  currTxQueueLen: number;
+  noiseFloor: number;
+  lastRssi: number;
+  nPacketsRecv: number;
+  nPacketsSent: number;
+  totalAirTimeSecs: number;
+  totalUpTimeSecs: number;
+  nSentFlood: number;
+  nSentDirect: number;
+  nRecvFlood: number;
+  nRecvDirect: number;
+  errEvents: number;
+  lastSnr: number;
+  nDirectDups: number;
+  nFloodDups: number;
+}
+
+export interface TelemetryPoint {
+  ts: number;
+  batteryMv: number | null;
+}
+
+/** Connection settings the server can be pointed at (env or runtime override). */
+export interface ConnectionSettings {
+  connection: ConnectionTransport;
+  serialPort: string | null;
+  serialBaud: number;
+  tcpHost: string | null;
+  tcpPort: number;
+  bleAddress: string | null;
+}
+
 export interface MapNode {
   publicKey: string;
   name: string;
@@ -100,6 +135,7 @@ export type WsEvent =
   | { type: "message.new"; message: Message }
   | { type: "message.status"; id: number; status: MessageStatus }
   | { type: "contact.updated"; contact: Contact }
+  | { type: "contact.removed"; publicKey: string }
   | { type: "self.updated"; self: SelfInfo }
   | { type: "telemetry"; batteryMilliVolts: number; ts: number };
 

@@ -1,8 +1,10 @@
 # BEST-EFFORT: server-side BLE requires a Linux host running BlueZ
 # (bluetoothd) and does NOT work on Docker Desktop for macOS/Windows.
-# Server-side BLE support is planned but not implemented yet — prefer USB
-# (compose.usb.yml) or ser2net/TCP (compose.tcp.yml). Browser-direct
-# Web Bluetooth from Chrome is the recommended way to use a BLE radio.
+# Pair the radio ONCE on the host first (companion BLE firmware defaults to
+# PIN 123456) so BlueZ holds the bond, e.g. in bluetoothctl:
+#   scan on ... pair AA:BB:CC:DD:EE:FF ... trust AA:BB:CC:DD:EE:FF
+# USB (compose.usb.yml) and ser2net/TCP (compose.tcp.yml) remain the
+# recommended server transports.
 services:
   meshkeep:
     build:
