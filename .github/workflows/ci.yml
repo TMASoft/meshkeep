@@ -21,6 +21,9 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm rebuild better-sqlite3 @serialport/bindings-cpp esbuild
 
+      # server and web resolve @meshkeep/shared from its dist/
+      - run: npm run build --workspace @meshkeep/shared
+
       - run: npm run typecheck
       - run: npm test
 
