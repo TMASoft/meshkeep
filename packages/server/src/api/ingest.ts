@@ -22,6 +22,10 @@ export const ingestMessageSchema = z
     senderTimestamp: z.number().int().nonnegative(),
     pathLen: z.number().int().min(0).max(255).nullish(),
     status: z.enum(["pending", "sent", "delivered", "failed"]).optional(),
+    authorPrefix: z
+      .string()
+      .regex(/^[0-9a-f]{8}$/i)
+      .nullish(),
   })
   .refine((m) => (m.kind === "dm" ? m.contactKey !== undefined : m.channelIdx !== undefined), {
     message: "dm messages need contactKey, channel messages need channelIdx",
@@ -74,6 +78,7 @@ export function ingestMessages(
       direction: item.direction,
       text: item.text,
       senderTimestamp: item.senderTimestamp,
+      authorPrefix: item.authorPrefix?.toLowerCase() ?? null,
     };
     const message = store.insertMessage({
       ...normalized,

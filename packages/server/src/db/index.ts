@@ -72,6 +72,10 @@ const MIGRATIONS: string[] = [
     last_used_at INTEGER
   );
   `,
+  // 2: author attribution for signed-plain room posts (4-byte pubkey prefix, hex)
+  `
+  ALTER TABLE messages ADD COLUMN author_prefix TEXT;
+  `,
 ];
 
 export type Db = Database.Database;

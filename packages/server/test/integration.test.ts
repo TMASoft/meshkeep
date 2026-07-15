@@ -125,6 +125,27 @@ describe("mock radio end-to-end", () => {
     expect(echo.message.channelName).toBe("Public");
   });
 
+  it("requests remote sensor telemetry and parses the Cayenne LPP payload", async () => {
+    const alice = manager.store.getContacts().find((c) => c.name === "Mock Alice")!;
+    const readings = await manager.requestTelemetry(alice.publicKey);
+    expect(readings).toEqual([
+      { channel: 1, type: 116, label: "Voltage", unit: "V", value: 4.03 },
+      { channel: 2, type: 103, label: "Temperature", unit: "°C", value: 22.5 },
+      { channel: 3, type: 104, label: "Humidity", unit: "%", value: 61 },
+    ]);
+  });
+
+  it("creates and deletes a channel slot", async () => {
+    await manager.setChannel(3, "test-chan", "00112233445566778899aabbccddeeff");
+    expect(manager.store.getChannels().map((c) => c.idx)).toEqual([0, 3]);
+    expect(await manager.refreshChannels()).toHaveLength(2);
+
+    await manager.deleteChannel(3);
+    expect(manager.store.getChannels().map((c) => c.idx)).toEqual([0]);
+    // the mock reports the slot as blank on the next full read
+    expect(await manager.refreshChannels()).toHaveLength(1);
+  });
+
   it("receives unsolicited incoming messages via MsgWaiting push", async () => {
     const incoming = waitForEvent(bus, (e) => e.type === "message.new");
     mock.injectDirectMessage("Mock Bob", "ping from the field");
@@ -267,6 +288,10 @@ describe("mock radio end-to-end", () => {
     await manager.sendDirectMessage(room.publicKey, "hello room");
     const event = (await echoed) as Extract<WsEvent, { type: "message.new" }>;
     expect(event.message.text).toBe("room echo: hello room");
+    // the mock room reposts as signed-plain attributed to Mock Alice
+    const alice = manager.store.getContacts().find((c) => c.name === "Mock Alice")!;
+    expect(event.message.authorPrefix).toBe(alice.publicKey.slice(0, 8));
+    expect(event.message.authorName).toBe("Mock Alice");
   }, 15_000);
 
   it("persists history across a manager restart", async () => {

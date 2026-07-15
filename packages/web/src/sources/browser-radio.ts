@@ -60,6 +60,7 @@ interface IngestItem {
   senderTimestamp: number;
   pathLen?: number | null;
   status?: Message["status"];
+  authorPrefix?: string | null;
 }
 
 export class BrowserRadioSource {
@@ -101,6 +102,7 @@ export class BrowserRadioSource {
       if (!connection) {
         throw new Error("No device selected");
       }
+      this.patchSignedPlain(connection);
       this.connection = connection;
 
       await this.waitForConnected(connection, 20_000);
@@ -141,6 +143,33 @@ export class BrowserRadioSource {
     this.releaseLock?.();
     this.releaseLock = null;
     this.callbacks.onState("disconnected", null);
+  }
+
+  /**
+   * Signed-plain frames (room server posts) carry 4 raw author-pubkey bytes
+   * between the timestamp and the text; the library decodes the whole
+   * remainder as UTF-8 and mangles them. Re-parse the frame ourselves and
+   * surface the prefix as `signedAuthorPrefix` (mirrors the server transport).
+   */
+  private patchSignedPlain(connection: MeshConnection): void {
+    const Constants = this.constants!;
+    const BufferUtils = this.bufferUtils!;
+    connection.onContactMsgRecvResponse = function (reader) {
+      const pubKeyPrefix = reader.readBytes(6);
+      const pathLen = reader.readByte();
+      const txtType = reader.readByte();
+      const senderTimestamp = reader.readUInt32LE();
+      const signedAuthorPrefix =
+        txtType === Constants.TxtTypes.SignedPlain ? BufferUtils.bytesToHex(reader.readBytes(4)) : null;
+      this.emit(Constants.ResponseCodes.ContactMsgRecv, {
+        pubKeyPrefix,
+        pathLen,
+        txtType,
+        senderTimestamp,
+        signedAuthorPrefix,
+        text: reader.readString(),
+      });
+    };
   }
 
   private waitForConnected(connection: MeshConnection, timeoutMs: number): Promise<void> {
@@ -260,6 +289,7 @@ export class BrowserRadioSource {
             senderTimestamp: m.senderTimestamp,
             pathLen: m.pathLen === 0xff ? null : m.pathLen,
             status: "sent",
+            authorPrefix: m.signedAuthorPrefix ?? null,
           });
         } else if (next.channelMessage) {
           const m = next.channelMessage;
@@ -389,6 +419,10 @@ export class BrowserRadioSource {
       pathLen: item.pathLen ?? null,
       status: item.status ?? "sent",
       createdAt: Math.floor(Date.now() / 1000),
+      authorPrefix: item.authorPrefix ?? null,
+      authorName: item.authorPrefix
+        ? this.contacts.find((c) => c.publicKey.startsWith(item.authorPrefix!))?.name ?? null
+        : null,
     };
   }
 

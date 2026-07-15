@@ -32,6 +32,7 @@ const CMD = {
   SendLogin: 26,
   SendStatusReq: 27,
   DeviceQuery: 22,
+  SendTelemetryReq: 39,
   GetChannel: 31,
   SetChannel: 32,
   SetOtherParams: 38,
@@ -61,6 +62,7 @@ const PUSH = {
   MsgWaiting: 0x83,
   LoginSuccess: 0x85,
   StatusResponse: 0x87,
+  TelemetryResponse: 0x8b,
 } as const;
 
 class FrameWriter {
@@ -137,7 +139,15 @@ interface MockChannel {
 }
 
 type QueuedMessage =
-  | { kind: "dm"; from: MockContact; text: string; senderTimestamp: number; pathLen: number }
+  | {
+      kind: "dm";
+      from: MockContact;
+      text: string;
+      senderTimestamp: number;
+      pathLen: number;
+      txtType?: number;
+      authorPrefix?: Uint8Array; // 4 bytes, present on signed-plain room posts
+    }
   | { kind: "channel"; channelIdx: number; text: string; senderTimestamp: number; pathLen: number };
 
 function keyFromSeed(seed: number): Uint8Array {
@@ -441,16 +451,14 @@ export class MockRadio {
         if (!next) {
           this.send(socket, new FrameWriter().byte(RESP.NoMoreMessages));
         } else if (next.kind === "dm") {
-          this.send(
-            socket,
-            new FrameWriter()
-              .byte(RESP.ContactMsgRecv)
-              .raw(next.from.publicKey.subarray(0, 6))
-              .byte(next.pathLen)
-              .byte(0) // txtType plain
-              .u32(next.senderTimestamp)
-              .str(next.text),
-          );
+          const frame = new FrameWriter()
+            .byte(RESP.ContactMsgRecv)
+            .raw(next.from.publicKey.subarray(0, 6))
+            .byte(next.pathLen)
+            .byte(next.txtType ?? 0)
+            .u32(next.senderTimestamp);
+          if (next.authorPrefix) frame.raw(next.authorPrefix); // signed-plain: 4 raw author bytes before the text
+          this.send(socket, frame.str(next.text));
         } else {
           this.send(
             socket,
@@ -482,9 +490,9 @@ export class MockRadio {
               this.queue.push({
                 kind: "dm",
                 from: contact,
-                text: reply,
                 senderTimestamp: nowSecs(),
                 pathLen: 0xff,
+                ...reply,
               });
               this.pushToAll(new FrameWriter().byte(PUSH.MsgWaiting));
             });
@@ -541,6 +549,25 @@ export class MockRadio {
         }
         break;
       }
+      case CMD.SendTelemetryReq: {
+        // [3 reserved bytes, 32-byte public key]
+        const key = body.subarray(3, 35);
+        const contact = this.contacts.find((c) => Buffer.from(c.publicKey).equals(key));
+        this.send(socket, new FrameWriter().byte(RESP.Sent).int8(0).u32(0).u32(600));
+        if (contact) {
+          this.later(120, () => {
+            this.pushToAll(
+              new FrameWriter()
+                .byte(PUSH.TelemetryResponse)
+                .byte(0)
+                .raw(contact.publicKey.subarray(0, 6))
+                // Cayenne LPP (big-endian): ch1 voltage 4.03 V, ch2 temp 22.5 °C, ch3 humidity 61 %
+                .raw(new Uint8Array([1, 116, 0x01, 0x93, 2, 103, 0x00, 0xe1, 3, 104, 122])),
+            );
+          });
+        }
+        break;
+      }
       case CMD.SendChannelTxtMsg: {
         // [txtType, channelIdx, u32 senderTimestamp, text]
         const channelIdx = body[1];
@@ -575,7 +602,11 @@ export class MockRadio {
         const idx = body[0];
         const name = readCString(body.subarray(1, 33));
         const secret = body.subarray(33, 49);
-        this.channels.set(idx, { name, secret: Uint8Array.from(secret) });
+        if (name) {
+          this.channels.set(idx, { name, secret: Uint8Array.from(secret) });
+        } else {
+          this.channels.delete(idx); // empty name blanks the slot
+        }
         this.send(socket, new FrameWriter().byte(RESP.Ok));
         break;
       }
@@ -604,21 +635,31 @@ export class MockRadio {
   }
 
   /** What a contact sends back for an incoming message, or null for silence. */
-  private replyFor(contact: MockContact, txtType: number, text: string): string | null {
+  private replyFor(
+    contact: MockContact,
+    txtType: number,
+    text: string,
+  ): { text: string; txtType?: number; authorPrefix?: Uint8Array } | null {
     const isLoggedIn = this.loggedIn.has(Buffer.from(contact.publicKey).toString("hex"));
     if (txtType === 1) {
       // CLI data — repeaters/rooms answer only when authenticated
       if (contact.password === undefined) return null;
-      if (!isLoggedIn) return "error: not logged in";
-      if (text === "ver") return "MockCore v1.16 (mock repeater)";
-      if (text === "clock") return new Date().toUTCString();
-      return `ok: ${text}`;
+      if (!isLoggedIn) return { text: "error: not logged in" };
+      if (text === "ver") return { text: "MockCore v1.16 (mock repeater)" };
+      if (text === "clock") return { text: new Date().toUTCString() };
+      return { text: `ok: ${text}` };
     }
     if (contact.type === 3) {
-      // room server re-broadcasts posts from authenticated members
-      return isLoggedIn ? `room echo: ${text}` : null;
+      // room server re-broadcasts member posts as signed-plain, attributed to the author
+      if (!isLoggedIn) return null;
+      const author = this.contacts.find((c) => c.name === "Mock Alice") ?? contact;
+      return {
+        text: `room echo: ${text}`,
+        txtType: 2, // TxtTypes.SignedPlain
+        authorPrefix: author.publicKey.subarray(0, 4),
+      };
     }
-    return contact.echoes ? `echo: ${text}` : null;
+    return contact.echoes ? { text: `echo: ${text}` } : null;
   }
 
   /** Mock advert-packet bytes: [32B pubkey][type][i32 lat][i32 lon][name]. */

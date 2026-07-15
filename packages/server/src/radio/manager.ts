@@ -1,4 +1,4 @@
-import { BufferUtils, Constants, type Connection } from "@liamcottle/meshcore.js";
+import { BufferUtils, CayenneLpp, Constants, type Connection } from "@liamcottle/meshcore.js";
 import {
   CONTACT_TYPE_FROM_ADV,
   type AppStatus,
@@ -9,6 +9,7 @@ import {
   type Message,
   type NodeStats,
   type SelfInfo,
+  type SensorReading,
 } from "@meshkeep/shared";
 import type { ServerConfig } from "../config.js";
 import type { Bus } from "../bus.js";
@@ -25,6 +26,36 @@ const CLOCK_DRIFT_TOLERANCE_SECS = 30;
 const BATTERY_POLL_MS = 5 * 60_000;
 const MAX_CHANNELS = 8;
 const CONNECTION_OVERRIDE_KEY = "connection.override";
+
+/** Cayenne LPP type codes → display label and unit (subset the firmware ecosystem uses). */
+const LPP_TYPE_INFO: Record<number, { label: string; unit: string | null }> = {
+  0: { label: "Digital input", unit: null },
+  1: { label: "Digital output", unit: null },
+  2: { label: "Analog input", unit: null },
+  3: { label: "Analog output", unit: null },
+  100: { label: "Generic sensor", unit: null },
+  101: { label: "Luminosity", unit: "lx" },
+  102: { label: "Presence", unit: null },
+  103: { label: "Temperature", unit: "°C" },
+  104: { label: "Humidity", unit: "%" },
+  113: { label: "Accelerometer", unit: "G" },
+  115: { label: "Pressure", unit: "hPa" },
+  116: { label: "Voltage", unit: "V" },
+  117: { label: "Current", unit: "A" },
+  118: { label: "Frequency", unit: "Hz" },
+  120: { label: "Percentage", unit: "%" },
+  121: { label: "Altitude", unit: "m" },
+  125: { label: "Concentration", unit: "ppm" },
+  128: { label: "Power", unit: "W" },
+  130: { label: "Distance", unit: "m" },
+  131: { label: "Energy", unit: "kWh" },
+  132: { label: "Direction", unit: "°" },
+  133: { label: "Unix time", unit: null },
+  134: { label: "Gyrometer", unit: "°/s" },
+  135: { label: "Colour", unit: null },
+  136: { label: "GPS", unit: null },
+  142: { label: "Switch", unit: null },
+};
 
 /** Latitude/longitude are transported as degrees * 1e6 signed integers. */
 const GEO_SCALE = 1e6;
@@ -360,6 +391,10 @@ export class ConnectionManager {
         this.store.upsertChannel(channel);
       }
     }
+    // drop slots the firmware no longer has (blanked from another client)
+    for (const known of this.store.getChannels()) {
+      if (!channels.some((c) => c.idx === known.idx)) this.store.deleteChannel(known.idx);
+    }
     return channels;
   }
 
@@ -409,6 +444,7 @@ export class ConnectionManager {
         senderTimestamp: m.senderTimestamp,
         pathLen: m.pathLen === 0xff ? null : m.pathLen,
         status: "sent",
+        authorPrefix: m.signedAuthorPrefix ?? null,
       });
     } else if (next.channelMessage) {
       const m = next.channelMessage;
@@ -495,6 +531,13 @@ export class ConnectionManager {
     const channel = { idx, name, secret: secretHex };
     this.store.upsertChannel(channel);
     return channel;
+  }
+
+  /** Blank a channel slot — firmware clears a slot when written with an empty name and zero key. */
+  async deleteChannel(idx: number): Promise<void> {
+    const connection = this.requireConnection();
+    await sendSetChannel(connection, idx, "", new Uint8Array(16));
+    this.store.deleteChannel(idx);
   }
 
   async setDeviceSettings(patch: {
@@ -618,6 +661,21 @@ export class ConnectionManager {
       nDirectDups: raw.n_direct_dups,
       nFloodDups: raw.n_flood_dups,
     };
+  }
+
+  /** Ask a remote node for its Cayenne LPP sensor telemetry. */
+  async requestTelemetry(contactKey: string): Promise<SensorReading[]> {
+    const connection = this.requireConnection();
+    const response = await connection.getTelemetry(BufferUtils.hexToBytes(contactKey)).catch(() => {
+      throw new Error("telemetry request failed — is the node reachable?");
+    });
+    return CayenneLpp.parse(response.lppSensorData).map((item) => ({
+      channel: item.channel,
+      type: item.type,
+      label: LPP_TYPE_INFO[item.type]?.label ?? `Sensor type ${item.type}`,
+      unit: LPP_TYPE_INFO[item.type]?.unit ?? null,
+      value: item.value,
+    }));
   }
 
   private async pollBattery(): Promise<void> {

@@ -47,6 +47,9 @@ declare module "@liamcottle/meshcore.js/src/connection/connection.js" {
     getBatteryVoltage(): Promise<{ batteryMilliVolts: number }>;
     getDeviceTime(): Promise<{ epochSecs: number }>;
     syncDeviceTime(): Promise<void>;
+    emit(event: string | number, ...data: unknown[]): void;
+    /** Frame parser for ContactMsgRecv; replaceable per-instance (see patchSignedPlain). */
+    onContactMsgRecvResponse(reader: FrameReader): void;
     syncNextMessage(): Promise<
       | {
           contactMessage?: {
@@ -54,6 +57,8 @@ declare module "@liamcottle/meshcore.js/src/connection/connection.js" {
             pathLen: number;
             txtType: number;
             senderTimestamp: number;
+            /** Author pubkey prefix (8 hex chars) on SignedPlain frames; set by patchSignedPlain. */
+            signedAuthorPrefix?: string | null;
             text: string;
           };
           channelMessage?: {
@@ -74,6 +79,14 @@ declare module "@liamcottle/meshcore.js/src/connection/connection.js" {
     sendChannelTextMessage(channelIdx: number, text: string): Promise<void>;
     sendFloodAdvert(): Promise<void>;
     sendZeroHopAdvert(): Promise<void>;
+  }
+
+  /** Subset of the library's internal BufferReader passed to on*Response handlers. */
+  export interface FrameReader {
+    readByte(): number;
+    readBytes(count: number): Uint8Array;
+    readUInt32LE(): number;
+    readString(): string;
   }
 }
 

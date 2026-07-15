@@ -38,15 +38,23 @@ room server login + posts, and repeater admin (login, status readout, remote CLI
 
 ## Possible later parity items
 
-- [ ] Remote telemetry requests (`sendCommandSendTelemetryReq` / Cayenne LPP sensors)
-- [ ] Signed-plain room posts with author attribution (`TxtTypes.SignedPlain` parsing)
-- [ ] Channel delete/clear (firmware supports blanking a slot; API/UI only set today)
+- [x] Remote telemetry requests (2026-07-15: GET /contacts/:key/telemetry + "Request
+      telemetry" in the details drawer; Cayenne LPP parsed server-side, mock-verified)
+- [x] Signed-plain room posts with author attribution (2026-07-15: frame parser patched —
+      meshcore.js mangles the 4 raw author bytes — author_prefix column + name resolution,
+      shown on room posts; server + browser-direct paths, mock-verified)
+- [x] Channel delete/clear (2026-07-15: DELETE /channels/:idx blanks the slot, danger
+      button in channel details, refresh prunes externally blanked slots; mock-verified)
+- [ ] Hardware check for the three above: telemetry from a real node, signed post in a
+      real room, delete a channel on real firmware
 
 ## Infra / release
 
 - [x] GitHub repo (github.com/TMASoft/meshkeep) — v0.1.0-Beta released 2026-07-15
-- [ ] CI (typecheck, vitest, docker build)
-- [ ] Publish image to ghcr.io; add renovate/dependabot
+- [x] CI (typecheck, vitest, docker build) — .github/workflows/ci.yml; first run
+      verifies on the next push
+- [x] Publish image to ghcr.io (release.yml, multi-arch, runs on v* tags) + dependabot
+      (npm weekly grouped minor/patch, actions, docker)
 - [x] Docker image builds and runs clean (verified at 0.1.0-beta)
 - [ ] NOTE: /mnt/storage is ntfs3 — npm installs hang on it; run npm in a tmpfs dir
       and copy package-lock.json back (see project memory)

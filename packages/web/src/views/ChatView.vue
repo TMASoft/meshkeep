@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
-import type { Contact, Message, NodeStats } from "@meshkeep/shared";
+import type { Contact, Message, NodeStats, SensorReading } from "@meshkeep/shared";
 import { api } from "../api/client";
 import { useAppStore, conversationKey, type ConversationId } from "../stores/app";
 import AppIcon from "../components/AppIcon.vue";
@@ -290,10 +290,12 @@ const isLoggedIn = computed(
 );
 const loginPassword = ref("");
 const nodeStatus = ref<NodeStats | null>(null);
+const sensorReadings = ref<SensorReading[] | null>(null);
 
 watch(active, () => {
   loginPassword.value = "";
   nodeStatus.value = null;
+  sensorReadings.value = null;
 });
 
 const loginToNode = () =>
@@ -310,6 +312,33 @@ const requestStatus = () =>
     const contact = activeContact.value;
     if (!contact) return;
     nodeStatus.value = await store.fetchNodeStatus(contact.publicKey);
+  });
+
+const requestTelemetry = () =>
+  detailsAction("telemetry", async () => {
+    const contact = activeContact.value;
+    if (!contact) return;
+    sensorReadings.value = await store.fetchTelemetry(contact.publicKey);
+    if (!sensorReadings.value.length) detailsNotice.value = "Node replied but reported no sensor data";
+  });
+
+function fmtReading(reading: SensorReading): string {
+  if (typeof reading.value === "number") {
+    return `${reading.value}${reading.unit ? ` ${reading.unit}` : ""}`;
+  }
+  return Object.entries(reading.value)
+    .map(([key, value]) => `${key} ${value}`)
+    .join(", ");
+}
+
+const deleteActiveChannel = () =>
+  detailsAction("delete", async () => {
+    const channel = activeChannel.value;
+    if (!channel) return;
+    if (!window.confirm(`Delete #${channel.name}? The slot is blanked on the radio; message history is kept.`)) {
+      return;
+    }
+    await store.deleteChannel(channel.idx);
   });
 
 async function copyChannelSecret() {
@@ -562,6 +591,13 @@ function fmtLastAdvert(epoch: number): string {
             <div><dt>Errors</dt><dd>{{ nodeStatus.errEvents }}</dd></div>
           </dl>
 
+          <dl v-if="sensorReadings?.length" class="details-facts node-stats">
+            <div v-for="reading in sensorReadings" :key="`${reading.channel}-${reading.type}`">
+              <dt>{{ reading.label }} · ch {{ reading.channel }}</dt>
+              <dd>{{ fmtReading(reading) }}</dd>
+            </div>
+          </dl>
+
           <p v-if="detailsNotice" class="details-notice" role="status">{{ detailsNotice }}</p>
           <div class="details-actions">
             <template v-if="activeContact">
@@ -572,6 +608,9 @@ function fmtLastAdvert(epoch: number): string {
                 @click="requestStatus"
               >
                 <AppIcon name="signal" :size="15" /> {{ detailsBusy === "status" ? "Requesting" : "Request status" }}
+              </button>
+              <button type="button" :disabled="detailsBusy !== null" @click="requestTelemetry">
+                <AppIcon name="battery" :size="15" /> {{ detailsBusy === "telemetry" ? "Requesting" : "Request telemetry" }}
               </button>
               <button type="button" :disabled="detailsBusy !== null" @click="copyContactUri">
                 <AppIcon name="link" :size="15" /> {{ detailsBusy === "share" ? "Copying" : "Copy share link" }}
@@ -600,6 +639,15 @@ function fmtLastAdvert(epoch: number): string {
             >
               <AppIcon name="trash" :size="15" /> {{ detailsBusy === "remove" ? "Removing" : "Remove contact" }}
             </button>
+            <button
+              v-if="activeChannel"
+              class="danger"
+              type="button"
+              :disabled="detailsBusy !== null"
+              @click="deleteActiveChannel"
+            >
+              <AppIcon name="trash" :size="15" /> {{ detailsBusy === "delete" ? "Deleting" : "Delete channel" }}
+            </button>
           </div>
         </section>
 
@@ -623,6 +671,9 @@ function fmtLastAdvert(epoch: number): string {
             <article class="message-bubble">
               <p v-if="message.kind === 'channel' && message.direction === 'in'" class="message-sender">
                 {{ message.contactName ?? "Unknown sender" }}
+              </p>
+              <p v-else-if="message.authorPrefix" class="message-sender">
+                {{ message.authorName ?? shortKey(message.authorPrefix) }}
               </p>
               <p class="message-copy">{{ message.text }}</p>
               <footer>

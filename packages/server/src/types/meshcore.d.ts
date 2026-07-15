@@ -58,6 +58,8 @@ declare module "@liamcottle/meshcore.js" {
             pathLen: number;
             txtType: number;
             senderTimestamp: number;
+            /** Author pubkey prefix (8 hex chars) on SignedPlain frames; set by patchSignedPlain. */
+            signedAuthorPrefix?: string | null;
             text: string;
           };
           channelMessage?: {
@@ -107,12 +109,26 @@ declare module "@liamcottle/meshcore.js" {
       n_direct_dups: number;
       n_flood_dups: number;
     }>;
+    getTelemetry(
+      contactPublicKey: Uint8Array,
+      extraTimeoutMillis?: number,
+    ): Promise<{ reserved: number; pubKeyPrefix: Uint8Array; lppSensorData: Uint8Array }>;
     importContact(advertPacketBytes: Uint8Array): Promise<unknown>;
     exportContact(pubKey?: Uint8Array | null): Promise<{ advertPacketBytes: Uint8Array }>;
     shareContact(pubKey: Uint8Array): Promise<unknown>;
     sendCommandGetChannel(channelIdx: number): Promise<void>;
     sendCommandSetChannel(channelIdx: number, name: string, secret: Uint8Array): Promise<void>;
     sendCommandAppStart(): Promise<void>;
+    /** Frame parser for ContactMsgRecv; replaceable per-instance (see patchSignedPlain). */
+    onContactMsgRecvResponse(reader: FrameReader): void;
+  }
+
+  /** Subset of the library's internal BufferReader passed to on*Response handlers. */
+  export interface FrameReader {
+    readByte(): number;
+    readBytes(count: number): Uint8Array;
+    readUInt32LE(): number;
+    readString(): string;
   }
 
   export class NodeJSSerialConnection extends Connection {
@@ -141,6 +157,10 @@ declare module "@liamcottle/meshcore.js" {
     TxtTypes: { Plain: number; CliData: number; SignedPlain: number };
     StatsTypes: { Core: number; Radio: number; Packets: number };
   };
+
+  export class CayenneLpp {
+    static parse(bytes: Uint8Array): Array<{ channel: number; type: number; value: number | Record<string, number> }>;
+  }
 
   export const BufferUtils: {
     areBuffersEqual(a: Uint8Array, b: Uint8Array): boolean;

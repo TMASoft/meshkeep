@@ -1,4 +1,11 @@
-import { NodeJSSerialConnection, TCPConnection, type Connection } from "@liamcottle/meshcore.js";
+import {
+  BufferUtils,
+  Constants,
+  NodeJSSerialConnection,
+  TCPConnection,
+  type Connection,
+  type FrameReader,
+} from "@liamcottle/meshcore.js";
 import type { ConnectionSettings } from "@meshkeep/shared";
 import { BleNodeConnection } from "./ble-connection.js";
 
@@ -27,12 +34,38 @@ export function createConnection(settings: ConnectionSettings): Connection {
   switch (settings.connection) {
     case "serial":
       // baud rate is fixed at 115200 by the companion firmware / meshcore.js
-      return new NodeJSSerialConnection(settings.serialPort!);
+      return patchSignedPlain(new NodeJSSerialConnection(settings.serialPort!));
     case "tcp":
-      return new TCPConnection(settings.tcpHost!, settings.tcpPort);
+      return patchSignedPlain(new TCPConnection(settings.tcpHost!, settings.tcpPort));
     case "ble":
-      return new BleNodeConnection(settings.bleAddress!);
+      return patchSignedPlain(new BleNodeConnection(settings.bleAddress!));
     default:
       throw new Error(`Cannot create a connection for transport "${settings.connection}"`);
   }
+}
+
+/**
+ * Signed-plain frames (room server posts) carry 4 raw author-pubkey bytes
+ * between the timestamp and the text. meshcore.js decodes the whole remainder
+ * as UTF-8, which mangles those bytes, so re-parse the frame ourselves and
+ * surface the prefix as `signedAuthorPrefix` (8 hex chars).
+ */
+export function patchSignedPlain(connection: Connection): Connection {
+  connection.onContactMsgRecvResponse = function (reader: FrameReader) {
+    const pubKeyPrefix = reader.readBytes(6);
+    const pathLen = reader.readByte();
+    const txtType = reader.readByte();
+    const senderTimestamp = reader.readUInt32LE();
+    const signedAuthorPrefix =
+      txtType === Constants.TxtTypes.SignedPlain ? BufferUtils.bytesToHex(reader.readBytes(4)) : null;
+    this.emit(Constants.ResponseCodes.ContactMsgRecv, {
+      pubKeyPrefix,
+      pathLen,
+      txtType,
+      senderTimestamp,
+      signedAuthorPrefix,
+      text: reader.readString(),
+    });
+  };
+  return connection;
 }

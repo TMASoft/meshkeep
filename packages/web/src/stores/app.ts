@@ -6,6 +6,7 @@ import type {
   Contact,
   Message,
   NodeStats,
+  SensorReading,
   WsEvent,
 } from "@meshkeep/shared";
 import { api, ApiError, connectEvents, type WsStatus } from "../api/client";
@@ -175,8 +176,21 @@ export const useAppStore = defineStore("app", {
       return status;
     },
 
+    async fetchTelemetry(contactKey: string): Promise<SensorReading[]> {
+      const { telemetry } = await api<{ telemetry: SensorReading[] }>(`/contacts/${contactKey}/telemetry`);
+      return telemetry;
+    },
+
     async saveChannel(idx: number, name: string, secret: string) {
       await api(`/channels/${idx}`, { method: "PUT", body: JSON.stringify({ name, secret }) });
+      await this.refreshChannels();
+    },
+
+    async deleteChannel(idx: number) {
+      await api(`/channels/${idx}`, { method: "DELETE" });
+      if (this.activeConversation?.kind === "channel" && this.activeConversation.channelIdx === idx) {
+        this.activeConversation = null;
+      }
       await this.refreshChannels();
     },
 

@@ -62,6 +62,10 @@ export interface Message {
   pathLen: number | null;
   status: MessageStatus;
   createdAt: number;
+  /** Signed-plain room posts: 4-byte pubkey prefix (hex) of the original author. */
+  authorPrefix?: string | null;
+  /** Author's contact name when the prefix matches a known contact. */
+  authorName?: string | null;
 }
 
 export interface ConnectionStatus {
@@ -107,6 +111,15 @@ export interface NodeStats {
 export interface TelemetryPoint {
   ts: number;
   batteryMv: number | null;
+}
+
+/** One parsed Cayenne LPP reading from a remote telemetry request. */
+export interface SensorReading {
+  channel: number;
+  type: number;
+  label: string;
+  unit: string | null;
+  value: number | Record<string, number>;
 }
 
 /** Connection settings the server can be pointed at (env or runtime override). */

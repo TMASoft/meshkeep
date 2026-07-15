@@ -124,6 +124,12 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
       res.json({ status: await manager.getNodeStatus(hexKey(req.params.key)) });
     }),
   );
+  api.get(
+    "/contacts/:key/telemetry",
+    handle(async (req, res) => {
+      res.json({ telemetry: await manager.requestTelemetry(hexKey(req.params.key)) });
+    }),
+  );
   api.post(
     "/contacts/:key/cli",
     handle(async (req, res) => {
@@ -248,6 +254,14 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
         .object({ name: z.string().min(1).max(31), secret: z.string().regex(/^[0-9a-f]{32}$/i) })
         .parse(req.body);
       res.json({ channel: await manager.setChannel(idx, body.name, body.secret.toLowerCase()) });
+    }),
+  );
+  api.delete(
+    "/channels/:idx",
+    handle(async (req, res) => {
+      const idx = z.coerce.number().int().min(0).max(7).parse(req.params.idx);
+      await manager.deleteChannel(idx);
+      res.json({ ok: true });
     }),
   );
 

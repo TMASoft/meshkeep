@@ -19,9 +19,11 @@ export function dedupeHash(
   senderTimestamp: number,
   direction: MessageDirection,
   text: string,
+  authorPrefix?: string | null,
 ): string {
+  // authorPrefix only participates when present so historical hashes stay valid
   return createHash("sha256")
-    .update(`${kind}|${counterparty}|${senderTimestamp}|${direction}|${text}`)
+    .update(`${kind}|${counterparty}|${senderTimestamp}|${direction}|${text}${authorPrefix ? `|${authorPrefix}` : ""}`)
     .digest("hex");
 }
 
@@ -36,8 +38,10 @@ interface MessageRow {
   path_len: number | null;
   status: MessageStatus;
   created_at: number;
+  author_prefix: string | null;
   contact_name?: string | null;
   channel_name?: string | null;
+  author_name?: string | null;
 }
 
 function rowToMessage(row: MessageRow): Message {
@@ -54,14 +58,17 @@ function rowToMessage(row: MessageRow): Message {
     pathLen: row.path_len,
     status: row.status,
     createdAt: row.created_at,
+    authorPrefix: row.author_prefix,
+    authorName: row.author_name ?? null,
   };
 }
 
 const MESSAGE_SELECT = `
-  SELECT m.*, c.name AS contact_name, ch.name AS channel_name
+  SELECT m.*, c.name AS contact_name, ch.name AS channel_name, a.name AS author_name
   FROM messages m
   LEFT JOIN contacts c ON c.public_key = m.contact_key
   LEFT JOIN channels ch ON ch.idx = m.channel_idx
+  LEFT JOIN contacts a ON m.author_prefix IS NOT NULL AND a.public_key LIKE m.author_prefix || '%'
 `;
 
 export class Store {
@@ -150,6 +157,10 @@ export class Store {
       .run(channel.idx, channel.name, channel.secret, now());
   }
 
+  deleteChannel(idx: number): void {
+    this.db.prepare("DELETE FROM channels WHERE idx = ?").run(idx);
+  }
+
   getChannels(): Channel[] {
     const rows = this.db.prepare("SELECT idx, name, secret_hex FROM channels ORDER BY idx").all() as Array<{
       idx: number;
@@ -173,14 +184,15 @@ export class Store {
     pathLen?: number | null;
     ackCrc?: number | null;
     status?: MessageStatus;
+    authorPrefix?: string | null;
   }): Message | null {
     const counterparty = input.kind === "dm" ? input.contactKey ?? "" : String(input.channelIdx ?? "");
-    const hash = dedupeHash(input.kind, counterparty, input.senderTimestamp, input.direction, input.text);
+    const hash = dedupeHash(input.kind, counterparty, input.senderTimestamp, input.direction, input.text, input.authorPrefix);
     const result = this.db
       .prepare(
         `INSERT OR IGNORE INTO messages
-           (kind, contact_key, channel_idx, direction, text, sender_timestamp, path_len, ack_crc, status, dedupe_hash, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (kind, contact_key, channel_idx, direction, text, sender_timestamp, path_len, ack_crc, status, dedupe_hash, created_at, author_prefix)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.kind,
@@ -194,6 +206,7 @@ export class Store {
         input.status ?? (input.direction === "in" ? "sent" : "pending"),
         hash,
         now(),
+        input.authorPrefix ?? null,
       );
     if (result.changes === 0) return null;
     return this.getMessage(Number(result.lastInsertRowid));
@@ -217,9 +230,10 @@ export class Store {
     text: string;
     senderTimestamp: number;
     status: MessageStatus;
+    authorPrefix?: string | null;
   }): Message | null {
     const counterparty = input.kind === "dm" ? input.contactKey ?? "" : String(input.channelIdx ?? "");
-    const hash = dedupeHash(input.kind, counterparty, input.senderTimestamp, input.direction, input.text);
+    const hash = dedupeHash(input.kind, counterparty, input.senderTimestamp, input.direction, input.text, input.authorPrefix);
     const row = this.db
       .prepare("SELECT id FROM messages WHERE dedupe_hash = ? AND status IN ('pending','sent')")
       .get(hash) as { id: number } | undefined;
