@@ -15,6 +15,8 @@ RUN npm run build --workspace @meshkeep/shared \
 
 FROM node:22-bookworm-slim
 ENV NODE_ENV=production
+# udevadm backs serialport's device enumeration (Radio → Connection detection)
+RUN apt-get update && apt-get install -y --no-install-recommends udev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY packages/shared/package.json packages/shared/

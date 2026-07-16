@@ -109,9 +109,11 @@ hatch for unusual boards), and a BLE scan lists nearby radios with signal streng
 and pairing state.
 
 Docker caveat: inside a container, serial detection only sees devices mapped in with
-`devices:` — map your radio (or mount `/dev/serial/by-id`) for it to show up. BLE
-scanning works through the same D-Bus socket mount that the BLE connection uses
-(`docker/compose.ble.yml`); without that mount the scan reports BLE as unavailable.
+`devices:`, and naming them needs the host udev database mounted read-only
+(`/run/udev:/run/udev:ro`, included in `docker/compose.usb.yml`); without it the form
+degrades to manual entry. BLE scanning works through the same D-Bus socket mount that
+the BLE connection uses (`docker/compose.ble.yml`); without that mount the scan
+reports BLE as unavailable.
 
 ## API
 

@@ -25,6 +25,9 @@ services:
       # MESHKEEP_MAP_REFRESH_MINUTES: "10"
     volumes:
       - meshkeep-data:/data
+      # host udev database so Radio → Connection can list USB radios by name;
+      # detection degrades to manual entry without it
+      - /run/udev:/run/udev:ro
 
 volumes:
   meshkeep-data:
