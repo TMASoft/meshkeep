@@ -127,6 +127,12 @@ export interface SensorReading {
   value: number | Record<string, number>;
 }
 
+/** One stored remote telemetry response for a contact. */
+export interface ContactTelemetryPoint {
+  ts: number;
+  readings: SensorReading[];
+}
+
 /** Connection settings the server can be pointed at (env or runtime override). */
 export interface ConnectionSettings {
   connection: ConnectionTransport;

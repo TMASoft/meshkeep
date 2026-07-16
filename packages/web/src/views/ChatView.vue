@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
-import type { Contact, Message, MessageSearchResult, NodeStats, SensorReading } from "@meshkeep/shared";
+import type {
+  Contact,
+  ContactTelemetryPoint,
+  Message,
+  MessageSearchResult,
+  NodeStats,
+  SensorReading,
+} from "@meshkeep/shared";
 import {
   buildChannelShareUri,
   channelSecretToBase64,
@@ -437,7 +444,74 @@ const requestTelemetry = () =>
     if (!contact) return;
     sensorReadings.value = await store.fetchTelemetry(contact.publicKey);
     if (!sensorReadings.value.length) detailsNotice.value = "Node replied but reported no sensor data";
+    else void loadTelemetryHistory();
   });
+
+// ---- per-contact telemetry history ----
+
+const telemetryHistory = ref<ContactTelemetryPoint[] | null>(null);
+
+async function loadTelemetryHistory() {
+  const contact = activeContact.value;
+  if (!contact) {
+    telemetryHistory.value = null;
+    return;
+  }
+  try {
+    const { points } = await api<{ points: ContactTelemetryPoint[] }>(
+      `/contacts/${contact.publicKey}/telemetry/history`,
+    );
+    telemetryHistory.value = points;
+  } catch {
+    telemetryHistory.value = null;
+  }
+}
+
+watch([detailsOpen, activeContact], ([open]) => {
+  telemetryHistory.value = null;
+  if (open && activeContact.value) void loadTelemetryHistory();
+});
+
+interface SensorSeries {
+  key: string;
+  label: string;
+  unit: string | null;
+  latest: number;
+  min: number;
+  max: number;
+  line: string;
+}
+
+/** One sparkline per numeric sensor channel, oldest → newest. */
+const sensorSeries = computed<SensorSeries[]>(() => {
+  const history = telemetryHistory.value;
+  if (!history) return [];
+  const grouped = new Map<string, { label: string; unit: string | null; points: { ts: number; value: number }[] }>();
+  for (const point of history) {
+    for (const reading of point.readings) {
+      if (typeof reading.value !== "number") continue; // GPS and friends don't chart
+      const key = `${reading.channel}:${reading.type}`;
+      const entry = grouped.get(key) ?? { label: `${reading.label} · ch ${reading.channel}`, unit: reading.unit, points: [] };
+      entry.points.push({ ts: point.ts, value: reading.value });
+      grouped.set(key, entry);
+    }
+  }
+  const series: SensorSeries[] = [];
+  for (const [key, entry] of grouped) {
+    if (entry.points.length < 2) continue;
+    const values = entry.points.map((p) => p.value);
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const span = Math.max(max - min, Math.abs(max) * 0.01, 0.001); // flat series stay centered
+    const t0 = entry.points[0]!.ts;
+    const dt = Math.max(entry.points[entry.points.length - 1]!.ts - t0, 1);
+    const line = entry.points
+      .map((p) => `${(((p.ts - t0) / dt) * 300).toFixed(1)},${(40 - ((p.value - min) / span) * 36).toFixed(1)}`)
+      .join(" ");
+    series.push({ key, label: entry.label, unit: entry.unit, latest: values[values.length - 1]!, min, max, line });
+  }
+  return series;
+});
 
 function fmtReading(reading: SensorReading): string {
   if (typeof reading.value === "number") {
@@ -771,6 +845,23 @@ function fmtLastAdvert(epoch: number): string {
             </div>
           </dl>
 
+          <div v-if="sensorSeries.length" class="telemetry-history">
+            <span class="instrument-label">Telemetry history</span>
+            <div v-for="series in sensorSeries" :key="series.key" class="sensor-chart">
+              <div class="sensor-chart-head">
+                <span>{{ series.label }}</span>
+                <span>{{ series.latest }}{{ series.unit ? ` ${series.unit}` : "" }}</span>
+              </div>
+              <svg viewBox="0 0 300 44" preserveAspectRatio="none" role="img" :aria-label="`${series.label} history`">
+                <polyline :points="series.line" class="sensor-chart-line" fill="none" />
+              </svg>
+              <div class="sensor-chart-scale">
+                <span>{{ series.min }}{{ series.unit ? ` ${series.unit}` : "" }}</span>
+                <span>{{ series.max }}{{ series.unit ? ` ${series.unit}` : "" }}</span>
+              </div>
+            </div>
+          </div>
+
           <p v-if="detailsNotice" class="details-notice" role="status">{{ detailsNotice }}</p>
           <div class="details-actions">
             <template v-if="activeContact">
@@ -1008,6 +1099,12 @@ function fmtLastAdvert(epoch: number): string {
 .result-snippet { display: block; overflow: hidden; max-width: 100%; white-space: nowrap; text-overflow: ellipsis; }
 .result-snippet mark { border-radius: 2px; background: color-mix(in srgb, var(--accent) 28%, transparent); color: inherit; }
 .result-day { flex: 0 0 auto; color: var(--text-faint); font-size: 10px; }
+.telemetry-history { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.sensor-chart svg { display: block; width: 100%; height: 44px; }
+.sensor-chart-line { stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.sensor-chart-head { display: flex; justify-content: space-between; margin-bottom: 2px; font-size: 11px; color: var(--text-muted); }
+.sensor-chart-head span:last-child { color: var(--text); font-weight: 650; }
+.sensor-chart-scale { display: flex; justify-content: space-between; color: var(--text-faint); font-size: 9px; }
 .message-row.out { justify-content: flex-end; }
 .message-bubble { max-width: min(68%, 680px); border: 1px solid var(--border); border-radius: 13px 13px 13px 4px; background: var(--surface-2); padding: calc(10px * var(--space-unit)) 12px 8px; box-shadow: 0 8px 20px rgb(0 0 0 / .08); }
 .message-row.out .message-bubble { border-color: color-mix(in srgb, var(--accent) 34%, var(--border)); border-radius: 13px 13px 4px 13px; background: color-mix(in srgb, var(--accent) 10%, var(--surface-2)); }

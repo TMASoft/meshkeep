@@ -131,6 +131,14 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
       res.json({ telemetry: await manager.requestTelemetry(hexKey(req.params.key)) });
     }),
   );
+  api.get(
+    "/contacts/:key/telemetry/history",
+    handle((req, res) => {
+      const hours = z.coerce.number().int().min(1).max(24 * 30).default(24 * 7).parse(req.query.hours ?? 24 * 7);
+      const since = Math.floor(Date.now() / 1000) - hours * 3600;
+      res.json({ points: manager.store.getContactTelemetry(hexKey(req.params.key), since) });
+    }),
+  );
   api.post(
     "/contacts/:key/cli",
     handle(async (req, res) => {

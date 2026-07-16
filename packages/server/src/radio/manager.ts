@@ -669,13 +669,18 @@ export class ConnectionManager {
     const response = await connection.getTelemetry(BufferUtils.hexToBytes(contactKey)).catch(() => {
       throw new Error("telemetry request failed — is the node reachable?");
     });
-    return CayenneLpp.parse(response.lppSensorData).map((item) => ({
+    const readings = CayenneLpp.parse(response.lppSensorData).map((item) => ({
       channel: item.channel,
       type: item.type,
       label: LPP_TYPE_INFO[item.type]?.label ?? `Sensor type ${item.type}`,
       unit: LPP_TYPE_INFO[item.type]?.unit ?? null,
       value: item.value,
     }));
+    if (readings.length) {
+      this.store.recordContactTelemetry(contactKey, readings);
+      this.store.trimTelemetry(this.config.telemetryRetentionDays);
+    }
+    return readings;
   }
 
   private async pollBattery(): Promise<void> {

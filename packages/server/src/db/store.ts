@@ -2,12 +2,14 @@ import { createHash } from "node:crypto";
 import type {
   Channel,
   Contact,
+  ContactTelemetryPoint,
   Message,
   MessageDirection,
   MessageKind,
   MessageSearchResult,
   MessageStatus,
   SelfInfo,
+  SensorReading,
   TelemetryPoint,
 } from "@meshkeep/shared";
 import type { Db } from "./index.js";
@@ -374,9 +376,23 @@ export class Store {
 
   getTelemetry(sinceTs: number): TelemetryPoint[] {
     const rows = this.db
-      .prepare("SELECT ts, battery_mv FROM telemetry WHERE ts >= ? ORDER BY ts ASC")
+      .prepare("SELECT ts, battery_mv FROM telemetry WHERE contact_key IS NULL AND ts >= ? ORDER BY ts ASC")
       .all(sinceTs) as Array<{ ts: number; battery_mv: number | null }>;
     return rows.map((r) => ({ ts: r.ts, batteryMv: r.battery_mv }));
+  }
+
+  /** Persist one successful remote telemetry response for a contact. */
+  recordContactTelemetry(contactKey: string, readings: SensorReading[]): void {
+    this.db
+      .prepare("INSERT INTO telemetry (ts, battery_mv, raw_json, contact_key) VALUES (?, NULL, ?, ?)")
+      .run(now(), JSON.stringify(readings), contactKey);
+  }
+
+  getContactTelemetry(contactKey: string, sinceTs: number): ContactTelemetryPoint[] {
+    const rows = this.db
+      .prepare("SELECT ts, raw_json FROM telemetry WHERE contact_key = ? AND ts >= ? ORDER BY ts ASC")
+      .all(contactKey, sinceTs) as Array<{ ts: number; raw_json: string | null }>;
+    return rows.map((row) => ({ ts: row.ts, readings: row.raw_json ? (JSON.parse(row.raw_json) as SensorReading[]) : [] }));
   }
 
   /** Delete telemetry rows older than the retention window. Returns rows removed. */
@@ -388,7 +404,7 @@ export class Store {
 
   latestBatteryMv(): number | null {
     const row = this.db
-      .prepare("SELECT battery_mv FROM telemetry WHERE battery_mv IS NOT NULL ORDER BY id DESC LIMIT 1")
+      .prepare("SELECT battery_mv FROM telemetry WHERE contact_key IS NULL AND battery_mv IS NOT NULL ORDER BY id DESC LIMIT 1")
       .get() as { battery_mv: number } | undefined;
     return row?.battery_mv ?? null;
   }
