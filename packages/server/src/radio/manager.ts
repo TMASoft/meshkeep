@@ -16,9 +16,8 @@ import type { Bus } from "../bus.js";
 import { getSetting, setSetting, type Db } from "../db/index.js";
 import { Store } from "../db/store.js";
 import { createConnection, describeTarget } from "./transports.js";
+import { describeConnectError, nextReconnectDelay, reconnectPolicyFor } from "./reconnect-policy.js";
 
-const RECONNECT_MIN_MS = 2_000;
-const RECONNECT_MAX_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 15_000;
 // BLE needs discovery + GATT enumeration (and possibly a pairing handshake)
 const BLE_CONNECT_TIMEOUT_MS = 45_000;
@@ -82,7 +81,8 @@ export class ConnectionManager {
   private state: ConnectionState = "disconnected";
   private lastError: string | null = null;
   private connectedAt: number | null = null;
-  private reconnectDelay = RECONNECT_MIN_MS;
+  // 0 = "start from the transport policy's minimum" on the next scheduling
+  private reconnectDelay = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private batteryTimer: NodeJS.Timeout | null = null;
   private stopped = false;
@@ -141,7 +141,7 @@ export class ConnectionManager {
       this.setState("disconnected", "no radio transport configured");
       return;
     }
-    this.reconnectDelay = RECONNECT_MIN_MS;
+    this.reconnectDelay = 0;
     await this.connect();
   }
 
@@ -252,14 +252,15 @@ export class ConnectionManager {
       await this.initialSync(connection);
 
       this.connectedAt = Math.floor(Date.now() / 1000);
-      this.reconnectDelay = RECONNECT_MIN_MS;
+      this.reconnectDelay = 0;
       this.setState("connected", null);
 
       this.batteryTimer = setInterval(() => {
         void this.pollBattery();
       }, BATTERY_POLL_MS);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error ?? "connect failed");
+      const raw = error instanceof Error ? error.message : String(error ?? "connect failed");
+      const message = describeConnectError(this.connectionSettings().effective.connection, raw);
       console.error(`[radio] connect failed: ${message}`);
       await this.teardown();
       this.setState("error", message);
@@ -269,8 +270,9 @@ export class ConnectionManager {
 
   private scheduleReconnect(): void {
     if (this.stopped || this.isStandby() || this.reconnectTimer) return;
-    const delay = this.reconnectDelay;
-    this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
+    const policy = reconnectPolicyFor(this.connectionSettings().effective.connection);
+    const delay = Math.max(this.reconnectDelay, policy.minDelayMs);
+    this.reconnectDelay = nextReconnectDelay(delay, policy);
     console.log(`[radio] reconnecting in ${Math.round(delay / 1000)}s`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
