@@ -191,3 +191,4 @@ export const CONTACT_TYPE_FROM_ADV: Record<number, ContactType> = {
   3: "room",
 };
 export * from "./channels.js";
+export * from "./messages.js";

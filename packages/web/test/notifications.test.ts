@@ -109,6 +109,16 @@ describe("notifyIncoming", () => {
     expect(constructed).toHaveLength(0);
   });
 
+  it("uses the inline 'name: msg' sender for channel notifications", () => {
+    pref = "all";
+    notifyIncoming(
+      message({ kind: "channel", channelIdx: 0, channelName: "Public", contactKey: null, contactName: null, text: "MCTA-Rak: Bing bong" }),
+      { conversationActive: false },
+    );
+    expect(constructed[0]!.title).toBe("Public · MCTA-Rak");
+    expect(constructed[0]!.options.body).toBe("Bing bong");
+  });
+
   it("click focuses the window and navigates to the conversation", () => {
     pref = "dms";
     notifyIncoming(message(), { conversationActive: false });
