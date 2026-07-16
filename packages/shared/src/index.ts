@@ -68,6 +68,11 @@ export interface Message {
   authorName?: string | null;
 }
 
+export interface MessageSearchResult extends Message {
+  /** Excerpt around the match; matched terms are wrapped in \x01…\x02. */
+  snippet: string;
+}
+
 export interface ConnectionStatus {
   state: ConnectionState;
   transport: ConnectionTransport;

@@ -76,6 +76,23 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE messages ADD COLUMN author_prefix TEXT;
   `,
+  // 3: full-text search over message text (external-content FTS5 table kept
+  // in sync by triggers; messages are append-mostly but delete/update stay
+  // covered so the index can never drift)
+  `
+  CREATE VIRTUAL TABLE messages_fts USING fts5(text, content='messages', content_rowid='id');
+  CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
+  END;
+  CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
+  END;
+  CREATE TRIGGER messages_fts_au AFTER UPDATE OF text ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
+  END;
+  INSERT INTO messages_fts(rowid, text) SELECT id, text FROM messages;
+  `,
 ];
 
 export type Db = Database.Database;

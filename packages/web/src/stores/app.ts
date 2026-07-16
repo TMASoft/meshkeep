@@ -5,6 +5,7 @@ import type {
   ConnectionState,
   Contact,
   Message,
+  MessageSearchResult,
   NodeStats,
   SensorReading,
   WsEvent,
@@ -128,6 +129,36 @@ export const useAppStore = defineStore("app", {
         method: "POST",
         body: JSON.stringify(id.kind === "dm" ? { contact: id.contactKey } : { channel: id.channelIdx }),
       }).catch(() => {});
+    },
+
+    async searchMessages(query: string): Promise<MessageSearchResult[]> {
+      const { results } = await api<{ results: MessageSearchResult[] }>(
+        `/messages/search?q=${encodeURIComponent(query)}&limit=20`,
+      );
+      return results;
+    },
+
+    /**
+     * Open a conversation and page history backwards until the given message
+     * is in the loaded window (bounded). Returns whether it was found.
+     */
+    async openConversationAt(id: ConversationId, messageId: number): Promise<boolean> {
+      await this.openConversation(id);
+      const key = conversationKey(id);
+      const query =
+        id.kind === "dm" ? `contact=${encodeURIComponent(id.contactKey)}` : `channel=${id.channelIdx}`;
+      for (let page = 0; page < 25; page++) {
+        const list = this.conversations[key] ?? [];
+        if (list.some((message) => message.id === messageId)) return true;
+        const oldest = list[0]?.id;
+        if (oldest === undefined || oldest <= messageId) return false;
+        const { messages } = await api<{ messages: Message[] }>(`/messages?${query}&before=${oldest}&limit=200`);
+        if (!messages.length) return false;
+        const merged = new Map(messages.map((message) => [message.id, message]));
+        for (const message of list) merged.set(message.id, message);
+        this.conversations[key] = [...merged.values()].sort((a, b) => a.id - b.id);
+      }
+      return false;
     },
 
     async sendMessage(id: ConversationId, text: string) {
