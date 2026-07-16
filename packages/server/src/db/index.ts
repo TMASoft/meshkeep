@@ -93,6 +93,12 @@ const MIGRATIONS: string[] = [
   END;
   INSERT INTO messages_fts(rowid, text) SELECT id, text FROM messages;
   `,
+  // 4: remote telemetry history — contact_key NULL keeps meaning "our own
+  // node" (battery polls); remote responses store parsed readings per contact
+  `
+  ALTER TABLE telemetry ADD COLUMN contact_key TEXT;
+  CREATE INDEX idx_telemetry_contact ON telemetry (contact_key, ts);
+  `,
 ];
 
 export type Db = Database.Database;
