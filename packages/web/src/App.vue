@@ -5,6 +5,7 @@ import { useAppStore } from "./stores/app";
 import AppIcon from "./components/AppIcon.vue";
 import LoginGate from "./components/LoginGate.vue";
 
+const version = __APP_VERSION__;
 const store = useAppStore();
 const route = useRoute();
 const appearanceOpen = ref(false);
@@ -161,7 +162,7 @@ const stateColor = computed(() => {
           <AppIcon name="logout" :size="22" />
           <span>Sign out</span>
         </button>
-        <span class="rail-version">v0.1</span>
+        <span class="rail-version">v{{ version }}</span>
       </div>
     </aside>
 
