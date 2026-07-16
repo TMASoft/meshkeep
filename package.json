@@ -1,6 +1,6 @@
 {
   "name": "meshkeep",
-  "version": "0.1.1-beta",
+  "version": "0.1.2-beta",
   "private": true,
   "description": "Self-hosted MeshCore companion web client \u2014 chat, contacts, channels, and map for your LoRa mesh.",
   "license": "MIT",
@@ -18,7 +18,18 @@
     "mock-radio": "npm run mock-radio --workspace @meshkeep/server",
     "build": "npm run build --workspace @meshkeep/shared && npm run build --workspace @meshkeep/server && npm run build --workspace @meshkeep/web",
     "test": "npm run test --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "eslint": "^9.30.0",
+    "eslint-config-prettier": "^10.1.0",
+    "eslint-plugin-vue": "^10.3.0",
+    "prettier": "^3.6.0",
+    "typescript-eslint": "^8.35.0",
+    "vue-eslint-parser": "^10.2.0"
   },
   "allowScripts": {
     "@serialport/bindings-cpp@13.0.0": true,

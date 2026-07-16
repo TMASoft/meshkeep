@@ -25,6 +25,7 @@ jobs:
       - run: npm run build --workspace @meshkeep/shared
 
       - run: npm run typecheck
+      - run: npm run lint
       - run: npm test
 
   docker:

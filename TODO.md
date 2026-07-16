@@ -1,5 +1,32 @@
 # MeshKeep TODO
 
+## Validation session runbook (hardware day)
+
+Ordered to minimize replug/reflash churn — serial soak starts first and runs in
+the background for the whole session:
+
+1. `docker compose up -d` (compose.yml now pulls `ghcr.io/tmasoft/meshkeep:0.1.1-beta`);
+   `curl localhost:8080/api/healthz` should report 0.1.1-beta. Start the soak log:
+   `./scripts/soak-check.sh &` — leave it running 24h (unplug/replug the radio once
+   mid-soak to cover the reconnect item).
+2. Mint an API token (Radio → API access) → configure the launcher's meshkeep plugin
+   (v0.1.1, install from GitHub) → dashboard shows messages + unread badge.
+3. Map page: global nodes load, own node + positioned contacts overlaid.
+4. RF params round-trip on real firmware (remember: firmware reports kHz).
+5. meshcore:// contact import from the phone app; export to it.
+6. Login flow: uncomment MESHKEEP_UI_PASSWORD in compose.yml, `docker compose up -d`,
+   verify the login gate + that the API token still works for the plugin. Revert after.
+7. Browser-direct WebSerial per docs/https.md "Validation-session quick start".
+8. BLE trio: server BLE reconnect after radio power-cycle; DM round-trip over the BLE
+   server link; browser-direct WebBLE from a phone/laptop.
+9. Real room/repeater: repeater login + status + CLI from the composer; join/post to a
+   real room server; create a channel the phone app can join from the copied secret.
+10. Hardware check of the parity items: telemetry request from a real node, signed post
+    attribution in a real room, channel delete on real firmware.
+
+Review the soak afterwards: `grep -v 'state=connected' soak.log` (gaps) and the mem column
+(drift).
+
 All build phases are code-complete. Done and mock-verified: full client
 (chat/channels/adverts/map/tokens), UI overhaul, login page, RF params, battery chart,
 connection settings override, meshcore:// share/import, contact management, message export,
@@ -51,10 +78,15 @@ room server login + posts, and repeater admin (login, status readout, remote CLI
 ## Infra / release
 
 - [x] GitHub repo (github.com/TMASoft/meshkeep) — v0.1.0-Beta released 2026-07-15
-- [x] CI (typecheck, vitest, docker build) — .github/workflows/ci.yml; first run
-      verifies on the next push
+- [x] CI (typecheck, lint, vitest, docker build) — .github/workflows/ci.yml; green on
+      master since 2026-07-15 (trigger originally pointed at a nonexistent `main` branch,
+      and CI now builds @meshkeep/shared before typechecking)
 - [x] Publish image to ghcr.io (release.yml, multi-arch, runs on v* tags) + dependabot
-      (npm weekly grouped minor/patch, actions, docker)
+      (npm weekly grouped minor/patch, actions, docker) — first published image:
+      v0.1.1-beta (2026-07-15, also tagged `beta`); v0.1.0-Beta predates release.yml
+      on master and has no image
 - [x] Docker image builds and runs clean (verified at 0.1.0-beta)
+- [x] HTTP/auth/ws test suites (supertest) + web tests (Pinia store, api client) +
+      ESLint/Prettier (2026-07-15)
 - [ ] NOTE: /mnt/storage is ntfs3 — npm installs hang on it; run npm in a tmpfs dir
       and copy package-lock.json back (see project memory)

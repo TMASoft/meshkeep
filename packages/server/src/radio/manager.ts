@@ -314,7 +314,7 @@ export class ConnectionManager {
       this.bus.publish({ type: "contact.updated", contact });
     });
 
-    connection.on(Constants.PushCodes.PathUpdated, (push: { publicKey: Uint8Array }) => {
+    connection.on(Constants.PushCodes.PathUpdated, (_push: { publicKey: Uint8Array }) => {
       void this.refreshContacts().catch(() => {});
     });
   }

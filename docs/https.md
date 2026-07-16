@@ -61,6 +61,22 @@ For quick tests only, Chromium can be told to treat a plain-HTTP origin as secur
 
 This weakens the browser's security model for that origin — prefer options 1–2.
 
+## Validation-session quick start
+
+Fastest path to exercising browser-direct with a radio on the browsing machine:
+
+1. Plug the RAK4631 (Companion USB firmware) into the machine you browse from.
+2. Open `http://localhost:8080` in Chromium (SSH tunnel if the server is remote:
+   `ssh -L 8080:server:8080 you@server`) — no HTTPS setup needed.
+3. Radio → Radio source → *USB (WebSerial)*, pick the device in the Chromium prompt.
+4. Verify in order: DM send/receive, delivery ticks appearing via sync-back, a
+   *Private session* keeping traffic out of server history, the offline queue
+   (stop the server mid-session, keep chatting, restart — queued traffic syncs),
+   and *Disconnect & hand back to server* reclaiming the server radio.
+5. WebBLE is the same flow with the BLE-firmware radio: Radio source →
+   *Bluetooth (WebBLE)*. Expect the per-device PIN (printed on the radio's
+   console at boot), not necessarily 123456.
+
 ## After HTTPS is in place
 
 Open MeshKeep → **Radio → Radio source** → *USB (WebSerial)* or *Bluetooth (WebBLE)*.
