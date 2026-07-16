@@ -5,8 +5,8 @@
 Ordered to minimize replug/reflash churn — serial soak starts first and runs in
 the background for the whole session:
 
-1. `docker compose up -d` (compose.yml now pulls `ghcr.io/tmasoft/meshkeep:0.1.1-beta`);
-   `curl localhost:8080/api/healthz` should report 0.1.1-beta. Start the soak log:
+1. `docker compose up -d` (compose.yml pulls `ghcr.io/tmasoft/meshkeep:beta`);
+   `curl localhost:8080/api/healthz` should report the current beta. Start the soak log:
    `./scripts/soak-check.sh &` — leave it running 24h (unplug/replug the radio once
    mid-soak to cover the reconnect item).
 2. Mint an API token (Radio → API access) → configure the launcher's meshkeep plugin
