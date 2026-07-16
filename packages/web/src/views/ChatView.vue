@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
 import type { Contact, Message, NodeStats, SensorReading } from "@meshkeep/shared";
+import {
+  buildChannelShareUri,
+  channelSecretToBase64,
+  deriveHashtagChannelSecret,
+  isHashtagChannelName,
+  normalizeChannelSecret,
+  parseChannelShareUri,
+} from "@meshkeep/shared";
 import { api } from "../api/client";
 import { useAppStore, conversationKey, type ConversationId } from "../stores/app";
 import AppIcon from "../components/AppIcon.vue";
@@ -233,6 +241,27 @@ function generateSecret(): string {
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+const channelIsHashtag = computed(() => isHashtagChannelName(channelName.value.trim()));
+
+// Pasting a meshcore://channel/add link (official app share/QR) into either
+// field fills out the whole form.
+watch([channelName, channelSecret], ([name, secret]) => {
+  const share = parseChannelShareUri(name) ?? parseChannelShareUri(secret);
+  if (share) {
+    channelName.value = share.name;
+    channelSecret.value = share.secret;
+  }
+});
+
+// Hashtag channels derive their key from the name, so everyone's #topic
+// interoperates; keep the secret field mirroring the derived key.
+watch([channelIsHashtag, channelName], async ([isTag]) => {
+  if (!isTag) return;
+  const name = channelName.value.trim();
+  const derived = await deriveHashtagChannelSecret(name);
+  if (channelName.value.trim() === name) channelSecret.value = derived;
+});
+
 function openChannelForm(channel?: { idx: number; name: string; secret: string }) {
   channelError.value = null;
   if (channel) {
@@ -252,14 +281,17 @@ function openChannelForm(channel?: { idx: number; name: string; secret: string }
 
 async function submitChannel() {
   const name = channelName.value.trim();
-  const secret = channelSecret.value.trim().toLowerCase();
   channelError.value = null;
   if (!name) {
     channelError.value = "Channel name is required";
     return;
   }
-  if (!/^[0-9a-f]{32}$/.test(secret)) {
-    channelError.value = "Secret must be 32 hex characters (16 bytes) — use Generate, or paste a shared key";
+  const secret = isHashtagChannelName(name)
+    ? await deriveHashtagChannelSecret(name)
+    : normalizeChannelSecret(channelSecret.value);
+  if (!secret) {
+    channelError.value =
+      "Secret must be 32 hex characters or a 16-byte base64 key — use Generate, or paste a shared key or meshcore:// link";
     return;
   }
   channelBusy.value = true;
@@ -341,12 +373,27 @@ const deleteActiveChannel = () =>
     await store.deleteChannel(channel.idx);
   });
 
-async function copyChannelSecret() {
+const activeChannelSecretBase64 = computed(() =>
+  activeChannel.value ? channelSecretToBase64(activeChannel.value.secret) : "",
+);
+
+async function copyChannelSecret(format: "hex" | "base64") {
   const channel = activeChannel.value;
   if (!channel) return;
   try {
-    await navigator.clipboard.writeText(channel.secret);
-    detailsNotice.value = "Channel secret copied — share it with people joining";
+    await navigator.clipboard.writeText(format === "hex" ? channel.secret : activeChannelSecretBase64.value);
+    detailsNotice.value = `Channel secret copied as ${format} — share it with people joining`;
+  } catch {
+    detailsNotice.value = null;
+  }
+}
+
+async function copyChannelShareLink() {
+  const channel = activeChannel.value;
+  if (!channel) return;
+  try {
+    await navigator.clipboard.writeText(buildChannelShareUri(channel.name, channel.secret));
+    detailsNotice.value = "meshcore:// share link copied — the phone app can open it";
   } catch {
     detailsNotice.value = null;
   }
@@ -422,12 +469,22 @@ function fmtLastAdvert(epoch: number): string {
               <input v-model="channelName" maxlength="31" placeholder="my-channel" autocomplete="off" />
             </label>
             <label>
-              <span>Shared secret · paste to join, generate to create</span>
+              <span>{{ channelIsHashtag ? "Shared secret · derived from the name" : "Shared secret · paste to join, generate to create" }}</span>
               <div class="secret-row">
-                <input v-model="channelSecret" placeholder="32 hex characters" spellcheck="false" autocomplete="off" />
-                <button type="button" @click="channelSecret = generateSecret()">Generate</button>
+                <input
+                  v-model="channelSecret"
+                  placeholder="hex, base64, or meshcore:// link"
+                  spellcheck="false"
+                  autocomplete="off"
+                  :disabled="channelIsHashtag"
+                />
+                <button type="button" :disabled="channelIsHashtag" @click="channelSecret = generateSecret()">Generate</button>
               </div>
             </label>
+            <p v-if="channelIsHashtag" class="channel-hint">
+              # names follow the MeshCore hashtag convention: the key comes from the name, so anyone who adds
+              {{ channelName.trim() }} lands on the same channel.
+            </p>
             <p v-if="channelError" class="import-error" role="alert">{{ channelError }}</p>
             <button class="import-submit channel-submit" type="submit" :disabled="channelBusy">
               {{ channelBusy ? "Saving" : "Save channel" }}
@@ -556,8 +613,12 @@ function fmtLastAdvert(epoch: number): string {
             <div><dt>Channel slot</dt><dd>{{ active.channelIdx }}</dd></div>
             <div><dt>Messages</dt><dd>{{ messages.length }} loaded</dd></div>
             <div v-if="activeChannel">
-              <dt>Shared secret</dt>
-              <dd class="secret-value">{{ activeChannel.secret.slice(0, 8) }}…{{ activeChannel.secret.slice(-4) }}</dd>
+              <dt>Secret · hex</dt>
+              <dd class="secret-value">{{ activeChannel.secret }}</dd>
+            </div>
+            <div v-if="activeChannel">
+              <dt>Secret · base64</dt>
+              <dd class="secret-value">{{ activeChannelSecretBase64 }}</dd>
             </div>
           </dl>
 
@@ -620,8 +681,14 @@ function fmtLastAdvert(epoch: number): string {
               </button>
             </template>
             <template v-if="activeChannel">
-              <button type="button" @click="copyChannelSecret">
-                <AppIcon name="key" :size="15" /> Copy secret
+              <button type="button" @click="copyChannelSecret('hex')">
+                <AppIcon name="key" :size="15" /> Copy hex secret
+              </button>
+              <button type="button" @click="copyChannelSecret('base64')">
+                <AppIcon name="key" :size="15" /> Copy base64 secret
+              </button>
+              <button type="button" @click="copyChannelShareLink">
+                <AppIcon name="link" :size="15" /> Copy share link
               </button>
               <button type="button" @click="openChannelForm(activeChannel)">
                 <AppIcon name="settings" :size="15" /> Edit channel
@@ -804,7 +871,10 @@ function fmtLastAdvert(epoch: number): string {
 .details-facts dt { color: var(--text-faint); font-family: monospace; font-size: 8px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
 .details-facts dd { margin: 0; color: var(--text); font-family: monospace; font-size: 11px; }
 .details-notice { margin: 0 0 10px; color: var(--accent); font-size: 11px; }
-.secret-value { letter-spacing: .03em; }
+.secret-value { letter-spacing: .03em; overflow-wrap: anywhere; font-family: monospace; }
+.channel-hint { width: 100%; margin: 0; color: var(--text-faint); font-size: 10px; line-height: 1.5; }
+.secret-row input:disabled, .secret-row button:disabled { opacity: .55; cursor: default; }
+.secret-row button:disabled:hover { border-color: var(--border); color: var(--text); }
 .node-login { margin: 0 0 12px; }
 .node-login .instrument-label { display: block; margin-bottom: 6px; }
 .node-login-row { display: flex; gap: 7px; max-width: 380px; }

@@ -158,3 +158,4 @@ export const CONTACT_TYPE_FROM_ADV: Record<number, ContactType> = {
   2: "repeater",
   3: "room",
 };
+export * from "./channels.js";
