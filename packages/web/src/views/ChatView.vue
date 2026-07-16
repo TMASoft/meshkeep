@@ -18,6 +18,7 @@ import {
 } from "@meshkeep/shared";
 import { api } from "../api/client";
 import { useAppStore, conversationKey, type ConversationId } from "../stores/app";
+import { displayMessage } from "../message-display";
 import AppIcon from "../components/AppIcon.vue";
 
 const store = useAppStore();
@@ -980,13 +981,10 @@ function fmtLastAdvert(epoch: number): string {
             :data-mid="message.id"
           >
             <article class="message-bubble">
-              <p v-if="message.kind === 'channel' && message.direction === 'in'" class="message-sender">
-                {{ message.contactName ?? "Unknown sender" }}
+              <p v-if="displayMessage(message).sender" class="message-sender">
+                {{ displayMessage(message).sender }}
               </p>
-              <p v-else-if="message.authorPrefix" class="message-sender">
-                {{ message.authorName ?? shortKey(message.authorPrefix) }}
-              </p>
-              <p class="message-copy">{{ message.text }}</p>
+              <p class="message-copy">{{ displayMessage(message).text }}</p>
               <footer>
                 <time :datetime="new Date(message.senderTimestamp * 1000).toISOString()">
                   {{ formatTime(message.senderTimestamp) }}
@@ -1051,8 +1049,8 @@ function fmtLastAdvert(epoch: number): string {
 </template>
 
 <style scoped>
-.comms-layout { display: grid; height: 100%; grid-template-columns: minmax(280px, 340px) minmax(0, 1fr); background: var(--bg); }
-.conversation-panel { display: flex; min-width: 0; flex-direction: column; border-right: 1px solid var(--border); background: var(--surface-1); }
+.comms-layout { display: grid; min-height: 0; height: 100%; grid-template-columns: minmax(280px, 340px) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); background: var(--bg); }
+.conversation-panel { display: flex; min-width: 0; min-height: 0; flex-direction: column; border-right: 1px solid var(--border); background: var(--surface-1); }
 .conversation-heading { display: flex; align-items: end; justify-content: space-between; padding: calc(24px * var(--space-unit)) 20px 16px; }
 .conversation-heading h1 { margin: 3px 0 0; font-size: 27px; font-weight: 720; letter-spacing: -.03em; }
 .total-unread { border-radius: 999px; background: var(--accent); padding: 4px 8px; color: var(--accent-ink); font-family: monospace; font-size: 10px; font-weight: 800; }
@@ -1060,7 +1058,7 @@ function fmtLastAdvert(epoch: number): string {
 .search-field:focus-within { border-color: var(--cyan); color: var(--cyan); }
 .search-field input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 13px; }
 .search-field input::placeholder { color: var(--text-faint); }
-.conversation-scroll { min-height: 0; flex: 1; overflow-y: auto; padding: 0 9px 20px; }
+.conversation-scroll { min-height: 0; flex: 1; overflow-y: auto; scrollbar-gutter: stable; padding: 0 9px 20px; }
 .conversation-group + .conversation-group { margin-top: 19px; }
 .group-heading { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; }
 .group-heading h2, .group-heading span { margin: 0; color: var(--text-faint); font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
@@ -1099,7 +1097,7 @@ function fmtLastAdvert(epoch: number): string {
 .secret-row button { height: 36px; flex: 0 0 auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-3); padding: 0 10px; color: var(--text); font-size: 10px; font-weight: 700; cursor: pointer; }
 .secret-row button:hover { border-color: var(--cyan); color: var(--cyan); }
 .channel-submit { align-self: flex-end; }
-.thread-panel { display: flex; min-width: 0; flex-direction: column; background: var(--bg); }
+.thread-panel { display: flex; min-width: 0; min-height: 0; flex-direction: column; background: var(--bg); }
 .thread-heading { display: flex; min-height: 70px; flex: 0 0 70px; align-items: center; gap: 11px; border-bottom: 1px solid var(--border); background: var(--surface-1); padding: 0 22px; }
 .thread-avatar { display: grid; width: 38px; height: 38px; place-items: center; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-2); color: var(--accent); }
 .thread-title { min-width: 0; }
