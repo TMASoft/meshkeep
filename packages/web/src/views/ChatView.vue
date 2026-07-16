@@ -177,6 +177,7 @@ function resultTitle(result: MessageSearchResult): string {
 function snippetParts(snippet: string): { text: string; hit: boolean }[] {
   const parts: { text: string; hit: boolean }[] = [];
   let hit = false;
+  // eslint-disable-next-line no-control-regex -- the markers are control chars by design
   for (const piece of snippet.split(/([\x01\x02])/)) {
     if (piece === "\x01") hit = true;
     else if (piece === "\x02") hit = false;

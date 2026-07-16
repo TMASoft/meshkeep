@@ -22,7 +22,8 @@ export default tseslint.config(
   {
     files: ["packages/web/**"],
     languageOptions: {
-      globals: { ...globals.browser },
+      // __APP_VERSION__ is baked in by Vite define (packages/web/vite.config.ts)
+      globals: { ...globals.browser, __APP_VERSION__: "readonly" },
     },
   },
   {
