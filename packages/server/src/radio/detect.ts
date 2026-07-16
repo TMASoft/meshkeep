@@ -56,7 +56,15 @@ export function classifySerialPort(info: RawPortInfo): DetectedSerialPort {
  * mounted /dev/serial/by-id) are visible.
  */
 export async function listSerialPorts(): Promise<DetectedSerialPort[]> {
-  const ports = await SerialPort.list();
+  let ports: RawPortInfo[];
+  try {
+    ports = await SerialPort.list();
+  } catch (error) {
+    // enumeration backend unavailable (e.g. no udevadm in a minimal
+    // container) — the UI falls back to manual entry
+    console.warn("[detect] serial enumeration failed:", error instanceof Error ? error.message : error);
+    return [];
+  }
   return ports
     .filter((port) => port.vendorId || port.pnpId)
     .map((port) => classifySerialPort(port))
