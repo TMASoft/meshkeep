@@ -1,4 +1,5 @@
 import type { Message } from "@meshkeep/shared";
+import { parseInlineSender } from "@meshkeep/shared";
 import type { ConversationId } from "./stores/app";
 
 /** off = never notify · dms = incoming DMs only · all = DMs + channel messages */
@@ -61,10 +62,13 @@ export function notifyIncoming(message: Message, opts: { conversationActive: boo
     message.kind === "dm"
       ? { kind: "dm", contactKey: message.contactKey ?? "" }
       : { kind: "channel", channelIdx: message.channelIdx ?? 0 };
-  const sender = message.contactName ?? message.authorName ?? shortKey(message.contactKey);
+  // channel texts carry their sender inline as "name: msg" (group-text convention)
+  const inline = message.kind === "channel" ? parseInlineSender(message.text) : null;
+  const sender = inline?.sender ?? message.contactName ?? message.authorName ?? shortKey(message.contactKey);
   const title =
     message.kind === "dm" ? sender : `${message.channelName ?? `channel ${message.channelIdx}`} · ${sender}`;
-  const body = message.text.length > 140 ? `${message.text.slice(0, 139)}…` : message.text;
+  const text = inline?.text ?? message.text;
+  const body = text.length > 140 ? `${text.slice(0, 139)}…` : text;
 
   try {
     // one notification per conversation: newer messages replace older ones

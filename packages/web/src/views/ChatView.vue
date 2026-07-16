@@ -15,6 +15,7 @@ import {
   isHashtagChannelName,
   normalizeChannelSecret,
   parseChannelShareUri,
+  parseInlineSender,
 } from "@meshkeep/shared";
 import { api } from "../api/client";
 import { useAppStore, conversationKey, type ConversationId } from "../stores/app";
@@ -71,6 +72,19 @@ function contactIcon(contact: Contact): "repeater" | "room" | "user" {
   if (contact.type === "repeater") return "repeater";
   if (contact.type === "room") return "room";
   return "user";
+}
+
+/**
+ * Incoming channel messages carry their sender inline as "name: msg" (the
+ * MeshCore group-text convention) and have no contact mapping — split it out
+ * for display instead of showing "Unknown sender" over a prefixed body.
+ */
+function channelDisplay(message: Message): { sender: string; text: string } {
+  if (message.kind === "channel" && message.direction === "in") {
+    const parsed = parseInlineSender(message.text);
+    if (parsed) return parsed;
+  }
+  return { sender: message.contactName ?? "Unknown sender", text: message.text };
 }
 
 function statusLabel(message: Message): string {
@@ -942,12 +956,12 @@ function fmtLastAdvert(epoch: number): string {
           >
             <article class="message-bubble">
               <p v-if="message.kind === 'channel' && message.direction === 'in'" class="message-sender">
-                {{ message.contactName ?? "Unknown sender" }}
+                {{ channelDisplay(message).sender }}
               </p>
               <p v-else-if="message.authorPrefix" class="message-sender">
                 {{ message.authorName ?? shortKey(message.authorPrefix) }}
               </p>
-              <p class="message-copy">{{ message.text }}</p>
+              <p class="message-copy">{{ channelDisplay(message).text }}</p>
               <footer>
                 <time :datetime="new Date(message.senderTimestamp * 1000).toISOString()">
                   {{ formatTime(message.senderTimestamp) }}
