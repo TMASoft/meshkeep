@@ -1,9 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { useRoute } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { useAppStore } from "./stores/app";
 import AppIcon from "./components/AppIcon.vue";
 import LoginGate from "./components/LoginGate.vue";
+import {
+  notificationsSupported,
+  requestNotifyPermission,
+  savedNotifyPref,
+  saveNotifyPref,
+  setNotificationNavigator,
+  type NotifyPref,
+} from "./notifications";
 
 const version = __APP_VERSION__;
 const store = useAppStore();
@@ -27,6 +35,25 @@ const density = ref<"comfortable" | "compact">(
   savedOption("meshkeep-density", "comfortable"),
 );
 const media = window.matchMedia("(prefers-color-scheme: dark)");
+
+const notify = ref<NotifyPref>(savedNotifyPref());
+const notifyBlocked = ref(false);
+const canNotify = notificationsSupported();
+
+watch(notify, async (value, previous) => {
+  if (value === "off") {
+    saveNotifyPref("off");
+    return;
+  }
+  if (await requestNotifyPermission()) {
+    notifyBlocked.value = false;
+    saveNotifyPref(value);
+  } else {
+    // keep the blocked hint visible; revert (the "off" branch won't clear it)
+    notifyBlocked.value = true;
+    notify.value = previous ?? "off";
+  }
+});
 
 const navLinks = [
   { to: "/chat", label: "Comms", icon: "chat" as const },
@@ -97,11 +124,17 @@ watch(
   () => void nextTick(() => appContent.value?.focus()),
 );
 
+const router = useRouter();
+
 onMounted(() => {
   applyAppearance();
   media.addEventListener("change", handleSystemTheme);
   document.addEventListener("pointerdown", handlePointerDown);
   document.addEventListener("keydown", handleKeydown);
+  setNotificationNavigator((id) => {
+    void router.push("/chat");
+    void store.openConversation(id);
+  });
   void store.bootstrap();
 });
 
@@ -260,6 +293,28 @@ const stateColor = computed(() => {
             </label>
           </div>
         </fieldset>
+        <fieldset>
+          <legend>Notifications</legend>
+          <div v-if="canNotify" class="segmented-control">
+            <label v-for="option in [
+              { value: 'off', label: 'off' },
+              { value: 'dms', label: 'DMs' },
+              { value: 'all', label: 'DMs + channels' },
+            ]" :key="option.value">
+              <input v-model="notify" type="radio" name="notify" :value="option.value" />
+              <span>{{ option.label }}</span>
+            </label>
+          </div>
+          <p v-if="!canNotify" class="notify-hint">
+            Needs a secure context — open MeshKeep over HTTPS or localhost (see docs/https.md).
+          </p>
+          <p v-else-if="notifyBlocked" class="notify-hint" role="alert">
+            Notifications are blocked for this site — allow them in the browser's site settings, then try again.
+          </p>
+          <p v-else-if="notify !== 'off'" class="notify-hint">
+            Notifies while the tab is hidden or another conversation is open.
+          </p>
+        </fieldset>
       </section>
     </Transition>
   </div>
@@ -303,6 +358,7 @@ const stateColor = computed(() => {
 .appearance-panel fieldset { margin: 0 0 16px; padding: 0; border: 0; }
 .appearance-panel fieldset:last-child { margin-bottom: 0; }
 .appearance-panel legend { margin-bottom: 7px; color: var(--text-muted); font-size: 12px; font-weight: 650; }
+.notify-hint { margin: 6px 0 0; color: var(--text-faint); font-size: 11px; line-height: 1.5; }
 .segmented-control { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-1); padding: 3px; }
 .segmented-control.two-up { grid-template-columns: repeat(2, 1fr); }
 .segmented-control label { cursor: pointer; }

@@ -12,6 +12,7 @@ import type {
 } from "@meshkeep/shared";
 import { api, ApiError, connectEvents, type WsStatus } from "../api/client";
 import { BrowserRadioSource, type BrowserRadioKind } from "../sources/browser-radio";
+import { notifyIncoming } from "../notifications";
 
 // lives outside the store: holds a live connection object, must not be reactive
 let browserSource: BrowserRadioSource | null = null;
@@ -306,6 +307,9 @@ export const useAppStore = defineStore("app", {
       const isActive = this.activeConversation && conversationKey(this.activeConversation) === key;
       if (message.direction === "in" && !isActive) {
         this.unread[key] = (this.unread[key] ?? 0) + 1;
+      }
+      if (message.direction === "in") {
+        notifyIncoming(message, { conversationActive: Boolean(isActive) });
       }
     },
 
