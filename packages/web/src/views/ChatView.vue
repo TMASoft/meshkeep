@@ -33,7 +33,7 @@ const activeTitle = computed(() => {
   if (id.kind === "dm") {
     return store.contacts.find((contact) => contact.publicKey === id.contactKey)?.name ?? shortKey(id.contactKey);
   }
-  return `#${store.channels.find((channel) => channel.idx === id.channelIdx)?.name ?? id.channelIdx}`;
+  return store.channels.find((channel) => channel.idx === id.channelIdx)?.name ?? `channel ${id.channelIdx}`;
 });
 
 const activeMeta = computed(() => {
@@ -222,7 +222,7 @@ const slotOptions = computed(() =>
   Array.from({ length: 8 }, (_, idx) => ({
     idx,
     label: store.channels.find((c) => c.idx === idx)
-      ? `${idx} — replaces #${store.channels.find((c) => c.idx === idx)!.name}`
+      ? `${idx} — replaces ${store.channels.find((c) => c.idx === idx)!.name}`
       : `${idx} — empty`,
   })),
 );
@@ -335,7 +335,7 @@ const deleteActiveChannel = () =>
   detailsAction("delete", async () => {
     const channel = activeChannel.value;
     if (!channel) return;
-    if (!window.confirm(`Delete #${channel.name}? The slot is blanked on the radio; message history is kept.`)) {
+    if (!window.confirm(`Delete ${channel.name}? The slot is blanked on the radio; message history is kept.`)) {
       return;
     }
     await store.deleteChannel(channel.idx);
@@ -445,7 +445,7 @@ function fmtLastAdvert(epoch: number): string {
           >
             <span class="conversation-avatar channel-avatar"><AppIcon name="channel" :size="18" /></span>
             <span class="conversation-copy">
-              <strong>#{{ channel.name }}</strong>
+              <strong>{{ channel.name }}</strong>
               <small>Channel {{ channel.idx }}</small>
             </span>
             <span v-if="store.unread[`ch:${channel.idx}`]" class="unread-badge">
