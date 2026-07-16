@@ -77,6 +77,8 @@ declare module "@liamcottle/meshcore.js/src/connection/connection.js" {
       type?: number,
     ): Promise<{ result: number; expectedAckCrc: number; estTimeout: number }>;
     sendChannelTextMessage(channelIdx: number, text: string): Promise<void>;
+    /** Fire-and-forget GetChannel command; the radio answers with a ChannelInfo response event. */
+    sendCommandGetChannel(channelIdx: number): Promise<void>;
     sendFloodAdvert(): Promise<void>;
     sendZeroHopAdvert(): Promise<void>;
   }

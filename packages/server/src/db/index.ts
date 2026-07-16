@@ -128,6 +128,45 @@ const MIGRATIONS: string[] = [
    UPDATE messages SET ingestion_id = lower(hex(randomblob(16))) WHERE ingestion_id IS NULL;
    CREATE UNIQUE INDEX idx_messages_ingestion_id ON messages (ingestion_id);
   `,
+  // 7: enforce exclusive conversation shapes. A dm row must carry a contact
+  // identity and no channel index; a channel row must carry a channel index
+  // and no contact identity. Triggers (not a table rebuild) so pre-existing
+  // rows are preserved as-is while every new write is validated.
+  `
+  CREATE TRIGGER messages_shape_bi BEFORE INSERT ON messages BEGIN
+    SELECT CASE
+      WHEN NEW.kind = 'dm' AND (NEW.channel_idx IS NOT NULL
+        OR ((NEW.contact_key IS NULL OR NEW.contact_key = '') AND (NEW.contact_prefix IS NULL OR NEW.contact_prefix = '')))
+        THEN RAISE(ABORT, 'dm message needs a contact identity and no channel index')
+      WHEN NEW.kind = 'channel' AND (NEW.channel_idx IS NULL
+        OR NEW.contact_key IS NOT NULL OR NEW.contact_prefix IS NOT NULL)
+        THEN RAISE(ABORT, 'channel message needs a channel index and no contact identity')
+    END;
+  END;
+  CREATE TRIGGER messages_shape_bu BEFORE UPDATE OF kind, contact_key, contact_prefix, channel_idx ON messages BEGIN
+    SELECT CASE
+      WHEN NEW.kind = 'dm' AND (NEW.channel_idx IS NOT NULL
+        OR ((NEW.contact_key IS NULL OR NEW.contact_key = '') AND (NEW.contact_prefix IS NULL OR NEW.contact_prefix = '')))
+        THEN RAISE(ABORT, 'dm message needs a contact identity and no channel index')
+      WHEN NEW.kind = 'channel' AND (NEW.channel_idx IS NULL
+        OR NEW.contact_key IS NOT NULL OR NEW.contact_prefix IS NOT NULL)
+        THEN RAISE(ABORT, 'channel message needs a channel index and no contact identity')
+    END;
+  END;
+  `,
+  // 8: random revocable UI sessions (replacing the deterministic shared
+  // cookie — existing logins must re-authenticate once) and least-privilege
+  // API tokens: scoped (existing integrations become read-only) with
+  // optional expiry.
+  `
+  CREATE TABLE sessions (
+    token_hash TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+  );
+  ALTER TABLE api_tokens ADD COLUMN scope TEXT NOT NULL DEFAULT 'read' CHECK (scope IN ('read','write'));
+  ALTER TABLE api_tokens ADD COLUMN expires_at INTEGER;
+  `,
 ];
 
 export type Db = Database.Database;

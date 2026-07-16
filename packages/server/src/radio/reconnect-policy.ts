@@ -1,4 +1,4 @@
-import type { ConnectionTransport } from "@meshkeep/shared";
+import type { ConnectionSettings, ConnectionTransport } from "@meshkeep/shared";
 
 /**
  * Reconnect pacing per transport, kept pure so the policy is unit-testable
@@ -23,6 +23,38 @@ export function reconnectPolicyFor(transport: ConnectionTransport): ReconnectPol
 /** Exponential backoff step within the policy's bounds. */
 export function nextReconnectDelay(currentMs: number, policy: ReconnectPolicy): number {
   return Math.min(Math.max(currentMs * 2, policy.minDelayMs), policy.maxDelayMs);
+}
+
+/**
+ * Configuration problems are permanent: no amount of retrying makes a missing
+ * serial path or a malformed BLE address connect. Returns a human-fixable
+ * description, or null when the settings are complete and in range. Callers
+ * must surface the error and suppress automatic reconnect until the
+ * configuration changes.
+ */
+export function validateConnectionSettings(settings: ConnectionSettings): string | null {
+  switch (settings.connection) {
+    case "none":
+      return null;
+    case "serial":
+      if (!settings.serialPort) return "serial transport needs a serial port (MESHKEEP_SERIAL_PORT or a runtime override)";
+      if (!Number.isInteger(settings.serialBaud) || settings.serialBaud < 1 || settings.serialBaud > 10_000_000) {
+        return `invalid serial baud rate ${settings.serialBaud}`;
+      }
+      return null;
+    case "tcp":
+      if (!settings.tcpHost) return "tcp transport needs a host (MESHKEEP_TCP_HOST or a runtime override)";
+      if (!Number.isInteger(settings.tcpPort) || settings.tcpPort < 1 || settings.tcpPort > 65_535) {
+        return `invalid tcp port ${settings.tcpPort}`;
+      }
+      return null;
+    case "ble":
+      if (!settings.bleAddress) return "ble transport needs a device address (MESHKEEP_BLE_ADDRESS or a runtime override)";
+      if (!/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(settings.bleAddress)) {
+        return `invalid BLE address "${settings.bleAddress}" (expected aa:bb:cc:dd:ee:ff)`;
+      }
+      return null;
+  }
 }
 
 /**

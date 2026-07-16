@@ -16,6 +16,13 @@ import {
   ingestSelfSchema,
 } from "./ingest.js";
 
+/** Conversation filters address exactly one conversation — never combine them. */
+const atMostOneConversationFilter = [
+  (value: { contact?: unknown; sender?: unknown; channel?: unknown }) =>
+    [value.contact, value.sender, value.channel].filter((v) => v !== undefined).length <= 1,
+  { message: "contact, sender, and channel are mutually exclusive" },
+] as const;
+
 function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
   return async (req: Request, res: Response) => {
     try {
@@ -25,9 +32,13 @@ function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
         res.status(400).json({ error: "invalid request", details: error.issues });
       } else if (error instanceof RadioUnavailableError) {
         res.status(503).json({ error: error.message });
+      } else if (error instanceof Error && error.constructor === Error && !("code" in error)) {
+        // deliberately thrown operational message (e.g. "radio rejected the message")
+        res.status(500).json({ error: error.message });
       } else {
-        const message = error instanceof Error ? error.message : "internal error";
-        res.status(500).json({ error: message });
+        // unexpected internals (library/system errors) never reach clients
+        console.error("[api] internal error:", error);
+        res.status(500).json({ error: "internal error" });
       }
     }
   };
@@ -36,14 +47,19 @@ function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
 export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: Auth, bus: Bus): Router {
   const api = Router();
   api.use(json({ limit: "1mb" }));
+  // cross-site mutation defense applies to every route, including login
+  api.use(auth.originGuard);
 
   // ---- auth (unguarded) ----
   api.post(
     "/auth/login",
     handle((req, res) => {
       const { password } = z.object({ password: z.string() }).parse(req.body);
-      if (auth.login(password, res)) {
+      const result = auth.login(password, req, res);
+      if (result === "ok") {
         res.json({ ok: true });
+      } else if (result === "throttled") {
+        res.status(429).json({ error: "too many failed logins; try again later" });
       } else {
         res.status(401).json({ error: "wrong password" });
       }
@@ -51,8 +67,8 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
   );
   api.post(
     "/auth/logout",
-    handle((_req, res) => {
-      auth.logout(res);
+    handle((req, res) => {
+      auth.logout(req, res);
       res.json({ ok: true });
     }),
   );
@@ -170,6 +186,12 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
     }),
   );
   api.get(
+    "/messages/unread",
+    handle((_req, res) => {
+      res.json({ conversations: manager.store.getUnreadSummary() });
+    }),
+  );
+  api.get(
     "/messages/search",
     handle((req, res) => {
       const query = z
@@ -180,6 +202,7 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
           channel: z.coerce.number().int().min(0).max(255).optional(),
           limit: z.coerce.number().int().min(1).max(100).default(25),
         })
+        .refine(...atMostOneConversationFilter)
         .parse(req.query);
       res.json({
         results: manager.store.searchMessages({
@@ -202,6 +225,7 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
           sender: z.string().regex(/^[0-9a-f]{2,64}$/i).optional(),
           channel: z.coerce.number().int().min(0).max(255).optional(),
         })
+        .refine(...atMostOneConversationFilter)
         .parse(req.query);
       const messages = manager.store.getMessagesForExport({
         contactKey: query.contact?.toLowerCase(),
@@ -230,6 +254,7 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
           before: z.coerce.number().int().positive().optional(),
           limit: z.coerce.number().int().min(1).max(200).default(50),
         })
+        .refine(...atMostOneConversationFilter)
         .parse(req.query);
       res.json({
         messages: manager.store.getConversation({
@@ -270,6 +295,7 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
         .refine((value) => value.contact !== undefined || value.sender !== undefined || value.channel !== undefined, {
           message: "contact, sender, or channel is required",
         })
+        .refine(...atMostOneConversationFilter)
         .parse(req.body);
       manager.store.markConversationRead({
         contactKey: body.contact?.toLowerCase(),
@@ -458,23 +484,47 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
   );
 
   // ---- API tokens (for the HLL plugin and other integrations) ----
+  // Session-only: bearer tokens can never mint, rotate, list, or revoke tokens.
   api.get(
     "/tokens",
+    auth.sessionGuard,
     handle((_req, res) => {
       res.json({ tokens: auth.listTokens() });
     }),
   );
   api.post(
     "/tokens",
+    auth.sessionGuard,
     handle((req, res) => {
-      const { label } = z.object({ label: z.string().min(1).max(64) }).parse(req.body);
-      const created = auth.createToken(label);
+      const body = z
+        .object({
+          label: z.string().min(1).max(64),
+          // integrations are read-only unless write access is requested explicitly
+          scope: z.enum(["read", "write"]).default("read"),
+          expiresInDays: z.number().int().min(1).max(3650).nullish(),
+        })
+        .parse(req.body);
+      const created = auth.createToken(body.label, body.scope, body.expiresInDays ? body.expiresInDays * 86_400 : null);
       // the raw token is only ever returned once
       res.status(201).json({ token: created.token, ...created.row });
     }),
   );
+  api.post(
+    "/tokens/:id/rotate",
+    auth.sessionGuard,
+    handle((req, res) => {
+      const id = z.coerce.number().int().positive().parse(req.params.id);
+      const rotated = auth.rotateToken(id);
+      if (rotated) {
+        res.json({ token: rotated.token, ...rotated.row });
+      } else {
+        res.status(404).json({ error: "token not found" });
+      }
+    }),
+  );
   api.delete(
     "/tokens/:id",
+    auth.sessionGuard,
     handle((req, res) => {
       const id = z.coerce.number().int().positive().parse(req.params.id);
       if (auth.deleteToken(id)) {

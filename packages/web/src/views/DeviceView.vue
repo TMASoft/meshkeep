@@ -127,12 +127,15 @@ const claimRadio = () =>
 interface TokenRow {
   id: number;
   label: string;
+  scope: "read" | "write";
   created_at: number;
   last_used_at: number | null;
+  expires_at: number | null;
 }
 
 const tokens = ref<TokenRow[]>([]);
 const newTokenLabel = ref("");
+const newTokenScope = ref<"read" | "write">("read");
 const mintedToken = ref<string | null>(null);
 
 async function loadTokens() {
@@ -150,10 +153,11 @@ const createToken = () =>
   run("Token creation", async () => {
     const created = await api<TokenRow & { token: string }>("/tokens", {
       method: "POST",
-      body: JSON.stringify({ label: newTokenLabel.value || "unnamed" }),
+      body: JSON.stringify({ label: newTokenLabel.value || "unnamed", scope: newTokenScope.value }),
     });
     mintedToken.value = created.token;
     newTokenLabel.value = "";
+    newTokenScope.value = "read";
     await loadTokens();
   });
 
@@ -566,7 +570,7 @@ onMounted(() => {
               <AppIcon name="location" :size="16" />
               Coordinates place this node on the local network map.
             </div>
-            <button class="button primary save-button" type="submit" :disabled="busy !== null">
+            <button class="button primary save-button" type="submit" :disabled="busy !== null || !store.capabilities.manageDevice" :title="store.capabilities.guidance ?? undefined">
               <span v-if="busy === 'Settings update'" class="button-spinner" />
               <AppIcon v-else name="check" :size="17" />
               Save changes
@@ -605,7 +609,7 @@ onMounted(() => {
               Nodes only hear each other when frequency, bandwidth, SF, and CR all match.
             </div>
             <p v-if="rfError" class="rf-error" role="alert">{{ rfError }}</p>
-            <button class="button primary save-button" type="submit" :disabled="busy !== null">
+            <button class="button primary save-button" type="submit" :disabled="busy !== null || !store.capabilities.manageDevice" :title="store.capabilities.guidance ?? undefined">
               <span v-if="busy === 'RF update'" class="button-spinner" />
               <AppIcon v-else name="check" :size="17" />
               Apply RF settings
@@ -866,7 +870,7 @@ onMounted(() => {
             <div><span class="module-index">08</span><h2>API access</h2></div>
             <span class="token-count">{{ tokens.length }} active</span>
           </div>
-          <p class="module-description">Tokens grant read and write access to integrations such as home-lab-launcher.</p>
+          <p class="module-description">Tokens grant integrations API access. New tokens are read-only unless write scope is chosen.</p>
 
           <div v-if="mintedToken" class="minted-token">
             <div>
@@ -881,6 +885,13 @@ onMounted(() => {
               <span>Token label</span>
               <input v-model="newTokenLabel" placeholder="home-lab-launcher" autocomplete="off" />
             </label>
+            <label class="field">
+              <span>Scope</span>
+              <select v-model="newTokenScope" class="field-select">
+                <option value="read">Read-only</option>
+                <option value="write">Read + write</option>
+              </select>
+            </label>
             <button class="button primary" type="submit" :disabled="busy !== null">
               <span v-if="busy === 'Token creation'" class="button-spinner" />
               <AppIcon v-else name="key" :size="16" /> {{ busy === "Token creation" ? "Creating" : "Create token" }}
@@ -893,7 +904,7 @@ onMounted(() => {
               <span class="token-icon"><AppIcon name="key" :size="16" /></span>
               <div class="token-identity">
                 <strong>{{ token.label }}</strong>
-                <span>Created {{ fmtDate(token.created_at) }}</span>
+                <span>{{ token.scope === "write" ? "Read + write" : "Read-only" }} · created {{ fmtDate(token.created_at) }}{{ token.expires_at ? ` · expires ${fmtDate(token.expires_at)}` : "" }}</span>
               </div>
               <span class="token-used"><small>Last used</small>{{ fmtDate(token.last_used_at) }}</span>
               <button type="button" :disabled="busy !== null" @click="deleteToken(token.id)">

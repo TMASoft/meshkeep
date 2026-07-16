@@ -4,6 +4,7 @@ import type {
   Channel,
   ConnectionState,
   Contact,
+  ConversationUnread,
   Message,
   MessageSearchResult,
   NodeStats,
@@ -17,6 +18,29 @@ import { notifyIncoming } from "../notifications";
 // lives outside the store: holds a live connection object, must not be reactive
 let browserSource: BrowserRadioSource | null = null;
 
+/**
+ * What the active radio driver supports. Browser-direct sessions drive a
+ * narrow companion subset (messaging, adverts, live channel reads); radio
+ * management still needs the server radio, which is in standby meanwhile.
+ */
+export interface RadioCapabilities {
+  sendMessages: boolean;
+  sendAdvert: boolean;
+  /** Node name/coordinates/TX power and RF parameters. */
+  manageDevice: boolean;
+  /** Create, edit, and delete channel slots. */
+  manageChannels: boolean;
+  /** Import, remove, share, and re-route contacts. */
+  manageContacts: boolean;
+  /** Repeater/room login, remote status, and telemetry requests. */
+  nodeTools: boolean;
+  /** Guidance for disabled controls (null when everything is available). */
+  guidance: string | null;
+}
+
+const BROWSER_RADIO_GUIDANCE =
+  "The radio is driven by this browser. Hand it back to the server on the Radio page to use this.";
+
 export type ConversationId =
   | { kind: "dm"; contactKey: string; contactPrefix?: undefined }
   | { kind: "dm"; contactKey?: undefined; contactPrefix: string }
@@ -26,11 +50,27 @@ export function conversationKey(id: ConversationId): string {
   return id.kind === "dm" ? `dm:${id.contactKey ?? `unknown:${id.contactPrefix}`}` : `ch:${id.channelIdx}`;
 }
 
-function conversationForMessage(message: Message): ConversationId {
-  if (message.kind === "channel") return { kind: "channel", channelIdx: message.channelIdx ?? 0 };
-  return message.contactKey
-    ? { kind: "dm", contactKey: message.contactKey }
-    : { kind: "dm", contactPrefix: message.contactPrefix ?? "" };
+/**
+ * The conversation a message belongs to, or null when the payload is malformed
+ * (a dm without any sender identity, a channel post without an index). Callers
+ * must reject null rather than grouping under a default bucket.
+ */
+function conversationForMessage(message: Message): ConversationId | null {
+  if (message.kind === "channel") {
+    return message.channelIdx == null ? null : { kind: "channel", channelIdx: message.channelIdx };
+  }
+  if (message.contactKey) return { kind: "dm", contactKey: message.contactKey };
+  if (message.contactPrefix) return { kind: "dm", contactPrefix: message.contactPrefix };
+  return null;
+}
+
+function conversationForUnread(row: ConversationUnread): ConversationId | null {
+  if (row.kind === "channel") {
+    return row.channelIdx == null ? null : { kind: "channel", channelIdx: row.channelIdx };
+  }
+  if (row.contactKey) return { kind: "dm", contactKey: row.contactKey };
+  if (row.contactPrefix) return { kind: "dm", contactPrefix: row.contactPrefix };
+  return null;
 }
 
 function dmQuery(id: Extract<ConversationId, { kind: "dm" }>): string {
@@ -72,6 +112,19 @@ export const useAppStore = defineStore("app", {
       state.browserRadio ? state.browserRadio.state : state.status?.connection.state ?? "disconnected",
     /** What is driving the radio right now. */
     radioDriver: (state): "server" | BrowserRadioKind => state.browserRadio?.kind ?? "server",
+    /** Capability model for the active radio driver. */
+    capabilities: (state): RadioCapabilities => {
+      const browser = state.browserRadio !== null;
+      return {
+        sendMessages: true,
+        sendAdvert: true,
+        manageDevice: !browser,
+        manageChannels: !browser,
+        manageContacts: !browser,
+        nodeTools: !browser,
+        guidance: browser ? BROWSER_RADIO_GUIDANCE : null,
+      };
+    },
     self: (state) => state.status?.self ?? null,
     batteryPercent: (state): number | null => {
       const mv = state.browserRadio?.batteryMilliVolts ?? state.status?.batteryMilliVolts;
@@ -88,7 +141,13 @@ export const useAppStore = defineStore("app", {
       if (this.loaded) return;
       this.session = await api<{ passwordRequired: boolean; authorized: boolean }>("/auth/session");
       if (this.needsLogin) return; // LoginGate takes over; bootstrap resumes after login()
-      await Promise.all([this.refreshStatus(), this.refreshContacts(), this.refreshChannels(), this.refreshUnknownSenders()]);
+      await Promise.all([
+        this.refreshStatus(),
+        this.refreshContacts(),
+        this.refreshChannels(),
+        this.refreshUnknownSenders(),
+        this.refreshUnread(),
+      ]);
       this.stopEvents = connectEvents(
         (event) => this.onEvent(event),
         (status) => {
@@ -133,8 +192,32 @@ export const useAppStore = defineStore("app", {
     },
 
     async refreshChannels() {
+      if (browserSource && this.browserRadio?.state === "connected") {
+        // read the browser radio's live slots — the server's stored channel
+        // list belongs to the standby server radio and may be stale here
+        this.channels = await browserSource.getChannels();
+        return;
+      }
       const { channels } = await api<{ channels: Channel[] }>("/channels");
       this.channels = channels;
+    },
+
+    /** Throw the capability guidance when an operation needs the server radio. */
+    requireServerRadio(allowed: boolean) {
+      if (!allowed) throw new Error(this.capabilities.guidance ?? "This operation needs the server radio");
+    },
+
+    /** Initialize per-conversation unread badges from the persisted read state. */
+    async refreshUnread() {
+      const { conversations } = await api<{ conversations: ConversationUnread[] }>("/messages/unread");
+      const unread: Record<string, number> = {};
+      for (const row of conversations) {
+        const id = conversationForUnread(row);
+        if (id && row.unread > 0) unread[conversationKey(id)] = row.unread;
+      }
+      // an open conversation is on screen and already marked read server-side
+      if (this.activeConversation) delete unread[conversationKey(this.activeConversation)];
+      this.unread = unread;
     },
 
     async openConversation(id: ConversationId) {
@@ -220,6 +303,7 @@ export const useAppStore = defineStore("app", {
 
     /** Authenticate with a room server or repeater over the server radio. */
     async loginToNode(contactKey: string, password: string) {
+      this.requireServerRadio(this.capabilities.nodeTools);
       await api(`/contacts/${contactKey}/login`, {
         method: "POST",
         body: JSON.stringify({ password }),
@@ -228,21 +312,25 @@ export const useAppStore = defineStore("app", {
     },
 
     async fetchNodeStatus(contactKey: string): Promise<NodeStats> {
+      this.requireServerRadio(this.capabilities.nodeTools);
       const { status } = await api<{ status: NodeStats }>(`/contacts/${contactKey}/status`);
       return status;
     },
 
     async fetchTelemetry(contactKey: string): Promise<SensorReading[]> {
+      this.requireServerRadio(this.capabilities.nodeTools);
       const { telemetry } = await api<{ telemetry: SensorReading[] }>(`/contacts/${contactKey}/telemetry`);
       return telemetry;
     },
 
     async saveChannel(idx: number, name: string, secret: string) {
+      this.requireServerRadio(this.capabilities.manageChannels);
       await api(`/channels/${idx}`, { method: "PUT", body: JSON.stringify({ name, secret }) });
       await this.refreshChannels();
     },
 
     async deleteChannel(idx: number) {
+      this.requireServerRadio(this.capabilities.manageChannels);
       await api(`/channels/${idx}`, { method: "DELETE" });
       if (this.activeConversation?.kind === "channel" && this.activeConversation.channelIdx === idx) {
         this.activeConversation = null;
@@ -316,10 +404,12 @@ export const useAppStore = defineStore("app", {
         }
         throw error;
       }
-      // synced traffic lands in the server DB; refresh what we mirror from it
-      if (!privateSession) {
-        await Promise.all([this.refreshContacts(), this.refreshStatus()]).catch(() => {});
-      }
+      // channels always come live from the browser radio now (never the
+      // standby server's stored copy); synced traffic lands in the server DB,
+      // so refresh what we mirror from it too
+      const refreshes = [this.refreshChannels()];
+      if (!privateSession) refreshes.push(this.refreshContacts(), this.refreshStatus());
+      await Promise.all(refreshes).catch(() => {});
     },
 
     /** Stop driving the radio from this browser; optionally hand it back to the server. */
@@ -331,25 +421,34 @@ export const useAppStore = defineStore("app", {
       if (claimServer) {
         await api("/connection/claim", { method: "POST" }).catch(() => {});
       }
-      await this.refreshStatus().catch(() => {});
+      // back on the server driver — restore its status and stored channel list
+      await Promise.all([this.refreshStatus(), this.refreshChannels()]).catch(() => {});
     },
 
     appendMessage(message: Message) {
       const id = conversationForMessage(message);
+      if (!id) return; // malformed event — never group under a default conversation
       const key = conversationKey(id);
       const list = (this.conversations[key] ??= []);
       const prior = this.findMessage(message);
-      if (prior && prior.message.id !== message.id) {
-        prior.list.splice(prior.index, 1);
-        const merged = { ...prior.message, ...message, status: finalStatus(prior.message.status, message.status) };
-        list.push(merged);
-        this.recent = [merged, ...this.recent.filter((m) => m.id !== prior.message.id && m.id !== message.id)].slice(0, 50);
-        return;
-      }
       if (prior) {
+        // A duplicate delivery or an offline row reconciled to its server
+        // identity: merge in place (keeping any delivery-state upgrade) and
+        // never repeat unread, recent-order, or notification side effects.
         const merged = { ...prior.message, ...message, status: finalStatus(prior.message.status, message.status) };
-        prior.list[prior.index] = merged;
-        this.recent = [merged, ...this.recent.filter((m) => m.id !== message.id)].slice(0, 50);
+        if (prior.message.id === message.id) {
+          prior.list[prior.index] = merged;
+        } else {
+          prior.list.splice(prior.index, 1);
+          list.push(merged);
+        }
+        let replaced = false;
+        this.recent = this.recent.flatMap((m) => {
+          if (m.id !== prior.message.id && m.id !== message.id) return [m];
+          if (replaced) return [];
+          replaced = true;
+          return [merged];
+        });
         return;
       }
       list.push(message);

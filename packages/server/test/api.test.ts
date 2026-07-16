@@ -54,6 +54,101 @@ describe("messagesToCsv", () => {
   });
 });
 
+describe("author-prefix attribution", () => {
+  const prefix = "deadbeef";
+  const contact = (publicKey: string, name: string): Contact => ({
+    publicKey,
+    name,
+    type: "chat",
+    flags: 0,
+    outPathLen: -1,
+    lat: null,
+    lon: null,
+    lastAdvert: 0,
+    lastSeen: null,
+  });
+
+  function setup() {
+    const store = new Store(openDb(":memory:"));
+    store.upsertContact(contact(`${prefix}${"a".repeat(56)}`, "Alice"));
+    store.insertMessage({
+      kind: "channel",
+      channelIdx: 1,
+      direction: "in",
+      text: "signed room post",
+      senderTimestamp: 1_000,
+      authorPrefix: prefix,
+    });
+    return store;
+  }
+
+  it("resolves the author name when the prefix matches exactly one contact", () => {
+    const store = setup();
+    const messages = store.getConversation({ channelIdx: 1, limit: 10 });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.authorName).toBe("Alice");
+  });
+
+  it("returns one unattributed row per message when the prefix is ambiguous", () => {
+    const store = setup();
+    store.upsertContact(contact(`${prefix}${"b".repeat(56)}`, "Mallory"));
+
+    const conversation = store.getConversation({ channelIdx: 1, limit: 10 });
+    expect(conversation).toHaveLength(1); // never duplicated by the collision
+    expect(conversation[0]!.authorName).toBeNull(); // never guessed either
+
+    expect(store.getRecentMessages(10)).toHaveLength(1);
+    expect(store.getMessagesForExport({ channelIdx: 1 })).toHaveLength(1);
+    const results = store.searchMessages({ query: "signed", limit: 10 });
+    expect(results).toHaveLength(1);
+    expect(results[0]!.authorName).toBeNull();
+    expect(store.counts().messages).toBe(1);
+  });
+});
+
+describe("contact reconciliation", () => {
+  const KEY_A = "a".repeat(64);
+  const KEY_B = "b".repeat(64);
+  const contact = (publicKey: string, name: string): Contact => ({
+    publicKey,
+    name,
+    type: "chat",
+    flags: 0,
+    outPathLen: -1,
+    lat: null,
+    lon: null,
+    lastAdvert: 0,
+    lastSeen: null,
+  });
+
+  it("syncContacts mirrors the radio list without orphaning message history", () => {
+    const store = new Store(openDb(":memory:"));
+    store.syncContacts([contact(KEY_A, "Alice"), contact(KEY_B, "Bob")]);
+    store.insertMessage({ kind: "dm", contactKey: KEY_A, direction: "in", text: "hi", senderTimestamp: 1 });
+
+    // Alice was removed on the radio elsewhere; the next full scan omits her
+    const { removed } = store.syncContacts([contact(KEY_B, "Bob v2")]);
+
+    expect(removed).toEqual([KEY_A]);
+    expect(store.getContacts().map((c) => c.name)).toEqual(["Bob v2"]);
+    // her history keeps its identity and stays queryable
+    const history = store.getConversation({ contactKey: KEY_A, limit: 10 });
+    expect(history).toHaveLength(1);
+    expect(history[0]!.text).toBe("hi");
+  });
+
+  it("touchContactSeen reports a missing contact instead of losing the update", () => {
+    const store = new Store(openDb(":memory:"));
+    // newly discovered advert: the contact is not stored yet
+    expect(store.touchContactSeen(KEY_A)).toBeNull();
+    // after the contact list sync the touch lands and returns the row
+    store.syncContacts([contact(KEY_A, "Alice")]);
+    const touched = store.touchContactSeen(KEY_A);
+    expect(touched?.publicKey).toBe(KEY_A);
+    expect(touched?.lastSeen).toBeGreaterThan(0);
+  });
+});
+
 describe("ingest", () => {
   function setup() {
     const db = openDb(":memory:");

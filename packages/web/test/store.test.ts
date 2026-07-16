@@ -7,6 +7,7 @@ const connectEventsMock = vi.hoisted(() => vi.fn(() => () => {}));
 const browserRadioMock = vi.hoisted(() => ({
   start: vi.fn<() => Promise<void>>(),
   stop: vi.fn<() => Promise<void>>(),
+  getChannels: vi.fn<() => Promise<unknown[]>>(),
 }));
 
 vi.mock("../src/api/client", () => ({
@@ -22,6 +23,12 @@ vi.mock("../src/api/client", () => ({
   connectEvents: connectEventsMock,
 }));
 
+const notifyIncomingMock = vi.hoisted(() => vi.fn());
+
+vi.mock("../src/notifications", () => ({
+  notifyIncoming: notifyIncomingMock,
+}));
+
 vi.mock("../src/sources/browser-radio", () => ({
   BrowserRadioSource: class {
     start() {
@@ -30,6 +37,10 @@ vi.mock("../src/sources/browser-radio", () => ({
 
     stop() {
       return browserRadioMock.stop();
+    }
+
+    getChannels() {
+      return browserRadioMock.getChannels();
     }
   },
 }));
@@ -58,10 +69,13 @@ beforeEach(() => {
   setActivePinia(createPinia());
   apiMock.mockReset();
   connectEventsMock.mockClear();
+  notifyIncomingMock.mockClear();
   browserRadioMock.start.mockReset();
   browserRadioMock.stop.mockReset();
   browserRadioMock.start.mockResolvedValue();
   browserRadioMock.stop.mockResolvedValue();
+  browserRadioMock.getChannels.mockReset();
+  browserRadioMock.getChannels.mockResolvedValue([]);
 });
 
 describe("bootstrap and auth state", () => {
@@ -88,6 +102,14 @@ describe("bootstrap and auth state", () => {
           return Promise.resolve({ channels: [] });
         case "/messages/unknown-senders":
           return Promise.resolve({ messages: [] });
+        case "/messages/unread":
+          return Promise.resolve({
+            conversations: [
+              { kind: "dm", contactKey: KEY_A, contactPrefix: null, channelIdx: null, unread: 2 },
+              { kind: "dm", contactKey: null, contactPrefix: "abcdef123456", channelIdx: null, unread: 1 },
+              { kind: "channel", contactKey: null, contactPrefix: null, channelIdx: 3, unread: 4 },
+            ],
+          });
         default:
           return Promise.reject(new Error(`unexpected ${path}`));
       }
@@ -99,6 +121,12 @@ describe("bootstrap and auth state", () => {
     expect(store.contacts).toHaveLength(1);
     expect(store.connectionState).toBe("connected");
     expect(connectEventsMock).toHaveBeenCalledOnce();
+    // persisted unread counts become badges keyed by conversation
+    expect(store.unread).toEqual({
+      [`dm:${KEY_A}`]: 2,
+      "dm:unknown:abcdef123456": 1,
+      "ch:3": 4,
+    });
   });
 
   it("login surfaces a friendly error on 401", async () => {
@@ -171,6 +199,64 @@ describe("browser radio ownership", () => {
     await expect(store.startBrowserRadio("webserial", true)).rejects.toThrow("No device selected");
     expect(apiMock).toHaveBeenCalledWith("/connection/claim", { method: "POST" });
     expect(store.browserRadio).toBeNull();
+  });
+});
+
+describe("browser-direct capabilities", () => {
+  const browserRadioState = () =>
+    ({ kind: "webserial", state: "connected", error: null, privateSession: false, batteryMilliVolts: null }) as const;
+
+  it("exposes full capabilities on the server driver and a narrow subset in browser mode", () => {
+    const store = useAppStore();
+    expect(store.capabilities).toMatchObject({
+      sendMessages: true,
+      sendAdvert: true,
+      manageDevice: true,
+      manageChannels: true,
+      manageContacts: true,
+      nodeTools: true,
+      guidance: null,
+    });
+
+    store.browserRadio = { ...browserRadioState() };
+
+    expect(store.capabilities).toMatchObject({
+      sendMessages: true,
+      sendAdvert: true,
+      manageDevice: false,
+      manageChannels: false,
+      manageContacts: false,
+      nodeTools: false,
+    });
+    expect(store.capabilities.guidance).toContain("driven by this browser");
+  });
+
+  it("rejects unsupported operations with guidance instead of a server 503", async () => {
+    const store = useAppStore();
+    store.browserRadio = { ...browserRadioState() };
+    await expect(store.saveChannel(0, "x", "0".repeat(32))).rejects.toThrow(/driven by this browser/);
+    await expect(store.deleteChannel(0)).rejects.toThrow(/driven by this browser/);
+    await expect(store.loginToNode(KEY_A, "pw")).rejects.toThrow(/driven by this browser/);
+    await expect(store.fetchNodeStatus(KEY_A)).rejects.toThrow(/driven by this browser/);
+    await expect(store.fetchTelemetry(KEY_A)).rejects.toThrow(/driven by this browser/);
+    expect(apiMock).not.toHaveBeenCalled();
+  });
+
+  it("reads live channels from the browser radio, then the server list after handback", async () => {
+    apiMock.mockResolvedValue({ ok: true, state: "standby" });
+    browserRadioMock.getChannels.mockResolvedValue([{ idx: 1, name: "Live", secret: "1".repeat(32) }]);
+    const store = useAppStore();
+    await store.startBrowserRadio("webserial", true);
+    store.browserRadio!.state = "connected";
+
+    apiMock.mockClear();
+    await store.refreshChannels();
+    expect(store.channels).toEqual([{ idx: 1, name: "Live", secret: "1".repeat(32) }]);
+    expect(apiMock).not.toHaveBeenCalled(); // never the server's stored copy
+
+    apiMock.mockResolvedValue({ channels: [{ idx: 0, name: "Server", secret: "0".repeat(32) }] });
+    await store.stopBrowserRadio(false);
+    expect(store.channels).toEqual([{ idx: 0, name: "Server", secret: "0".repeat(32) }]);
   });
 });
 
@@ -294,6 +380,56 @@ describe("websocket event application", () => {
     expect(store.contacts[0].name).toBe("Alice v2");
     expect(store.status?.batteryMilliVolts).toBe(3900);
     expect(store.batteryPercent).toBe(67);
+  });
+
+  it("applies duplicate message.new events without repeating side effects", () => {
+    const store = useAppStore();
+    const key = conversationKey({ kind: "dm", contactKey: KEY_A });
+    store.onEvent({ type: "message.new", message: message({ id: 1 }) } as WsEvent);
+    store.onEvent({ type: "message.new", message: message({ id: 2, kind: "channel", contactKey: null, channelIdx: 3 }) } as WsEvent);
+    expect(store.unread[key]).toBe(1);
+    expect(store.recent.map((m) => m.id)).toEqual([2, 1]);
+    expect(notifyIncomingMock).toHaveBeenCalledTimes(2);
+
+    store.onEvent({ type: "message.new", message: message({ id: 1 }) } as WsEvent); // redelivery
+
+    expect(store.unread[key]).toBe(1); // unread counted once
+    expect(store.recent.map((m) => m.id)).toEqual([2, 1]); // recent order untouched
+    expect(store.conversations[key]).toHaveLength(1); // no duplicate row
+    expect(notifyIncomingMock).toHaveBeenCalledTimes(2); // notified once per message
+  });
+
+  it("keeps duplicate unknown-sender events from re-adding the sender", () => {
+    const store = useAppStore();
+    const prefix = "abcdef123456";
+    store.onEvent({ type: "message.new", message: message({ id: 1, contactKey: null, contactPrefix: prefix }) } as WsEvent);
+    store.onEvent({ type: "message.new", message: message({ id: 1, contactKey: null, contactPrefix: prefix }) } as WsEvent);
+    expect(store.unknownSenders).toHaveLength(1);
+    expect(store.unread[conversationKey({ kind: "dm", contactPrefix: prefix })]).toBe(1);
+  });
+
+  it("preserves a delivery upgrade when a duplicate arrives with a stale status", () => {
+    const store = useAppStore();
+    const key = conversationKey({ kind: "dm", contactKey: KEY_A });
+    store.appendMessage(message({ id: 1, direction: "out", status: "sent" }));
+    store.updateMessageStatus(1, "delivered");
+
+    store.onEvent({ type: "message.new", message: message({ id: 1, direction: "out", status: "sent" }) } as WsEvent);
+
+    expect(store.conversations[key][0].status).toBe("delivered");
+    expect(store.recent[0].status).toBe("delivered");
+  });
+
+  it("drops malformed message events instead of grouping them under a default conversation", () => {
+    const store = useAppStore();
+    // channel post without an index must not land in ch:0
+    store.onEvent({ type: "message.new", message: message({ id: 1, kind: "channel", contactKey: null, channelIdx: null }) } as WsEvent);
+    // dm without any sender identity must not land in dm:unknown:
+    store.onEvent({ type: "message.new", message: message({ id: 2, contactKey: null, contactPrefix: null }) } as WsEvent);
+    expect(store.conversations).toEqual({});
+    expect(store.recent).toHaveLength(0);
+    expect(store.unread).toEqual({});
+    expect(notifyIncomingMock).not.toHaveBeenCalled();
   });
 
   it("contact.removed drops the contact, unread, and active conversation", () => {

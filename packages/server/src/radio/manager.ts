@@ -16,7 +16,7 @@ import type { Bus } from "../bus.js";
 import { getSetting, setSetting, type Db } from "../db/index.js";
 import { Store } from "../db/store.js";
 import { createConnection, describeTarget } from "./transports.js";
-import { describeConnectError, nextReconnectDelay, reconnectPolicyFor } from "./reconnect-policy.js";
+import { describeConnectError, nextReconnectDelay, reconnectPolicyFor, validateConnectionSettings } from "./reconnect-policy.js";
 
 const CONNECT_TIMEOUT_MS = 15_000;
 // BLE needs discovery + GATT enumeration (and possibly a pairing handshake)
@@ -257,6 +257,14 @@ export class ConnectionManager {
     let connection: Connection | null = null;
     try {
       const effective = this.connectionSettings().effective;
+      const configError = validateConnectionSettings(effective);
+      if (configError) {
+        // permanent: retrying cannot fix configuration — surface it and stay
+        // put until the settings change (override, claim, or restart)
+        console.error(`[radio] configuration error: ${configError}`);
+        this.setState("error", `configuration error: ${configError}`);
+        return;
+      }
       const connectTimeoutMs = effective.connection === "ble" ? BLE_CONNECT_TIMEOUT_MS : CONNECT_TIMEOUT_MS;
       const activeConnection = this.connectionFactory(effective);
       connection = activeConnection;
@@ -341,10 +349,17 @@ export class ConnectionManager {
 
     connection.on(Constants.PushCodes.Advert, (push: { publicKey: Uint8Array }) => {
       if (!this.isCurrent(connection, generation)) return;
-      // firmware auto-added/updated a contact; re-pull the contact list
-      void this.refreshContacts().catch(() => {});
+      // firmware auto-added/updated a contact; re-pull the contact list first
+      // so the last-seen touch lands on an existing row instead of being lost
+      // for a newly discovered contact
       const key = BufferUtils.bytesToHex(push.publicKey);
-      this.store.touchContactSeen(key);
+      void this.refreshContacts()
+        .catch(() => {}) // transient failure — the touch may still hit an already-stored contact
+        .then(() => {
+          if (!this.isCurrent(connection, generation)) return;
+          const contact = this.store.touchContactSeen(key);
+          if (contact) this.bus.publish({ type: "contact.updated", contact });
+        });
     });
 
     connection.on(Constants.PushCodes.NewAdvert, (advert: RawContact) => {
@@ -411,10 +426,7 @@ export class ConnectionManager {
     // 3. contacts and channels
     const rawContacts = await this.awaitCurrent(connection.getContacts(), connection, generation, signal);
     this.ensureCurrent(connection, generation);
-    for (const contact of rawContacts.map(rawContactToContact)) {
-      this.store.upsertContact(contact);
-      this.bus.publish({ type: "contact.updated", contact });
-    }
+    this.applyContactScan(rawContacts.map(rawContactToContact));
     await this.refreshChannelsForConnection(connection, generation, signal);
 
     // 4. drain any messages queued while we were away
@@ -430,11 +442,19 @@ export class ConnectionManager {
     const signal = this.lifecycleAbort.signal;
     const rawContacts = await this.awaitCurrent(connection.getContacts(), connection, generation, signal);
     const contacts = rawContacts.map(rawContactToContact);
-    for (const contact of contacts) {
-      this.store.upsertContact(contact);
-      this.bus.publish({ type: "contact.updated", contact });
-    }
+    this.applyContactScan(contacts);
     return contacts;
+  }
+
+  /**
+   * Apply a confirmed complete contact scan from the radio: the stored list
+   * mirrors it exactly (contacts removed elsewhere disappear here too), while
+   * message history keeps its own identity columns and is never orphaned.
+   */
+  private applyContactScan(contacts: Contact[]): void {
+    const { removed } = this.store.syncContacts(contacts);
+    for (const contact of contacts) this.bus.publish({ type: "contact.updated", contact });
+    for (const publicKey of removed) this.bus.publish({ type: "contact.removed", publicKey });
   }
 
   async refreshChannels(): Promise<Channel[]> {

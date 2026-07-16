@@ -73,6 +73,18 @@ export interface Message {
   authorName?: string | null;
 }
 
+/** Per-conversation unread count, keyed the same way conversations are addressed. */
+export interface ConversationUnread {
+  kind: MessageKind;
+  /** Set for direct messages from a resolved contact. */
+  contactKey: string | null;
+  /** Set for direct messages whose sender prefix is still unresolved. */
+  contactPrefix: string | null;
+  /** Set for channel conversations. */
+  channelIdx: number | null;
+  unread: number;
+}
+
 export interface MessageSearchResult extends Message {
   /** Excerpt around the match; matched terms are wrapped in \x01…\x02. */
   snippet: string;

@@ -1,4 +1,4 @@
-import { type ConnectionState, type Contact, type Message, type SelfInfo } from "@meshkeep/shared";
+import { type Channel, type ConnectionState, type Contact, type Message, type SelfInfo } from "@meshkeep/shared";
 import type MeshConnection from "@liamcottle/meshcore.js/src/connection/connection.js";
 import { api } from "../api/client";
 import {
@@ -30,6 +30,8 @@ export type BrowserRadioKind = "webserial" | "webble";
 
 const BATTERY_POLL_MS = 5 * 60_000;
 const QUEUE_FLUSH_MS = 30_000;
+const MAX_CHANNELS = 8;
+const CHANNEL_READ_TIMEOUT_MS = 3_000;
 
 export function browserRadioSupport(kind: BrowserRadioKind): string | null {
   if (!window.isSecureContext) {
@@ -346,6 +348,51 @@ export class BrowserRadioSource {
     } else {
       await connection.sendZeroHopAdvert();
     }
+  }
+
+  /**
+   * Read this radio's live channel slots. Browser mode must present the
+   * browser radio's state, never the standby server's stored channel list.
+   */
+  async getChannels(): Promise<Channel[]> {
+    const connection = this.requireConnection();
+    const channels: Channel[] = [];
+    for (let idx = 0; idx < MAX_CHANNELS; idx++) {
+      const channel = await this.readChannel(connection, idx, CHANNEL_READ_TIMEOUT_MS);
+      if (channel) channels.push(channel);
+    }
+    return channels;
+  }
+
+  /** GetChannel has no promise helper in meshcore.js; wrap the events (mirrors the server). */
+  private readChannel(connection: MeshConnection, idx: number, timeoutMs: number): Promise<Channel | null> {
+    const Constants = this.constants!;
+    const BufferUtils = this.bufferUtils!;
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        connection.off(Constants.ResponseCodes.ChannelInfo, onInfo);
+        connection.off(Constants.ResponseCodes.Err, onErr);
+        clearTimeout(timeout);
+      };
+      const onInfo = (...args: unknown[]) => {
+        const info = args[0] as { channelIdx: number; name: string; secret: Uint8Array };
+        if (info.channelIdx !== idx) return;
+        cleanup();
+        // an empty name marks an unset slot
+        resolve(info.name ? { idx: info.channelIdx, name: info.name, secret: BufferUtils.bytesToHex(info.secret) } : null);
+      };
+      const onErr = () => {
+        cleanup();
+        reject(new Error(`Radio rejected reading channel ${idx}`));
+      };
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Timed out reading channel ${idx}`));
+      }, timeoutMs);
+      connection.on(Constants.ResponseCodes.ChannelInfo, onInfo);
+      connection.on(Constants.ResponseCodes.Err, onErr);
+      void connection.sendCommandGetChannel(idx);
+    });
   }
 
   private async recordOutgoing(item: IngestItem): Promise<Message> {

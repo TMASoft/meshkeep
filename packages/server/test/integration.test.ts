@@ -94,6 +94,41 @@ describe("mock radio end-to-end", () => {
     expect(channels[0].name).toBe("Public");
   });
 
+  it("drops contacts the radio no longer has on refresh but keeps their history", async () => {
+    const phantomKey = "f".repeat(64);
+    // a contact that was removed on the radio through another app
+    manager.store.upsertContact({
+      publicKey: phantomKey,
+      name: "Ghost",
+      type: "chat",
+      flags: 0,
+      outPathLen: -1,
+      lat: null,
+      lon: null,
+      lastAdvert: 0,
+      lastSeen: null,
+    });
+    manager.store.insertMessage({
+      kind: "dm",
+      contactKey: phantomKey,
+      direction: "in",
+      text: "from beyond",
+      senderTimestamp: 1_000,
+    });
+
+    const removedEvent = waitForEvent(bus, (e) => e.type === "contact.removed");
+    const contacts = await manager.refreshContacts();
+
+    expect((await removedEvent) as Extract<WsEvent, { type: "contact.removed" }>).toMatchObject({ publicKey: phantomKey });
+    expect(contacts.map((c) => c.name)).not.toContain("Ghost");
+    expect(manager.store.getContacts().map((c) => c.name)).not.toContain("Ghost");
+    // radio contacts survive the reconciliation
+    expect(manager.store.getContacts()).toHaveLength(4);
+    // the removed contact's history keeps its identity
+    const history = manager.store.getConversation({ contactKey: phantomKey, limit: 10 });
+    expect(history.map((m) => m.text)).toEqual(["from beyond"]);
+  });
+
   it("sends a DM, sees it delivered, and receives the echo", async () => {
     const alice = manager.store.getContacts().find((c) => c.name === "Mock Alice")!;
 
@@ -481,6 +516,26 @@ describe("connection lifecycle races", () => {
   afterEach(async () => {
     await manager?.stop();
     db?.close();
+    vi.useRealTimers();
+  });
+
+  it("treats configuration errors as permanent and suppresses reconnect until settings change", async () => {
+    db = openDb(":memory:");
+    const factory = vi.fn(() => {
+      throw new Error("factory must not run for invalid configuration");
+    });
+    const config: ServerConfig = { ...testConfig(1), connection: "serial", serialPort: null };
+    manager = new ConnectionManager(config, db, new Bus(), "test", 50, factory as never);
+
+    vi.useFakeTimers();
+    await manager.start();
+    expect(manager.getState()).toBe("error");
+    expect(manager.status().connection.lastError).toContain("configuration error");
+    expect(manager.status().connection.lastError).toContain("serial port");
+
+    // no reconnect loop: retrying cannot fix missing configuration
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    expect(factory).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 

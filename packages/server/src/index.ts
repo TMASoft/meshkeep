@@ -11,6 +11,7 @@ import { MapCache } from "./map/cache.js";
 import { Auth } from "./api/auth.js";
 import { buildApi } from "./api/routes.js";
 import { attachWs } from "./api/ws.js";
+import { gracefulShutdown } from "./shutdown.js";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 
@@ -50,7 +51,7 @@ if (webDist) {
 }
 
 const server = createServer(app);
-attachWs(server, bus, auth);
+const wss = attachWs(server, bus, auth);
 
 server.listen(config.port, () => {
   console.log(`[meshkeep] v${version} listening on :${config.port}`);
@@ -60,12 +61,16 @@ server.listen(config.port, () => {
 
 void manager.start();
 
+let shuttingDown = false;
 async function shutdown(): Promise<void> {
+  if (shuttingDown) {
+    console.error("[meshkeep] second signal — exiting immediately");
+    process.exit(1);
+  }
+  shuttingDown = true;
   console.log("[meshkeep] shutting down");
-  await manager.stop();
-  server.close();
-  db.close();
-  process.exit(0);
+  const result = await gracefulShutdown({ manager, wss, server, db });
+  process.exit(result === "clean" ? 0 : 1);
 }
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());

@@ -31,6 +31,12 @@ class FakeConnection {
     };
     this.on(event, wrapper);
   }
+  off(event: string | number, callback: (...args: unknown[]) => void) {
+    this.listeners.set(
+      event,
+      (this.listeners.get(event) ?? []).filter((l) => l !== callback),
+    );
+  }
   emit(event: string | number, ...args: unknown[]) {
     for (const listener of [...(this.listeners.get(event) ?? [])]) listener(...args);
   }
@@ -90,6 +96,15 @@ class FakeConnection {
   }
   async sendFloodAdvert() {}
   async sendZeroHopAdvert() {}
+  channelSlots: { channelIdx: number; name: string; secret: Uint8Array }[] = [];
+  async sendCommandGetChannel(idx: number) {
+    const slot = this.channelSlots.find((c) => c.channelIdx === idx) ?? {
+      channelIdx: idx,
+      name: "", // unset slot
+      secret: new Uint8Array(16),
+    };
+    queueMicrotask(() => this.emit(Constants.ResponseCodes.ChannelInfo, slot));
+  }
 }
 
 class MemoryQueue implements IngestQueue {
@@ -186,6 +201,21 @@ describe("BrowserRadioSource lifecycle", () => {
     expect(h.selves[0]).toMatchObject({ name: "FakeNode", manufacturerModel: "Fake Board" });
     expect(h.batteries).toEqual([4111]);
     expect(h.posts.map((p) => p.kind)).toEqual(["self", "contacts"]);
+    await h.source.stop();
+  });
+
+  it("getChannels reads the radio's live channel slots and skips unset ones", async () => {
+    const h = harness();
+    h.connection.channelSlots = [
+      { channelIdx: 0, name: "Public", secret: new Uint8Array(16).fill(0x11) },
+      { channelIdx: 3, name: "Ops", secret: new Uint8Array(16).fill(0x22) },
+    ];
+    await h.source.start();
+    const channels = await h.source.getChannels();
+    expect(channels).toEqual([
+      { idx: 0, name: "Public", secret: "11".repeat(16) },
+      { idx: 3, name: "Ops", secret: "22".repeat(16) },
+    ]);
     await h.source.stop();
   });
 

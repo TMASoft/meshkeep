@@ -3,6 +3,7 @@ import type {
   Channel,
   Contact,
   ContactTelemetryPoint,
+  ConversationUnread,
   Message,
   MessageDirection,
   MessageKind,
@@ -56,12 +57,20 @@ function rowToMessage(row: MessageRow): Message {
   };
 }
 
+// Author attribution resolves only when the prefix matches exactly one
+// contact. A scalar subquery (never a JOIN) guarantees one row per message
+// even when multiple contacts share the prefix, and yields NULL on ambiguity.
+const AUTHOR_NAME_SELECT = `(
+    SELECT CASE WHEN COUNT(*) = 1 THEN MIN(a.name) END
+    FROM contacts a
+    WHERE m.author_prefix IS NOT NULL AND a.public_key LIKE m.author_prefix || '%'
+  ) AS author_name`;
+
 const MESSAGE_SELECT = `
-  SELECT m.*, c.name AS contact_name, ch.name AS channel_name, a.name AS author_name
+  SELECT m.*, c.name AS contact_name, ch.name AS channel_name, ${AUTHOR_NAME_SELECT}
   FROM messages m
   LEFT JOIN contacts c ON c.public_key = m.contact_key
   LEFT JOIN channels ch ON ch.idx = m.channel_idx
-  LEFT JOIN contacts a ON m.author_prefix IS NOT NULL AND a.public_key LIKE m.author_prefix || '%'
 `;
 
 export class Store {
@@ -100,10 +109,39 @@ export class Store {
     return this.reconcileContactMessages(contact.publicKey);
   }
 
-  touchContactSeen(publicKey: string): void {
-    this.db
+  /**
+   * Update last-seen for a stored contact. Returns the updated contact, or
+   * null when the contact is not stored yet — callers must sync the contact
+   * list first rather than letting the touch land on a missing row and vanish.
+   */
+  touchContactSeen(publicKey: string): Contact | null {
+    const result = this.db
       .prepare("UPDATE contacts SET last_seen = ?, updated_at = ? WHERE public_key = ?")
       .run(now(), now(), publicKey);
+    if (result.changes === 0) return null;
+    return this.getContacts().find((contact) => contact.publicKey === publicKey) ?? null;
+  }
+
+  /**
+   * Apply one confirmed complete radio contact scan atomically: upsert every
+   * contact the radio reported, then drop stored contacts the radio no longer
+   * has. The contacts table mirrors the radio's *current* contact list;
+   * message history is the historical record — messages carry their own
+   * contact_key/contact_prefix identity and stay queryable after a removal.
+   * Never call this with a partial listing (e.g. a browser ingest batch).
+   */
+  syncContacts(contacts: Contact[]): { removed: string[] } {
+    const removed: string[] = [];
+    this.db.transaction(() => {
+      for (const contact of contacts) this.upsertContact(contact);
+      for (const known of this.getContacts()) {
+        if (!contacts.some((contact) => contact.publicKey === known.publicKey)) {
+          this.removeContact(known.publicKey);
+          removed.push(known.publicKey);
+        }
+      }
+    })();
+    return { removed };
   }
 
   getContacts(): Contact[] {
@@ -200,6 +238,17 @@ export class Store {
     authorPrefix?: string | null;
     ingestionId?: string;
   }): Message | null {
+    if (input.kind === "dm") {
+      if (input.channelIdx != null) throw new Error("dm messages cannot carry a channel index");
+      if (!input.contactKey && !input.contactPrefix) {
+        throw new Error("dm messages need a contact key or sender prefix");
+      }
+    } else {
+      if (input.channelIdx == null) throw new Error("channel messages need a channel index");
+      if (input.contactKey || input.contactPrefix) {
+        throw new Error("channel messages cannot carry a contact identity");
+      }
+    }
     const contactKey =
       input.kind === "dm" && !input.contactKey && input.contactPrefix
         ? this.findUniqueContactByPrefix(input.contactPrefix)?.publicKey ?? null
@@ -320,13 +369,12 @@ export class Store {
     }
     const rows = this.db
       .prepare(
-        `SELECT m.*, c.name AS contact_name, ch.name AS channel_name, a.name AS author_name,
+        `SELECT m.*, c.name AS contact_name, ch.name AS channel_name, ${AUTHOR_NAME_SELECT},
                 snippet(messages_fts, 0, char(1), char(2), '…', 12) AS snippet
          FROM messages_fts
          JOIN messages m ON m.id = messages_fts.rowid
          LEFT JOIN contacts c ON c.public_key = m.contact_key
          LEFT JOIN channels ch ON ch.idx = m.channel_idx
-         LEFT JOIN contacts a ON m.author_prefix IS NOT NULL AND a.public_key LIKE m.author_prefix || '%'
          WHERE ${clauses.join(" AND ")}
          ORDER BY rank LIMIT @limit`,
       )
@@ -383,6 +431,40 @@ export class Store {
         .prepare("UPDATE messages SET read = 1 WHERE kind = 'channel' AND channel_idx = ? AND direction = 'in'")
         .run(opts.channelIdx);
     }
+  }
+
+  /**
+   * Unread incoming messages grouped per conversation, using the same
+   * addressing as getConversation: resolved DMs by contact key, unresolved
+   * DMs by sender prefix, channel messages by channel index.
+   */
+  getUnreadSummary(): ConversationUnread[] {
+    const rows = this.db
+      .prepare(
+        `SELECT kind,
+                CASE WHEN kind = 'dm' THEN contact_key END AS contact_key,
+                CASE WHEN kind = 'dm' AND contact_key IS NULL THEN contact_prefix END AS contact_prefix,
+                CASE WHEN kind = 'channel' THEN channel_idx END AS channel_idx,
+                COUNT(*) AS unread
+         FROM messages
+         WHERE direction = 'in' AND read = 0
+         GROUP BY 1, 2, 3, 4
+         ORDER BY unread DESC`,
+      )
+      .all() as Array<{
+      kind: MessageKind;
+      contact_key: string | null;
+      contact_prefix: string | null;
+      channel_idx: number | null;
+      unread: number;
+    }>;
+    return rows.map((row) => ({
+      kind: row.kind,
+      contactKey: row.contact_key,
+      contactPrefix: row.contact_prefix,
+      channelIdx: row.channel_idx,
+      unread: row.unread,
+    }));
   }
 
   counts(): { contacts: number; messages: number; unread: number } {

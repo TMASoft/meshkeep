@@ -22,6 +22,8 @@ import { displayMessage } from "../message-display";
 import AppIcon from "../components/AppIcon.vue";
 
 const store = useAppStore();
+// what the active radio driver supports; disabled controls carry the guidance
+const caps = computed(() => store.capabilities);
 const draft = ref("");
 const sending = ref(false);
 const opening = ref(false);
@@ -647,6 +649,8 @@ function fmtLastAdvert(epoch: number): string {
                 type="button"
                 aria-label="Create or join a channel"
                 :aria-expanded="channelFormOpen"
+                :disabled="!caps.manageChannels"
+                :title="caps.guidance ?? undefined"
                 @click="channelFormOpen ? (channelFormOpen = false) : openChannelForm()"
               >
                 <AppIcon name="plus" :size="14" />
@@ -683,7 +687,7 @@ function fmtLastAdvert(epoch: number): string {
               {{ channelName.trim() }} lands on the same channel.
             </p>
             <p v-if="channelError" class="import-error" role="alert">{{ channelError }}</p>
-            <button class="import-submit channel-submit" type="submit" :disabled="channelBusy">
+            <button class="import-submit channel-submit" type="submit" :disabled="channelBusy || !caps.manageChannels" :title="caps.guidance ?? undefined">
               {{ channelBusy ? "Saving" : "Save channel" }}
             </button>
           </form>
@@ -718,6 +722,8 @@ function fmtLastAdvert(epoch: number): string {
                 type="button"
                 aria-label="Import a contact from a meshcore:// link"
                 :aria-expanded="importOpen"
+                :disabled="!caps.manageContacts"
+                :title="caps.guidance ?? undefined"
                 @click="importOpen = !importOpen"
               >
                 <AppIcon name="plus" :size="14" />
@@ -735,7 +741,7 @@ function fmtLastAdvert(epoch: number): string {
                 spellcheck="false"
               />
             </label>
-            <button class="import-submit" type="submit" :disabled="importBusy || !importUri.trim()">
+            <button class="import-submit" type="submit" :disabled="importBusy || !importUri.trim() || !caps.manageContacts" :title="caps.guidance ?? undefined">
               {{ importBusy ? "Importing" : "Import" }}
             </button>
             <p v-if="importError" class="import-error" role="alert">{{ importError }}</p>
@@ -862,7 +868,7 @@ function fmtLastAdvert(epoch: number): string {
                 :placeholder="activeContact?.type === 'room' ? 'Room password' : 'Admin password'"
                 autocomplete="off"
               />
-              <button type="submit" :disabled="detailsBusy !== null || !loginPassword">
+              <button type="submit" :disabled="detailsBusy !== null || !loginPassword || !caps.nodeTools" :title="caps.guidance ?? undefined">
                 {{ detailsBusy === "login" ? "Logging in" : "Log in" }}
               </button>
             </div>
@@ -904,23 +910,25 @@ function fmtLastAdvert(epoch: number): string {
           </div>
 
           <p v-if="detailsNotice" class="details-notice" role="status">{{ detailsNotice }}</p>
+          <p v-if="caps.guidance" class="details-notice" role="note">{{ caps.guidance }}</p>
           <div class="details-actions">
             <template v-if="activeContact">
               <button
                 v-if="isRemoteNode"
                 type="button"
-                :disabled="detailsBusy !== null"
+                :disabled="detailsBusy !== null || !caps.nodeTools"
+                :title="caps.guidance ?? undefined"
                 @click="requestStatus"
               >
                 <AppIcon name="signal" :size="15" /> {{ detailsBusy === "status" ? "Requesting" : "Request status" }}
               </button>
-              <button type="button" :disabled="detailsBusy !== null" @click="requestTelemetry">
+              <button type="button" :disabled="detailsBusy !== null || !caps.nodeTools" :title="caps.guidance ?? undefined" @click="requestTelemetry">
                 <AppIcon name="battery" :size="15" /> {{ detailsBusy === "telemetry" ? "Requesting" : "Request telemetry" }}
               </button>
-              <button type="button" :disabled="detailsBusy !== null" @click="copyContactUri">
+              <button type="button" :disabled="detailsBusy !== null || !caps.manageContacts" :title="caps.guidance ?? undefined" @click="copyContactUri">
                 <AppIcon name="link" :size="15" /> {{ detailsBusy === "share" ? "Copying" : "Copy share link" }}
               </button>
-              <button type="button" :disabled="detailsBusy !== null" @click="resetContactPath">
+              <button type="button" :disabled="detailsBusy !== null || !caps.manageContacts" :title="caps.guidance ?? undefined" @click="resetContactPath">
                 <AppIcon name="broadcast" :size="15" /> {{ detailsBusy === "path" ? "Resetting" : "Reset route" }}
               </button>
             </template>
@@ -934,7 +942,7 @@ function fmtLastAdvert(epoch: number): string {
               <button type="button" @click="copyChannelShareLink">
                 <AppIcon name="link" :size="15" /> Copy share link
               </button>
-              <button type="button" @click="openChannelForm(activeChannel)">
+              <button type="button" :disabled="!caps.manageChannels" :title="caps.guidance ?? undefined" @click="openChannelForm(activeChannel)">
                 <AppIcon name="settings" :size="15" /> Edit channel
               </button>
             </template>
@@ -945,7 +953,8 @@ function fmtLastAdvert(epoch: number): string {
               v-if="activeContact"
               class="danger"
               type="button"
-              :disabled="detailsBusy !== null"
+              :disabled="detailsBusy !== null || !caps.manageContacts"
+              :title="caps.guidance ?? undefined"
               @click="removeActiveContact"
             >
               <AppIcon name="trash" :size="15" /> {{ detailsBusy === "remove" ? "Removing" : "Remove contact" }}
@@ -954,7 +963,8 @@ function fmtLastAdvert(epoch: number): string {
               v-if="activeChannel"
               class="danger"
               type="button"
-              :disabled="detailsBusy !== null"
+              :disabled="detailsBusy !== null || !caps.manageChannels"
+              :title="caps.guidance ?? undefined"
               @click="deleteActiveChannel"
             >
               <AppIcon name="trash" :size="15" /> {{ detailsBusy === "delete" ? "Deleting" : "Delete channel" }}

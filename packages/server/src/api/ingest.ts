@@ -30,8 +30,24 @@ export const ingestMessageSchema = z
       .nullish(),
     ingestionId: z.string().uuid(),
   })
-  .refine((m) => (m.kind === "dm" ? m.contactKey !== undefined || m.contactPrefix !== undefined : m.channelIdx !== undefined), {
-    message: "dm messages need a contact key or sender prefix, channel messages need channelIdx",
+  .superRefine((m, ctx) => {
+    // dm and channel shapes are mutually exclusive — never accept a message
+    // carrying both identities (or neither) rather than guessing a bucket
+    if (m.kind === "dm") {
+      if (m.contactKey === undefined && m.contactPrefix === undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "dm messages need a contact key or sender prefix" });
+      }
+      if (m.channelIdx !== undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "dm messages cannot carry channelIdx" });
+      }
+    } else {
+      if (m.channelIdx === undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "channel messages need channelIdx" });
+      }
+      if (m.contactKey !== undefined || m.contactPrefix !== undefined) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "channel messages cannot carry a contact identity" });
+      }
+    }
   });
 
 export const ingestContactSchema = z.object({

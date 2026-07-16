@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { describeConnectError, nextReconnectDelay, reconnectPolicyFor } from "../src/radio/reconnect-policy.js";
+import {
+  describeConnectError,
+  nextReconnectDelay,
+  reconnectPolicyFor,
+  validateConnectionSettings,
+} from "../src/radio/reconnect-policy.js";
 
 describe("reconnect policy", () => {
   it("backs off BLE far more aggressively than serial/tcp", () => {
@@ -41,5 +46,41 @@ describe("describeConnectError", () => {
   it("passes unknown BLE errors and non-BLE transports through", () => {
     expect(describeConnectError("ble", "le-connection-abort-by-local")).toBe("le-connection-abort-by-local");
     expect(describeConnectError("serial", "operation timed out")).toBe("operation timed out");
+  });
+});
+
+describe("validateConnectionSettings", () => {
+  const base = {
+    connection: "none" as const,
+    serialPort: null,
+    serialBaud: 115_200,
+    tcpHost: null,
+    tcpPort: 5000,
+    bleAddress: null,
+  };
+
+  it("accepts complete, in-range settings (and 'none')", () => {
+    expect(validateConnectionSettings(base)).toBeNull();
+    expect(validateConnectionSettings({ ...base, connection: "serial", serialPort: "/dev/ttyUSB0" })).toBeNull();
+    expect(validateConnectionSettings({ ...base, connection: "tcp", tcpHost: "radio.local" })).toBeNull();
+    expect(validateConnectionSettings({ ...base, connection: "ble", bleAddress: "aa:bb:cc:dd:ee:ff" })).toBeNull();
+  });
+
+  it("flags missing targets as permanent configuration errors", () => {
+    expect(validateConnectionSettings({ ...base, connection: "serial" })).toContain("serial port");
+    expect(validateConnectionSettings({ ...base, connection: "tcp" })).toContain("host");
+    expect(validateConnectionSettings({ ...base, connection: "ble" })).toContain("device address");
+  });
+
+  it("flags out-of-range and malformed values", () => {
+    expect(
+      validateConnectionSettings({ ...base, connection: "serial", serialPort: "/dev/ttyUSB0", serialBaud: 0 }),
+    ).toContain("baud");
+    expect(
+      validateConnectionSettings({ ...base, connection: "tcp", tcpHost: "radio.local", tcpPort: 70_000 }),
+    ).toContain("tcp port");
+    expect(
+      validateConnectionSettings({ ...base, connection: "ble", bleAddress: "not-a-mac" }),
+    ).toContain("BLE address");
   });
 });

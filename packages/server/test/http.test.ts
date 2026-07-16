@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import request from "supertest";
 import { buildHarness } from "./helpers.js";
 
@@ -35,6 +35,55 @@ describe("http: zod validation (400s)", () => {
       () => request(app).post("/api/v1/messages").send({ kind: "dm", to: KEY_A, text: "x".repeat(2001) }),
     ],
     ["read without target", () => request(app).post("/api/v1/messages/read").send({})],
+    ["read with two targets", () => request(app).post("/api/v1/messages/read").send({ contact: KEY_A, channel: 1 })],
+    ["messages contact and channel", () => request(app).get(`/api/v1/messages?contact=${KEY_A}&channel=1`)],
+    ["messages contact and sender", () => request(app).get(`/api/v1/messages?contact=${KEY_A}&sender=abcd`)],
+    ["search contact and channel", () => request(app).get(`/api/v1/messages/search?q=x&contact=${KEY_A}&channel=1`)],
+    ["export contact and channel", () => request(app).get(`/api/v1/messages/export?contact=${KEY_A}&channel=1`)],
+    [
+      "ingest dm carrying channelIdx",
+      () =>
+        request(app)
+          .post("/api/v1/ingest/messages")
+          .send({
+            messages: [
+              { kind: "dm", contactKey: KEY_A, channelIdx: 1, direction: "in", text: "x", senderTimestamp: 1, ingestionId: "00000000-0000-4000-8000-00000000aa01" },
+            ],
+          }),
+    ],
+    [
+      "ingest channel carrying a contact",
+      () =>
+        request(app)
+          .post("/api/v1/ingest/messages")
+          .send({
+            messages: [
+              { kind: "channel", channelIdx: 1, contactKey: KEY_A, direction: "in", text: "x", senderTimestamp: 1, ingestionId: "00000000-0000-4000-8000-00000000aa02" },
+            ],
+          }),
+    ],
+    [
+      "ingest dm without any sender identity",
+      () =>
+        request(app)
+          .post("/api/v1/ingest/messages")
+          .send({
+            messages: [
+              { kind: "dm", direction: "in", text: "x", senderTimestamp: 1, ingestionId: "00000000-0000-4000-8000-00000000aa03" },
+            ],
+          }),
+    ],
+    [
+      "ingest channel without channelIdx",
+      () =>
+        request(app)
+          .post("/api/v1/ingest/messages")
+          .send({
+            messages: [
+              { kind: "channel", direction: "in", text: "x", senderTimestamp: 1, ingestionId: "00000000-0000-4000-8000-00000000aa04" },
+            ],
+          }),
+    ],
     ["channel idx out of range", () => request(app).put("/api/v1/channels/8").send({ name: "x", secret: "0".repeat(32) })],
     ["channel bad secret", () => request(app).put("/api/v1/channels/0").send({ name: "x", secret: "zz" })],
     ["device lat without lon", () => request(app).patch("/api/v1/device").send({ lat: 44.2 })],
@@ -58,6 +107,26 @@ describe("http: zod validation (400s)", () => {
       expect(Array.isArray(res.body.details)).toBe(true);
     });
   }
+});
+
+describe("http: internal errors stay generic", () => {
+  it("hides unexpected library/system errors but keeps deliberate operational messages", async () => {
+    const { app, manager } = buildHarness();
+    const spy = vi.spyOn(manager.store, "getRecentMessages");
+
+    spy.mockImplementation(() => {
+      throw new TypeError("boom at /srv/meshkeep/secret/path.ts:42");
+    });
+    const internal = await request(app).get("/api/v1/messages/recent").expect(500);
+    expect(internal.body).toEqual({ error: "internal error" });
+
+    spy.mockImplementation(() => {
+      throw new Error("radio rejected the message");
+    });
+    const operational = await request(app).get("/api/v1/messages/recent").expect(500);
+    expect(operational.body).toEqual({ error: "radio rejected the message" });
+    spy.mockRestore();
+  });
 });
 
 describe("http: radio-touching routes 503 while disconnected", () => {
@@ -177,6 +246,72 @@ describe("http: store-backed reads", () => {
     const res = await request(app).get("/api/v1/telemetry?hours=1").expect(200);
     expect(res.body.points).toHaveLength(1);
     expect(res.body.points[0].batteryMv).toBe(4100);
+  });
+});
+
+describe("http: per-conversation unread summary", () => {
+  const { app, manager } = buildHarness();
+  const store = manager.store;
+  const base = 1_784_000_000;
+  const prefix = "abcdef123456";
+
+  const insert = (input: Partial<Parameters<typeof store.insertMessage>[0]>, n = 1) => {
+    for (let i = 0; i < n; i++) {
+      store.insertMessage({
+        kind: "dm",
+        direction: "in",
+        text: `m${i}`,
+        senderTimestamp: base + i,
+        status: "sent",
+        ...input,
+      });
+    }
+  };
+  store.upsertContact({
+    publicKey: KEY_A,
+    name: "Alice",
+    type: "chat",
+    flags: 0,
+    outPathLen: -1,
+    lat: null,
+    lon: null,
+    lastAdvert: 0,
+    lastSeen: null,
+  });
+  insert({ contactKey: KEY_A }, 2);
+  insert({ contactKey: KEY_A, direction: "out" }); // outgoing never counts
+  insert({ contactKey: null, contactPrefix: prefix }); // unresolved sender
+  insert({ kind: "channel", channelIdx: 3 }, 3);
+
+  const summary = async () => {
+    const res = await request(app).get("/api/v1/messages/unread").expect(200);
+    return res.body.conversations as Array<Record<string, unknown>>;
+  };
+
+  it("groups unread incoming messages by conversation", async () => {
+    expect(await summary()).toEqual([
+      { kind: "channel", contactKey: null, contactPrefix: null, channelIdx: 3, unread: 3 },
+      { kind: "dm", contactKey: KEY_A, contactPrefix: null, channelIdx: null, unread: 2 },
+      { kind: "dm", contactKey: null, contactPrefix: prefix, channelIdx: null, unread: 1 },
+    ]);
+  });
+
+  it("stays correct after marking a conversation read", async () => {
+    await request(app).post("/api/v1/messages/read").send({ contact: KEY_A }).expect(200);
+    expect(await summary()).toEqual([
+      { kind: "channel", contactKey: null, contactPrefix: null, channelIdx: 3, unread: 3 },
+      { kind: "dm", contactKey: null, contactPrefix: prefix, channelIdx: null, unread: 1 },
+    ]);
+    await request(app).post("/api/v1/messages/read").send({ sender: prefix }).expect(200);
+    await request(app).post("/api/v1/messages/read").send({ channel: 3 }).expect(200);
+    expect(await summary()).toEqual([]);
+  });
+
+  it("counts new incoming messages again after read", async () => {
+    insert({ contactKey: KEY_A, senderTimestamp: base + 500 });
+    expect(await summary()).toEqual([
+      { kind: "dm", contactKey: KEY_A, contactPrefix: null, channelIdx: null, unread: 1 },
+    ]);
   });
 });
 
