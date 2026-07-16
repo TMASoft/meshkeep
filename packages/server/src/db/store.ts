@@ -5,6 +5,7 @@ import type {
   Message,
   MessageDirection,
   MessageKind,
+  MessageSearchResult,
   MessageStatus,
   SelfInfo,
   TelemetryPoint,
@@ -286,6 +287,46 @@ export class Store {
       .prepare(`${MESSAGE_SELECT} ${where} ORDER BY m.id DESC LIMIT @limit`)
       .all(params) as MessageRow[];
     return rows.map(rowToMessage).reverse();
+  }
+
+  /**
+   * Full-text search over message text (FTS5), best match first. User input
+   * is quoted term-by-term so FTS query syntax can't error; the final term
+   * matches as a prefix for type-ahead feel. Snippets mark matches with
+   * \x01…\x02 so the UI can highlight without HTML in the payload.
+   */
+  searchMessages(opts: {
+    query: string;
+    contactKey?: string;
+    channelIdx?: number;
+    limit: number;
+  }): MessageSearchResult[] {
+    const terms = opts.query.trim().split(/\s+/).filter(Boolean);
+    if (!terms.length) return [];
+    const match = terms.map((term, i) => `"${term.replace(/"/g, '""')}"${i === terms.length - 1 ? "*" : ""}`).join(" ");
+    const clauses: string[] = ["messages_fts MATCH @match"];
+    const params: Record<string, unknown> = { match, limit: Math.min(Math.max(opts.limit, 1), 100) };
+    if (opts.contactKey !== undefined) {
+      clauses.push("m.kind = 'dm' AND m.contact_key = @contactKey");
+      params.contactKey = opts.contactKey;
+    } else if (opts.channelIdx !== undefined) {
+      clauses.push("m.kind = 'channel' AND m.channel_idx = @channelIdx");
+      params.channelIdx = opts.channelIdx;
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT m.*, c.name AS contact_name, ch.name AS channel_name, a.name AS author_name,
+                snippet(messages_fts, 0, char(1), char(2), '…', 12) AS snippet
+         FROM messages_fts
+         JOIN messages m ON m.id = messages_fts.rowid
+         LEFT JOIN contacts c ON c.public_key = m.contact_key
+         LEFT JOIN channels ch ON ch.idx = m.channel_idx
+         LEFT JOIN contacts a ON m.author_prefix IS NOT NULL AND a.public_key LIKE m.author_prefix || '%'
+         WHERE ${clauses.join(" AND ")}
+         ORDER BY rank LIMIT @limit`,
+      )
+      .all(params) as (MessageRow & { snippet: string })[];
+    return rows.map((row) => ({ ...rowToMessage(row), snippet: row.snippet }));
   }
 
   /** Every message of a conversation (or everything), oldest first, for export. */

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
-import type { Contact, Message, NodeStats, SensorReading } from "@meshkeep/shared";
+import type { Contact, Message, MessageSearchResult, NodeStats, SensorReading } from "@meshkeep/shared";
 import {
   buildChannelShareUri,
   channelSecretToBase64,
@@ -117,13 +117,98 @@ async function send() {
   }
 }
 
+// paused while jumping to a search hit, so history merges don't yank the view
+let autoScrollPaused = false;
+
 function scrollToEnd() {
+  if (autoScrollPaused) return;
   void nextTick(() => {
     thread.value?.scrollTo({ top: thread.value.scrollHeight, behavior: reduceMotion.matches ? "auto" : "smooth" });
   });
 }
 
 watch(() => messages.value.length, scrollToEnd);
+
+// ---- full-text message search ----
+
+const searchResults = ref<MessageSearchResult[] | null>(null);
+const searchBusy = ref(false);
+const highlightId = ref<number | null>(null);
+let searchTimer: number | undefined;
+
+watch(search, (value) => {
+  window.clearTimeout(searchTimer);
+  const query = value.trim();
+  if (query.length < 2) {
+    searchResults.value = null;
+    return;
+  }
+  searchTimer = window.setTimeout(async () => {
+    searchBusy.value = true;
+    try {
+      searchResults.value = await store.searchMessages(query);
+    } catch {
+      searchResults.value = null;
+    } finally {
+      searchBusy.value = false;
+    }
+  }, 250);
+});
+
+function resultConversation(result: MessageSearchResult): ConversationId {
+  return result.kind === "dm"
+    ? { kind: "dm", contactKey: result.contactKey ?? "" }
+    : { kind: "channel", channelIdx: result.channelIdx ?? 0 };
+}
+
+function resultTitle(result: MessageSearchResult): string {
+  if (result.kind === "dm") return result.contactName ?? shortKey(result.contactKey ?? "");
+  return result.channelName ?? `channel ${result.channelIdx}`;
+}
+
+/** Split a snippet on the \x01…\x02 highlight markers the server emits. */
+function snippetParts(snippet: string): { text: string; hit: boolean }[] {
+  const parts: { text: string; hit: boolean }[] = [];
+  let hit = false;
+  for (const piece of snippet.split(/([\x01\x02])/)) {
+    if (piece === "\x01") hit = true;
+    else if (piece === "\x02") hit = false;
+    else if (piece) parts.push({ text: piece, hit });
+  }
+  return parts;
+}
+
+async function openSearchResult(result: MessageSearchResult) {
+  if (opening.value) return;
+  error.value = null;
+  opening.value = true;
+  autoScrollPaused = true;
+  try {
+    const found = await store.openConversationAt(resultConversation(result), result.id);
+    await nextTick();
+    if (found) {
+      highlightId.value = result.id;
+      thread.value
+        ?.querySelector(`[data-mid="${result.id}"]`)
+        ?.scrollIntoView({ block: "center", behavior: reduceMotion.matches ? "auto" : "smooth" });
+      window.setTimeout(() => {
+        if (highlightId.value === result.id) highlightId.value = null;
+      }, 2500);
+    }
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "Failed to open conversation";
+  } finally {
+    opening.value = false;
+    // let the pending length-watch callbacks pass before resuming auto-scroll
+    window.setTimeout(() => {
+      autoScrollPaused = false;
+    }, 100);
+  }
+}
+
+function formatDay(epoch: number): string {
+  return new Date(epoch * 1000).toLocaleDateString([], { month: "short", day: "numeric" });
+}
 
 // ---- conversation details & contact management ----
 
@@ -436,11 +521,38 @@ function fmtLastAdvert(epoch: number): string {
 
       <label class="search-field">
         <AppIcon name="search" :size="17" />
-        <span class="sr-only">Filter contacts</span>
-        <input v-model="search" type="search" placeholder="Find a node" autocomplete="off" />
+        <span class="sr-only">Filter contacts and search messages</span>
+        <input v-model="search" type="search" placeholder="Find a node or message" autocomplete="off" />
       </label>
 
       <div class="conversation-scroll">
+        <section v-if="searchResults !== null" class="conversation-group" aria-labelledby="results-heading">
+          <div class="group-heading">
+            <h2 id="results-heading">Messages</h2>
+            <span class="group-heading-tools">{{ searchBusy ? "…" : searchResults.length.toString().padStart(2, "0") }}</span>
+          </div>
+          <button
+            v-for="result in searchResults"
+            :key="`sr-${result.id}`"
+            class="conversation-row search-result"
+            type="button"
+            :disabled="opening"
+            @click="openSearchResult(result)"
+          >
+            <span class="conversation-copy">
+              <strong>{{ resultTitle(result) }}</strong>
+              <small class="result-snippet">
+                <template v-for="(part, i) in snippetParts(result.snippet)" :key="i">
+                  <mark v-if="part.hit">{{ part.text }}</mark>
+                  <template v-else>{{ part.text }}</template>
+                </template>
+              </small>
+            </span>
+            <span class="result-day">{{ formatDay(result.createdAt) }}</span>
+          </button>
+          <p v-if="!searchResults.length && !searchBusy" class="group-empty">No matching messages</p>
+        </section>
+
         <section class="conversation-group" aria-labelledby="channels-heading">
           <div class="group-heading">
             <h2 id="channels-heading">Channels</h2>
@@ -733,7 +845,8 @@ function fmtLastAdvert(epoch: number): string {
             v-else
             :key="message.id"
             class="message-row"
-            :class="message.direction"
+            :class="[message.direction, { 'search-hit': highlightId === message.id }]"
+            :data-mid="message.id"
           >
             <article class="message-bubble">
               <p v-if="message.kind === 'channel' && message.direction === 'in'" class="message-sender">
@@ -891,6 +1004,10 @@ function fmtLastAdvert(epoch: number): string {
 .details-actions .danger:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
 .message-thread { min-height: 0; flex: 1; overflow-y: auto; padding: calc(28px * var(--space-unit)) clamp(18px, 4vw, 58px); }
 .message-row { display: flex; margin-bottom: calc(11px * var(--space-unit)); }
+.message-row.search-hit .message-bubble { outline: 2px solid var(--accent); outline-offset: 2px; transition: outline-color .4s ease; }
+.result-snippet { display: block; overflow: hidden; max-width: 100%; white-space: nowrap; text-overflow: ellipsis; }
+.result-snippet mark { border-radius: 2px; background: color-mix(in srgb, var(--accent) 28%, transparent); color: inherit; }
+.result-day { flex: 0 0 auto; color: var(--text-faint); font-size: 10px; }
 .message-row.out { justify-content: flex-end; }
 .message-bubble { max-width: min(68%, 680px); border: 1px solid var(--border); border-radius: 13px 13px 13px 4px; background: var(--surface-2); padding: calc(10px * var(--space-unit)) 12px 8px; box-shadow: 0 8px 20px rgb(0 0 0 / .08); }
 .message-row.out .message-bubble { border-color: color-mix(in srgb, var(--accent) 34%, var(--border)); border-radius: 13px 13px 4px 13px; background: color-mix(in srgb, var(--accent) 10%, var(--surface-2)); }

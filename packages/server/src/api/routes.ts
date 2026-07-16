@@ -156,6 +156,27 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
     }),
   );
   api.get(
+    "/messages/search",
+    handle((req, res) => {
+      const query = z
+        .object({
+          q: z.string().min(1).max(200),
+          contact: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
+          channel: z.coerce.number().int().min(0).max(255).optional(),
+          limit: z.coerce.number().int().min(1).max(100).default(25),
+        })
+        .parse(req.query);
+      res.json({
+        results: manager.store.searchMessages({
+          query: query.q,
+          contactKey: query.contact?.toLowerCase(),
+          channelIdx: query.channel,
+          limit: query.limit,
+        }),
+      });
+    }),
+  );
+  api.get(
     "/messages/export",
     handle((req, res) => {
       const query = z
