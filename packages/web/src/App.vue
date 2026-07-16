@@ -296,11 +296,14 @@ const stateColor = computed(() => {
         <fieldset>
           <legend>Notifications</legend>
           <div v-if="canNotify" class="segmented-control">
-            <label v-for="option in [
-              { value: 'off', label: 'off' },
-              { value: 'dms', label: 'DMs' },
-              { value: 'all', label: 'DMs + channels' },
-            ]" :key="option.value">
+            <label
+              v-for="option in [
+                { value: 'off', label: 'off' },
+                { value: 'dms', label: 'DMs' },
+                { value: 'all', label: 'DMs + channels' },
+              ]"
+              :key="option.value"
+            >
               <input v-model="notify" type="radio" name="notify" :value="option.value" />
               <span>{{ option.label }}</span>
             </label>

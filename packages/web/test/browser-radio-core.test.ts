@@ -5,7 +5,6 @@ import {
   flushQueueOnce,
   ingestItemFromSync,
   localMessageFromItem,
-  normalizeDeviceText,
   selfInfoFromRaw,
   takePendingAck,
   type IngestQueue,
