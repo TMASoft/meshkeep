@@ -132,6 +132,27 @@ export interface ConnectionSettings {
   bleAddress: string | null;
 }
 
+// Hardware auto-detection (Radio → Connection).
+export interface DetectedSerialPort {
+  /** Stable /dev/serial/by-id path when available, otherwise the raw path. */
+  path: string;
+  rawPath: string;
+  manufacturer: string | null;
+  vendorId: string | null;
+  productId: string | null;
+  label: string;
+  likelyRadio: boolean;
+}
+
+export interface BleCandidate {
+  address: string;
+  name: string | null;
+  rssi: number | null;
+  paired: boolean;
+  /** Advertises the Nordic UART service the companion firmware uses. */
+  nus: boolean;
+}
+
 export interface MapNode {
   publicKey: string;
   name: string;

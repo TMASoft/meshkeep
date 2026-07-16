@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
-import type { ConnectionSettings, TelemetryPoint } from "@meshkeep/shared";
+import type { BleCandidate, ConnectionSettings, DetectedSerialPort, TelemetryPoint } from "@meshkeep/shared";
 import { api } from "../api/client";
 import { useAppStore } from "../stores/app";
 import { browserRadioSupport, type BrowserRadioKind } from "../sources/browser-radio";
@@ -337,6 +337,97 @@ const clearConnConfig = () =>
     seedConnForm(connConfig.value.effective);
     await store.refreshStatus();
   });
+
+// ---- hardware detection ----
+
+const CUSTOM = "__custom__";
+
+const serialPorts = ref<DetectedSerialPort[] | null>(null);
+const serialCustom = ref(false);
+const portsBusy = ref(false);
+
+async function loadPorts() {
+  portsBusy.value = true;
+  try {
+    serialPorts.value = (await api<{ ports: DetectedSerialPort[] }>("/system/ports")).ports;
+    if (!serialPorts.value.some((port) => port.path === connForm.serialPort)) {
+      // current value isn't a detected port: keep it editable, or preselect
+      // the only likely radio when starting from scratch
+      const candidates = serialPorts.value.filter((port) => port.likelyRadio);
+      if (!connForm.serialPort && candidates.length === 1) {
+        connForm.serialPort = candidates[0]!.path;
+        serialCustom.value = false;
+      } else {
+        serialCustom.value = true;
+      }
+    }
+  } catch {
+    serialPorts.value = null;
+    serialCustom.value = true;
+  } finally {
+    portsBusy.value = false;
+  }
+}
+
+const serialChoice = computed({
+  get: () => (serialCustom.value ? CUSTOM : connForm.serialPort),
+  set: (value: string) => {
+    if (value === CUSTOM) {
+      serialCustom.value = true;
+    } else {
+      serialCustom.value = false;
+      connForm.serialPort = value;
+    }
+  },
+});
+
+const bleDevices = ref<BleCandidate[] | null>(null);
+const bleCustom = ref(false);
+const bleBusy = ref(false);
+const bleError = ref<string | null>(null);
+
+async function scanBle() {
+  bleBusy.value = true;
+  bleError.value = null;
+  try {
+    bleDevices.value = (await api<{ devices: BleCandidate[] }>("/system/ble-scan")).devices;
+    if (!bleDevices.value.some((device) => device.address === connForm.bleAddress)) bleCustom.value = true;
+    if (!bleDevices.value.length) bleError.value = "No BLE devices found — is the radio powered and nearby?";
+  } catch (cause) {
+    bleDevices.value = null;
+    bleError.value = cause instanceof Error ? cause.message : "BLE scan failed";
+  } finally {
+    bleBusy.value = false;
+  }
+}
+
+const bleChoice = computed({
+  get: () => (bleCustom.value ? CUSTOM : connForm.bleAddress),
+  set: (value: string) => {
+    if (value === CUSTOM) {
+      bleCustom.value = true;
+    } else {
+      bleCustom.value = false;
+      connForm.bleAddress = value;
+    }
+  },
+});
+
+function bleLabel(device: BleCandidate): string {
+  const parts = [device.name ?? device.address];
+  if (device.name) parts.push(device.address);
+  if (device.rssi !== null) parts.push(`${device.rssi} dBm`);
+  parts.push(device.paired ? "paired" : "not paired");
+  return parts.join(" · ");
+}
+
+watch(
+  () => connForm.transport,
+  (transport) => {
+    if (transport === "serial" && serialPorts.value === null && !portsBusy.value) void loadPorts();
+  },
+  { immediate: false },
+);
 
 // ---- sharing & export ----
 
@@ -691,10 +782,26 @@ onMounted(() => {
                 <option value="none">No radio</option>
               </select>
             </label>
-            <label v-if="connForm.transport === 'serial'" class="field field-wide">
-              <span>Serial device</span>
-              <input v-model="connForm.serialPort" placeholder="/dev/ttyMESH" autocomplete="off" spellcheck="false" />
-            </label>
+            <template v-if="connForm.transport === 'serial'">
+              <label class="field field-wide">
+                <span>Serial device</span>
+                <div class="detect-row">
+                  <select v-model="serialChoice" class="field-select">
+                    <option v-for="port in serialPorts ?? []" :key="port.path" :value="port.path">
+                      {{ port.label }} — {{ port.path }}
+                    </option>
+                    <option :value="CUSTOM">Custom path…</option>
+                  </select>
+                  <button class="button secondary detect-button" type="button" :disabled="portsBusy" @click="loadPorts">
+                    <span v-if="portsBusy" class="button-spinner" />{{ portsBusy ? "Scanning" : "Rescan" }}
+                  </button>
+                </div>
+              </label>
+              <label v-if="serialCustom" class="field field-wide">
+                <span>Device path</span>
+                <input v-model="connForm.serialPort" placeholder="/dev/ttyMESH" autocomplete="off" spellcheck="false" />
+              </label>
+            </template>
             <template v-if="connForm.transport === 'tcp'">
               <label class="field">
                 <span>Host</span>
@@ -705,10 +812,33 @@ onMounted(() => {
                 <input v-model="connForm.tcpPort" inputmode="numeric" />
               </label>
             </template>
-            <label v-if="connForm.transport === 'ble'" class="field field-wide">
-              <span>Radio MAC address</span>
-              <input v-model="connForm.bleAddress" placeholder="AA:BB:CC:DD:EE:FF" autocomplete="off" spellcheck="false" />
-            </label>
+            <template v-if="connForm.transport === 'ble'">
+              <label class="field field-wide">
+                <span>Radio</span>
+                <div class="detect-row">
+                  <select v-model="bleChoice" class="field-select">
+                    <option v-for="device in bleDevices ?? []" :key="device.address" :value="device.address">
+                      {{ bleLabel(device) }}
+                    </option>
+                    <option :value="CUSTOM">Custom MAC address…</option>
+                  </select>
+                  <button class="button secondary detect-button" type="button" :disabled="bleBusy" @click="scanBle">
+                    <span v-if="bleBusy" class="button-spinner" />{{ bleBusy ? "Scanning" : "Scan" }}
+                  </button>
+                </div>
+              </label>
+              <label v-if="bleCustom" class="field field-wide">
+                <span>MAC address</span>
+                <input v-model="connForm.bleAddress" placeholder="AA:BB:CC:DD:EE:FF" autocomplete="off" spellcheck="false" />
+              </label>
+              <p v-if="bleError" class="token-error" role="alert">{{ bleError }}</p>
+              <p
+                v-if="bleDevices?.some((device) => device.address === connForm.bleAddress && !device.paired)"
+                class="module-hint field-wide"
+              >
+                This radio isn't paired yet — pair once on the host with bluetoothctl (companion firmware PIN 123456).
+              </p>
+            </template>
             <div class="coordinate-note field-wide">
               <AppIcon name="info" :size="16" />
               Saving reconnects the radio immediately. Reset returns to the container's environment settings.
@@ -927,6 +1057,9 @@ onMounted(() => {
 .source-buttons .button { flex: 1; }
 .source-note { margin: -6px 18px 15px; color: var(--text-faint); font-size: 10px; }
 .conn-buttons { display: flex; justify-content: flex-end; gap: 8px; }
+.detect-row { display: flex; gap: 6px; }
+.detect-row .field-select { min-width: 0; flex: 1; }
+.detect-button { flex: 0 0 auto; }
 .export-buttons { display: flex; gap: 8px; padding: 0 18px 18px; }
 .export-buttons .button { flex: 1; text-decoration: none; }
 @keyframes spin { to { transform: rotate(360deg); } }

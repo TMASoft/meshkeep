@@ -2,6 +2,7 @@ import { Router, json, type Request, type Response } from "express";
 import { z } from "zod";
 import type { ConnectionManager } from "../radio/manager.js";
 import { RadioUnavailableError } from "../radio/manager.js";
+import { listSerialPorts, scanBleRadios } from "../radio/detect.js";
 import type { MapCache } from "../map/cache.js";
 import type { Bus } from "../bus.js";
 import type { Auth } from "./auth.js";
@@ -310,6 +311,26 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
       const hours = z.coerce.number().int().min(1).max(24 * 30).default(24).parse(req.query.hours ?? 24);
       const since = Math.floor(Date.now() / 1000) - hours * 3600;
       res.json({ points: manager.store.getTelemetry(since) });
+    }),
+  );
+
+  // ---- hardware detection (Radio → Connection) ----
+  api.get(
+    "/system/ports",
+    handle(async (_req, res) => {
+      res.json({ ports: await listSerialPorts() });
+    }),
+  );
+  api.get(
+    "/system/ble-scan",
+    handle(async (req, res) => {
+      const seconds = z.coerce.number().min(2).max(15).default(6).parse(req.query.seconds ?? 6);
+      try {
+        res.json({ devices: await scanBleRadios(seconds * 1000) });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        res.status(503).json({ error: `BLE scan unavailable (BlueZ/D-Bus not reachable): ${detail}` });
+      }
     }),
   );
 
