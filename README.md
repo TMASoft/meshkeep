@@ -103,7 +103,15 @@ a BLE radio near your *browsing* device is often better served by browser-direct
 | `MESHKEEP_MAP_ENABLED` | `true` | set `false` to disable the global map layer |
 
 Connection settings can also be changed at runtime from Radio → Connection; a saved
-override wins over the environment until you reset it.
+override wins over the environment until you reset it. The form detects candidate
+hardware for you: plugged-in USB radios are listed by name (with a free-text escape
+hatch for unusual boards), and a BLE scan lists nearby radios with signal strength
+and pairing state.
+
+Docker caveat: inside a container, serial detection only sees devices mapped in with
+`devices:` — map your radio (or mount `/dev/serial/by-id`) for it to show up. BLE
+scanning works through the same D-Bus socket mount that the BLE connection uses
+(`docker/compose.ble.yml`); without that mount the scan reports BLE as unavailable.
 
 ## API
 
