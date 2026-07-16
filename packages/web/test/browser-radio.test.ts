@@ -12,6 +12,8 @@ class FakeConnection {
   sentTexts: { key: Uint8Array; text: string; type: number }[] = [];
   sentChannelTexts: { idx: number; text: string }[] = [];
   nextAckCrc = 7777;
+  nextAckTimeout = 5000;
+  emitAckBeforeResponse = false;
   onContactMsgRecvResponse: unknown = null; // assigned by patchSignedPlain
 
   on(event: string | number, callback: (...args: unknown[]) => void) {
@@ -78,7 +80,10 @@ class FakeConnection {
   }
   async sendTextMessage(key: Uint8Array, text: string, type: number) {
     this.sentTexts.push({ key, text, type });
-    return { result: 0, expectedAckCrc: this.nextAckCrc, estTimeout: 5000 };
+    if (this.emitAckBeforeResponse) {
+      this.emit(Constants.PushCodes.SendConfirmed, { ackCode: this.nextAckCrc, roundTrip: 0 });
+    }
+    return { result: 0, expectedAckCrc: this.nextAckCrc, estTimeout: this.nextAckTimeout };
   }
   async sendChannelTextMessage(idx: number, text: string) {
     this.sentChannelTexts.push({ idx, text });
@@ -106,6 +111,7 @@ interface Harness {
   states: { state: ConnectionState; error: string | null }[];
   localMessages: Message[];
   localStatuses: { id: number; status: Message["status"] }[];
+  syncedMessages: Message[];
   selves: SelfInfo[];
   batteries: number[];
   posts: { kind: string; payload: unknown }[];
@@ -119,6 +125,7 @@ function harness(opts: { privateSession?: boolean; postFails?: boolean } = {}): 
   const states: Harness["states"] = [];
   const localMessages: Message[] = [];
   const localStatuses: Harness["localStatuses"] = [];
+  const syncedMessages: Message[] = [];
   const selves: SelfInfo[] = [];
   const batteries: number[] = [];
   const posts: Harness["posts"] = [];
@@ -136,6 +143,7 @@ function harness(opts: { privateSession?: boolean; postFails?: boolean } = {}): 
     onState: (state, error) => states.push({ state, error }),
     onLocalMessage: (message) => localMessages.push(message),
     onLocalStatus: (id, status) => localStatuses.push({ id, status }),
+    onSyncedMessage: (message) => syncedMessages.push(message),
     onSelf: (self) => selves.push(self),
     onBattery: (mv) => batteries.push(mv),
   };
@@ -150,7 +158,20 @@ function harness(opts: { privateSession?: boolean; postFails?: boolean } = {}): 
     queue,
     postIngest: postIngest as never,
   });
-  return { source, connection, queue, states, localMessages, localStatuses, selves, batteries, posts, postIngest, releaseLock };
+  return {
+    source,
+    connection,
+    queue,
+    states,
+    localMessages,
+    localStatuses,
+    syncedMessages,
+    selves,
+    batteries,
+    posts,
+    postIngest,
+    releaseLock,
+  };
 }
 
 beforeEach(() => {
@@ -193,6 +214,7 @@ describe("BrowserRadioSource lifecycle", () => {
       onState: (state, error) => h.states.push({ state, error }),
       onLocalMessage: () => {},
       onLocalStatus: () => {},
+      onSyncedMessage: () => {},
       onSelf: () => {},
       onBattery: () => {},
     }, {
@@ -239,6 +261,43 @@ describe("message flow", () => {
     await h.source.stop();
   });
 
+  it("retains an acknowledgement that arrives before the send response", async () => {
+    const h = harness();
+    h.connection.emitAckBeforeResponse = true;
+    await h.source.start();
+
+    const message = await h.source.sendDirectMessage("ab".repeat(32), "early ack");
+    expect(message.status).toBe("delivered");
+    await vi.waitFor(() => {
+      const delivered = h.posts.filter((p) => p.kind === "messages").at(-1);
+      expect((delivered!.payload as { messages: { status: string }[] }).messages[0]!.status).toBe("delivered");
+    });
+    await h.source.stop();
+  });
+
+  it("serializes same-CRC sends so each acknowledgement updates its own message", async () => {
+    const h = harness();
+    h.connection.nextAckCrc = 1234;
+    await h.source.start();
+
+    const first = h.source.sendDirectMessage("ab".repeat(32), "first");
+    const second = h.source.sendDirectMessage("ab".repeat(32), "second");
+    await first;
+    expect(h.connection.sentTexts.map((sent) => sent.text)).toEqual(["first"]);
+
+    h.connection.emit(Constants.PushCodes.SendConfirmed, { ackCode: 1234, roundTrip: 0 });
+    await vi.waitFor(() => expect(h.connection.sentTexts.map((sent) => sent.text)).toEqual(["first", "second"]));
+    await second;
+    h.connection.emit(Constants.PushCodes.SendConfirmed, { ackCode: 1234, roundTrip: 0 });
+    await vi.waitFor(() => {
+      const delivered = h.posts
+        .filter((post) => post.kind === "messages")
+        .filter((post) => (post.payload as { messages: { status: string }[] }).messages[0]!.status === "delivered");
+      expect(delivered).toHaveLength(2);
+    });
+    await h.source.stop();
+  });
+
   it("private sessions keep traffic local with negative ids and never post", async () => {
     const h = harness({ privateSession: true });
     await h.source.start();
@@ -280,6 +339,23 @@ describe("offline queue", () => {
       );
     });
     expect(recovered.queue.entries).toHaveLength(0);
+    await recovered.source.stop();
+  });
+
+  it("keeps a local ACK status and reports the server row when an offline send replays", async () => {
+    const failing = harness({ postFails: true });
+    await failing.source.start();
+    const local = await failing.source.sendDirectMessage("ab".repeat(32), "offline ack");
+    failing.connection.emit(Constants.PushCodes.SendConfirmed, { ackCode: failing.connection.nextAckCrc });
+    await vi.waitFor(() => expect(failing.localStatuses).toContainEqual({ id: local.id, status: "delivered" }));
+    await failing.source.stop();
+
+    const recovered = harness();
+    recovered.queue.entries = failing.queue.entries;
+    await recovered.source.start();
+    await vi.waitFor(() => {
+      expect(recovered.syncedMessages.some((message) => message.ingestionId && message.text === "offline ack")).toBe(true);
+    });
     await recovered.source.stop();
   });
 });

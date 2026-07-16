@@ -191,6 +191,7 @@ describe("http: ingest", () => {
       text: "from the browser",
       senderTimestamp: 1_784_000_500,
       status: "sent",
+      ingestionId: "00000000-0000-4000-8000-000000000004",
     };
     const first = await request(app).post("/api/v1/ingest/messages").send({ messages: [message] }).expect(200);
     expect(first.body.inserted).toBe(1);
@@ -230,7 +231,80 @@ describe("http: ingest", () => {
       senderTimestamp: i + 1,
       status: "sent",
     }));
-    await request(app).post("/api/v1/ingest/messages").send({ messages }).expect(400);
+      await request(app).post("/api/v1/ingest/messages").send({ messages }).expect(400);
+  });
+
+  it("keeps ambiguous sender prefixes unresolved", async () => {
+    const { app, manager } = buildHarness();
+    const prefix = "abcdef123456";
+    for (const suffix of ["a", "b"]) {
+      manager.store.upsertContact({
+        publicKey: `${prefix}${suffix.repeat(52)}`,
+        name: suffix,
+        type: "chat",
+        flags: 0,
+        outPathLen: -1,
+        lat: null,
+        lon: null,
+        lastAdvert: 0,
+        lastSeen: null,
+      });
+    }
+    const inserted = await request(app)
+      .post("/api/v1/ingest/messages")
+       .send({
+         messages: [
+           {
+             kind: "dm",
+             contactPrefix: prefix,
+             direction: "in",
+             text: "ambiguous",
+             senderTimestamp: 1,
+             ingestionId: "00000000-0000-4000-8000-000000000005",
+           },
+         ],
+       })
+      .expect(200);
+    expect(inserted.body.messages[0]).toMatchObject({ contactKey: null, contactPrefix: prefix });
+    const unknown = await request(app).get("/api/v1/messages/unknown-senders").expect(200);
+    expect(unknown.body.messages).toHaveLength(1);
+  });
+
+  it("reconciles an unknown sender when a unique matching contact is stored", async () => {
+    const { app, manager } = buildHarness();
+    const prefix = "abcdef123456";
+    const fullKey = `${prefix}${"a".repeat(52)}`;
+    await request(app)
+      .post("/api/v1/ingest/messages")
+       .send({
+         messages: [
+           {
+             kind: "dm",
+             contactPrefix: prefix,
+             direction: "in",
+             text: "identify me",
+             senderTimestamp: 1,
+             ingestionId: "00000000-0000-4000-8000-000000000006",
+           },
+         ],
+       })
+      .expect(200);
+    manager.store.upsertContact({
+      publicKey: fullKey,
+      name: "Alice",
+      type: "chat",
+      flags: 0,
+      outPathLen: -1,
+      lat: null,
+      lon: null,
+      lastAdvert: 0,
+      lastSeen: null,
+    });
+    const history = await request(app).get(`/api/v1/messages?contact=${fullKey}`).expect(200);
+    expect(history.body.messages).toHaveLength(1);
+    expect(history.body.messages[0]).toMatchObject({ contactKey: fullKey, contactPrefix: prefix });
+    const unknown = await request(app).get("/api/v1/messages/unknown-senders").expect(200);
+    expect(unknown.body.messages).toHaveLength(0);
   });
 });
 

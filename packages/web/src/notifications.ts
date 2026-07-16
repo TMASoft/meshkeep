@@ -59,9 +59,11 @@ export function notifyIncoming(message: Message, opts: { conversationActive: boo
 
   const id: ConversationId =
     message.kind === "dm"
-      ? { kind: "dm", contactKey: message.contactKey ?? "" }
+      ? message.contactKey
+        ? { kind: "dm", contactKey: message.contactKey }
+        : { kind: "dm", contactPrefix: message.contactPrefix ?? "" }
       : { kind: "channel", channelIdx: message.channelIdx ?? 0 };
-  const sender = message.contactName ?? message.authorName ?? shortKey(message.contactKey);
+  const sender = message.contactName ?? message.authorName ?? shortKey(message.contactKey ?? message.contactPrefix);
   const title =
     message.kind === "dm" ? sender : `${message.channelName ?? `channel ${message.channelIdx}`} · ${sender}`;
   const body = message.text.length > 140 ? `${message.text.slice(0, 139)}…` : message.text;
@@ -81,7 +83,7 @@ export function notifyIncoming(message: Message, opts: { conversationActive: boo
 }
 
 function conversationTag(id: ConversationId): string {
-  return id.kind === "dm" ? `dm-${id.contactKey}` : `ch-${id.channelIdx}`;
+  return id.kind === "dm" ? `dm-${id.contactKey ?? `unknown-${id.contactPrefix}`}` : `ch-${id.channelIdx}`;
 }
 
 function shortKey(key: string | null | undefined): string {

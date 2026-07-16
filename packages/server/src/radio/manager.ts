@@ -26,6 +26,17 @@ const BATTERY_POLL_MS = 5 * 60_000;
 const MAX_CHANNELS = 8;
 const CONNECTION_OVERRIDE_KEY = "connection.override";
 
+class LifecycleCancelledError extends Error {}
+
+interface PendingDirectDelivery {
+  messageId: number;
+  expectedAckCrc: number | null;
+  earlyAckCode: number | null;
+  timeout: NodeJS.Timeout | null;
+  finished: Promise<void>;
+  finish: () => void;
+}
+
 /** Cayenne LPP type codes → display label and unit (subset the firmware ecosystem uses). */
 const LPP_TYPE_INFO: Record<number, { label: string; unit: string | null }> = {
   0: { label: "Digital input", unit: null },
@@ -85,15 +96,26 @@ export class ConnectionManager {
   private reconnectDelay = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private batteryTimer: NodeJS.Timeout | null = null;
+  private lifecycleGeneration = 0;
+  private lifecycleAbort = new AbortController();
   private stopped = false;
   private draining = false;
   private drainAgain = false;
+  // MeshCore responses have no request ID, so only one hand-written command
+  // wrapper may listen for its generic response events at a time.
+  private uncorrelatedCommandQueue: Promise<void> = Promise.resolve();
+  // SendConfirmed identifies a frame only by its CRC. Keep one direct send in
+  // flight until its acknowledgement arrives or times out to avoid collisions.
+  private directSendQueue: Promise<void> = Promise.resolve();
+  private pendingDirectDelivery: PendingDirectDelivery | null = null;
 
   constructor(
     private readonly config: ServerConfig,
     private readonly db: Db,
     private readonly bus: Bus,
     private readonly appVersion: string,
+    private readonly channelReadTimeoutMs = 5_000,
+    private readonly connectionFactory: typeof createConnection = createConnection,
   ) {
     this.store = new Store(db);
   }
@@ -197,6 +219,10 @@ export class ConnectionManager {
   }
 
   private async teardown(): Promise<void> {
+    this.lifecycleGeneration += 1;
+    this.lifecycleAbort.abort();
+    this.lifecycleAbort = new AbortController();
+    if (this.pendingDirectDelivery) this.finishDirectDelivery(this.pendingDirectDelivery, false);
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -224,41 +250,52 @@ export class ConnectionManager {
   }
 
   private async connect(): Promise<void> {
-    if (this.stopped || this.connection) return;
+    if (this.stopped || this.isStandby() || this.connection) return;
+    const generation = this.lifecycleGeneration;
+    const signal = this.lifecycleAbort.signal;
     this.setState("connecting", null);
+    let connection: Connection | null = null;
     try {
       const effective = this.connectionSettings().effective;
       const connectTimeoutMs = effective.connection === "ble" ? BLE_CONNECT_TIMEOUT_MS : CONNECT_TIMEOUT_MS;
-      const connection = createConnection(effective);
-      this.connection = connection;
-      this.attachListeners(connection);
+      const activeConnection = this.connectionFactory(effective);
+      connection = activeConnection;
+      this.connection = activeConnection;
+      this.attachListeners(activeConnection, generation);
 
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(
-          () => reject(new Error(`timed out connecting after ${connectTimeoutMs}ms`)),
-          connectTimeoutMs,
-        );
-        connection.once("connected", () => {
-          clearTimeout(timeout);
-          resolve();
-        });
-        connection.connect().catch((error: unknown) => {
-          clearTimeout(timeout);
-          reject(error);
-        });
-      });
+      await this.awaitCurrent(
+        new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(
+            () => reject(new Error(`timed out connecting after ${connectTimeoutMs}ms`)),
+            connectTimeoutMs,
+          );
+          activeConnection.once("connected", () => {
+            clearTimeout(timeout);
+            resolve();
+          });
+          activeConnection.connect().catch((error: unknown) => {
+            clearTimeout(timeout);
+            reject(error);
+          });
+        }),
+        activeConnection,
+        generation,
+        signal,
+      );
 
       this.setState("syncing", null);
-      await this.initialSync(connection);
+      await this.initialSync(activeConnection, generation, signal);
+      if (!this.isCurrent(activeConnection, generation)) return;
 
       this.connectedAt = Math.floor(Date.now() / 1000);
       this.reconnectDelay = 0;
       this.setState("connected", null);
 
       this.batteryTimer = setInterval(() => {
-        void this.pollBattery();
+        void this.pollBattery(activeConnection, generation, signal);
       }, BATTERY_POLL_MS);
     } catch (error) {
+      if (error instanceof LifecycleCancelledError || !connection || !this.isCurrent(connection, generation)) return;
       const raw = error instanceof Error ? error.message : String(error ?? "connect failed");
       const message = describeConnectError(this.connectionSettings().effective.connection, raw);
       console.error(`[radio] connect failed: ${message}`);
@@ -280,9 +317,9 @@ export class ConnectionManager {
     }, delay);
   }
 
-  private attachListeners(connection: Connection): void {
+  private attachListeners(connection: Connection, generation = this.lifecycleGeneration): void {
     connection.on("disconnected", () => {
-      if (this.connection !== connection) return;
+      if (!this.isCurrent(connection, generation)) return;
       console.log("[radio] disconnected");
       void this.teardown().then(() => {
         if (!this.stopped && !this.isStandby()) {
@@ -293,17 +330,17 @@ export class ConnectionManager {
     });
 
     connection.on(Constants.PushCodes.MsgWaiting, () => {
-      void this.drainMessages();
+      if (!this.isCurrent(connection, generation)) return;
+      void this.drainConnection(connection, generation, this.lifecycleAbort.signal);
     });
 
     connection.on(Constants.PushCodes.SendConfirmed, (push: { ackCode: number; roundTrip: number }) => {
-      const message = this.store.markDeliveredByAck(push.ackCode);
-      if (message) {
-        this.bus.publish({ type: "message.status", id: message.id, status: "delivered" });
-      }
+      if (!this.isCurrent(connection, generation)) return;
+      this.handleSendConfirmed(push.ackCode);
     });
 
     connection.on(Constants.PushCodes.Advert, (push: { publicKey: Uint8Array }) => {
+      if (!this.isCurrent(connection, generation)) return;
       // firmware auto-added/updated a contact; re-pull the contact list
       void this.refreshContacts().catch(() => {});
       const key = BufferUtils.bytesToHex(push.publicKey);
@@ -311,25 +348,34 @@ export class ConnectionManager {
     });
 
     connection.on(Constants.PushCodes.NewAdvert, (advert: RawContact) => {
+      if (!this.isCurrent(connection, generation)) return;
       const contact = rawContactToContact(advert);
       this.store.upsertContact(contact);
       this.bus.publish({ type: "contact.updated", contact });
     });
 
     connection.on(Constants.PushCodes.PathUpdated, (_push: { publicKey: Uint8Array }) => {
+      if (!this.isCurrent(connection, generation)) return;
       void this.refreshContacts().catch(() => {});
     });
   }
 
-  private async initialSync(connection: Connection): Promise<void> {
+  private async initialSync(connection: Connection, generation: number, signal: AbortSignal): Promise<void> {
     // 1. identify ourselves / fetch self info
-    const rawSelf = await connection.getSelfInfo(10_000);
+    const rawSelf = await this.awaitCurrent(connection.getSelfInfo(10_000), connection, generation, signal);
     let device: { firmwareVer: number; firmware_build_date: string; manufacturerModel: string } | null = null;
     try {
-      device = await connection.deviceQuery(Constants.SupportedCompanionProtocolVersion);
-    } catch {
+      device = await this.awaitCurrent(
+        connection.deviceQuery(Constants.SupportedCompanionProtocolVersion),
+        connection,
+        generation,
+        signal,
+      );
+    } catch (error) {
+      if (error instanceof LifecycleCancelledError) throw error;
       // older firmware may not answer; not fatal
     }
+    this.ensureCurrent(connection, generation);
     const self: SelfInfo = {
       publicKey: BufferUtils.bytesToHex(rawSelf.publicKey),
       name: rawSelf.name,
@@ -351,30 +397,38 @@ export class ConnectionManager {
 
     // 2. fix clock drift (messages are timestamped by the device)
     try {
-      const deviceTime = await connection.getDeviceTime();
+      const deviceTime = await this.awaitCurrent(connection.getDeviceTime(), connection, generation, signal);
       const drift = Math.abs(deviceTime.epochSecs - Math.floor(Date.now() / 1000));
       if (drift > CLOCK_DRIFT_TOLERANCE_SECS) {
         console.log(`[radio] device clock drifted ${drift}s; syncing`);
-        await connection.syncDeviceTime();
+        await this.awaitCurrent(connection.syncDeviceTime(), connection, generation, signal);
       }
     } catch (error) {
+      if (error instanceof LifecycleCancelledError) throw error;
       console.warn("[radio] could not check device time", error);
     }
 
     // 3. contacts and channels
-    await this.refreshContacts();
-    await this.refreshChannels();
+    const rawContacts = await this.awaitCurrent(connection.getContacts(), connection, generation, signal);
+    this.ensureCurrent(connection, generation);
+    for (const contact of rawContacts.map(rawContactToContact)) {
+      this.store.upsertContact(contact);
+      this.bus.publish({ type: "contact.updated", contact });
+    }
+    await this.refreshChannelsForConnection(connection, generation, signal);
 
     // 4. drain any messages queued while we were away
-    await this.drainMessages();
+    await this.drainConnection(connection, generation, signal);
 
     // 5. battery snapshot
-    await this.pollBattery();
+    await this.pollBattery(connection, generation, signal);
   }
 
   async refreshContacts(): Promise<Contact[]> {
     const connection = this.requireConnection();
-    const rawContacts = await connection.getContacts();
+    const generation = this.lifecycleGeneration;
+    const signal = this.lifecycleAbort.signal;
+    const rawContacts = await this.awaitCurrent(connection.getContacts(), connection, generation, signal);
     const contacts = rawContacts.map(rawContactToContact);
     for (const contact of contacts) {
       this.store.upsertContact(contact);
@@ -385,19 +439,34 @@ export class ConnectionManager {
 
   async refreshChannels(): Promise<Channel[]> {
     const connection = this.requireConnection();
-    const channels: Channel[] = [];
-    for (let idx = 0; idx < MAX_CHANNELS; idx++) {
-      const channel = await getChannelInfo(connection, idx);
-      if (channel) {
-        channels.push(channel);
-        this.store.upsertChannel(channel);
+    return this.refreshChannelsForConnection(connection, this.lifecycleGeneration, this.lifecycleAbort.signal);
+  }
+
+  private async refreshChannelsForConnection(
+    connection: Connection,
+    generation: number,
+    signal: AbortSignal,
+  ): Promise<Channel[]> {
+    return this.runUncorrelatedCommand(async () => {
+      const channels: Channel[] = [];
+      for (let idx = 0; idx < MAX_CHANNELS; idx++) {
+        const channel = await this.awaitCurrent(
+          getChannelInfo(connection, idx, this.channelReadTimeoutMs),
+          connection,
+          generation,
+          signal,
+        );
+        if (channel) channels.push(channel);
       }
-    }
-    // drop slots the firmware no longer has (blanked from another client)
-    for (const known of this.store.getChannels()) {
-      if (!channels.some((c) => c.idx === known.idx)) this.store.deleteChannel(known.idx);
-    }
-    return channels;
+      this.ensureCurrent(connection, generation);
+      this.db.transaction(() => {
+        for (const channel of channels) this.store.upsertChannel(channel);
+        for (const known of this.store.getChannels()) {
+          if (!channels.some((channel) => channel.idx === known.idx)) this.store.deleteChannel(known.idx);
+        }
+      })();
+      return channels;
+    });
   }
 
   /**
@@ -405,26 +474,35 @@ export class ConnectionManager {
    * arriving mid-drain triggers one more pass instead of a concurrent one.
    */
   async drainMessages(): Promise<void> {
+    return this.drainConnection(this.connection, this.lifecycleGeneration, this.lifecycleAbort.signal);
+  }
+
+  private async drainConnection(
+    connection: Connection | null,
+    generation: number,
+    signal: AbortSignal,
+  ): Promise<void> {
     if (this.draining) {
       this.drainAgain = true;
       return;
     }
-    const connection = this.connection;
     if (!connection) return;
     this.draining = true;
     try {
       while (true) {
-        const next = await connection.syncNextMessage();
+        const next = await this.awaitCurrent(connection.syncNextMessage(), connection, generation, signal);
         if (!next) break;
         this.handleIncoming(next);
       }
     } catch (error) {
+      if (error instanceof LifecycleCancelledError) return;
       console.error("[radio] failed draining messages", error);
     } finally {
       this.draining = false;
-      if (this.drainAgain) {
-        this.drainAgain = false;
-        void this.drainMessages();
+      const drainAgain = this.drainAgain;
+      this.drainAgain = false;
+      if (drainAgain && this.isCurrent(connection, generation)) {
+        void this.drainConnection(this.connection, this.lifecycleGeneration, this.lifecycleAbort.signal);
       }
     }
   }
@@ -436,11 +514,12 @@ export class ConnectionManager {
     if (next.contactMessage) {
       const m = next.contactMessage;
       const prefixHex = BufferUtils.bytesToHex(m.pubKeyPrefix);
-      const contact = this.store.findContactByPrefix(prefixHex);
+      const contact = this.store.findUniqueContactByPrefix(prefixHex);
       if (contact) this.store.touchContactSeen(contact.publicKey);
       message = this.store.insertMessage({
         kind: "dm",
-        contactKey: contact?.publicKey ?? prefixHex,
+        contactKey: contact?.publicKey ?? null,
+        contactPrefix: prefixHex,
         direction: "in",
         text: m.text,
         senderTimestamp: m.senderTimestamp,
@@ -479,12 +558,22 @@ export class ConnectionManager {
     });
     if (!stored) throw new Error("duplicate message");
     try {
-      const txtType = cli ? Constants.TxtTypes.CliData : Constants.TxtTypes.Plain;
-      const sent = await connection.sendTextMessage(pubKey, text, txtType);
-      this.db_setAck(stored.id, sent.expectedAckCrc);
-      this.store.setMessageStatus(stored.id, "sent");
-      this.bus.publish({ type: "message.status", id: stored.id, status: "sent" });
-      return { ...stored, status: "sent" };
+      return await this.runDirectSend(stored.id, async (pending) => {
+        const txtType = cli ? Constants.TxtTypes.CliData : Constants.TxtTypes.Plain;
+        const sent = await connection.sendTextMessage(pubKey, text, txtType);
+        pending.expectedAckCrc = sent.expectedAckCrc;
+        this.db_setAck(stored.id, sent.expectedAckCrc);
+
+        if (pending.earlyAckCode === sent.expectedAckCrc) {
+          this.finishDirectDelivery(pending, true);
+          return { ...stored, status: "delivered" };
+        }
+
+        this.store.setMessageStatus(stored.id, "sent");
+        this.bus.publish({ type: "message.status", id: stored.id, status: "sent" });
+        pending.timeout = setTimeout(() => this.finishDirectDelivery(pending, false), sent.estTimeout);
+        return { ...stored, status: "sent" };
+      });
     } catch (error) {
       this.store.setMessageStatus(stored.id, "failed");
       this.bus.publish({ type: "message.status", id: stored.id, status: "failed" });
@@ -529,7 +618,7 @@ export class ConnectionManager {
     const connection = this.requireConnection();
     const secret = BufferUtils.hexToBytes(secretHex);
     if (secret.length !== 16) throw new Error("channel secret must be 16 bytes of hex");
-    await sendSetChannel(connection, idx, name, secret);
+    await this.runUncorrelatedCommand(() => sendSetChannel(connection, idx, name, secret));
     const channel = { idx, name, secret: secretHex };
     this.store.upsertChannel(channel);
     return channel;
@@ -538,7 +627,7 @@ export class ConnectionManager {
   /** Blank a channel slot — firmware clears a slot when written with an empty name and zero key. */
   async deleteChannel(idx: number): Promise<void> {
     const connection = this.requireConnection();
-    await sendSetChannel(connection, idx, "", new Uint8Array(16));
+    await this.runUncorrelatedCommand(() => sendSetChannel(connection, idx, "", new Uint8Array(16)));
     this.store.deleteChannel(idx);
   }
 
@@ -685,11 +774,14 @@ export class ConnectionManager {
     return readings;
   }
 
-  private async pollBattery(): Promise<void> {
-    const connection = this.connection;
+  private async pollBattery(
+    connection = this.connection,
+    generation = this.lifecycleGeneration,
+    signal = this.lifecycleAbort.signal,
+  ): Promise<void> {
     if (!connection) return;
     try {
-      const battery = await connection.getBatteryVoltage();
+      const battery = await this.awaitCurrent(connection.getBatteryVoltage(), connection, generation, signal);
       this.store.recordTelemetry(battery.batteryMilliVolts);
       this.store.trimTelemetry(this.config.telemetryRetentionDays);
       this.bus.publish({
@@ -698,6 +790,7 @@ export class ConnectionManager {
         ts: Math.floor(Date.now() / 1000),
       });
     } catch (error) {
+      if (error instanceof LifecycleCancelledError) return;
       console.warn("[radio] battery poll failed", error);
     }
   }
@@ -706,11 +799,104 @@ export class ConnectionManager {
     this.db.prepare("UPDATE messages SET ack_crc = ? WHERE id = ?").run(ackCrc, messageId);
   }
 
+  private handleSendConfirmed(ackCode: number): void {
+    const pending = this.pendingDirectDelivery;
+    if (!pending) return;
+    // A push can arrive before sendTextMessage resolves with expectedAckCrc.
+    if (pending.expectedAckCrc === null) {
+      pending.earlyAckCode = ackCode;
+      return;
+    }
+    if (pending.expectedAckCrc === ackCode) this.finishDirectDelivery(pending, true);
+  }
+
+  private runDirectSend<T>(messageId: number, operation: (pending: PendingDirectDelivery) => Promise<T>): Promise<T> {
+    let resolveResult!: (value: T) => void;
+    let rejectResult!: (reason: unknown) => void;
+    const result = new Promise<T>((resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    });
+    const queued = this.directSendQueue.then(async () => {
+      const pending = this.createPendingDirectDelivery(messageId);
+      this.pendingDirectDelivery = pending;
+      try {
+        resolveResult(await operation(pending));
+        await pending.finished;
+      } catch (error) {
+        this.finishDirectDelivery(pending, false);
+        rejectResult(error);
+      }
+    });
+    this.directSendQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private createPendingDirectDelivery(messageId: number): PendingDirectDelivery {
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    return { messageId, expectedAckCrc: null, earlyAckCode: null, timeout: null, finished, finish };
+  }
+
+  private finishDirectDelivery(pending: PendingDirectDelivery, delivered: boolean): void {
+    if (this.pendingDirectDelivery !== pending) return;
+    this.pendingDirectDelivery = null;
+    if (pending.timeout !== null) clearTimeout(pending.timeout);
+    if (delivered) {
+      this.store.setMessageStatus(pending.messageId, "delivered");
+      this.bus.publish({ type: "message.status", id: pending.messageId, status: "delivered" });
+    }
+    pending.finish();
+  }
+
   private requireConnection(): Connection {
     if (!this.connection || (this.state !== "connected" && this.state !== "syncing")) {
       throw new RadioUnavailableError(`radio is ${this.state}`);
     }
     return this.connection;
+  }
+
+  private isCurrent(connection: Connection, generation: number): boolean {
+    return (
+      this.lifecycleGeneration === generation &&
+      this.connection === connection &&
+      !this.stopped &&
+      !this.isStandby()
+    );
+  }
+
+  private ensureCurrent(connection: Connection, generation: number): void {
+    if (!this.isCurrent(connection, generation)) throw new LifecycleCancelledError();
+  }
+
+  private async awaitCurrent<T>(
+    operation: Promise<T>,
+    connection: Connection,
+    generation: number,
+    signal: AbortSignal,
+  ): Promise<T> {
+    if (signal.aborted) throw new LifecycleCancelledError();
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(new LifecycleCancelledError()), { once: true });
+    });
+    const result = await Promise.race([operation, cancelled]);
+    this.ensureCurrent(connection, generation);
+    return result;
+  }
+
+  private runUncorrelatedCommand<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.uncorrelatedCommandQueue.then(operation, operation);
+    // Keep the queue usable after a rejected radio command.
+    this.uncorrelatedCommandQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 }
 
@@ -742,7 +928,7 @@ function rawContactToContact(raw: RawContact): Contact {
 }
 
 /** GetChannel has no promise helper in meshcore.js; wrap the events ourselves. */
-function getChannelInfo(connection: Connection, idx: number): Promise<Channel | null> {
+function getChannelInfo(connection: Connection, idx: number, timeoutMs: number): Promise<Channel | null> {
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       connection.off(Constants.ResponseCodes.ChannelInfo, onInfo);
@@ -760,12 +946,12 @@ function getChannelInfo(connection: Connection, idx: number): Promise<Channel | 
     };
     const onErr = () => {
       cleanup();
-      resolve(null);
+      reject(new Error(`radio rejected reading channel ${idx}`));
     };
     const timeout = setTimeout(() => {
       cleanup();
       reject(new Error(`timed out reading channel ${idx}`));
-    }, 5_000);
+    }, timeoutMs);
     connection.on(Constants.ResponseCodes.ChannelInfo, onInfo);
     connection.on(Constants.ResponseCodes.Err, onErr);
     void connection.sendCommandGetChannel(idx);

@@ -164,12 +164,19 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
     }),
   );
   api.get(
+    "/messages/unknown-senders",
+    handle((_req, res) => {
+      res.json({ messages: manager.store.getUnknownDirectMessages() });
+    }),
+  );
+  api.get(
     "/messages/search",
     handle((req, res) => {
       const query = z
         .object({
           q: z.string().min(1).max(200),
           contact: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
+          sender: z.string().regex(/^[0-9a-f]{2,64}$/i).optional(),
           channel: z.coerce.number().int().min(0).max(255).optional(),
           limit: z.coerce.number().int().min(1).max(100).default(25),
         })
@@ -178,6 +185,7 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
         results: manager.store.searchMessages({
           query: query.q,
           contactKey: query.contact?.toLowerCase(),
+          contactPrefix: query.sender?.toLowerCase(),
           channelIdx: query.channel,
           limit: query.limit,
         }),
@@ -191,11 +199,13 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
         .object({
           format: z.enum(["csv", "json"]).default("csv"),
           contact: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
+          sender: z.string().regex(/^[0-9a-f]{2,64}$/i).optional(),
           channel: z.coerce.number().int().min(0).max(255).optional(),
         })
         .parse(req.query);
       const messages = manager.store.getMessagesForExport({
         contactKey: query.contact?.toLowerCase(),
+        contactPrefix: query.sender?.toLowerCase(),
         channelIdx: query.channel,
       });
       const stamp = new Date().toISOString().slice(0, 10);
@@ -215,6 +225,7 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
       const query = z
         .object({
           contact: z.string().regex(/^[0-9a-f]{2,64}$/i).optional(),
+          sender: z.string().regex(/^[0-9a-f]{2,64}$/i).optional(),
           channel: z.coerce.number().int().min(0).max(255).optional(),
           before: z.coerce.number().int().positive().optional(),
           limit: z.coerce.number().int().min(1).max(200).default(50),
@@ -223,6 +234,7 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
       res.json({
         messages: manager.store.getConversation({
           contactKey: query.contact?.toLowerCase(),
+          contactPrefix: query.sender?.toLowerCase(),
           channelIdx: query.channel,
           beforeId: query.before,
           limit: query.limit,
@@ -252,13 +264,18 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
       const body = z
         .object({
           contact: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
+          sender: z.string().regex(/^[0-9a-f]{2,64}$/i).optional(),
           channel: z.number().int().min(0).max(255).optional(),
         })
-        .refine((value) => value.contact !== undefined || value.channel !== undefined, {
-          message: "contact or channel is required",
+        .refine((value) => value.contact !== undefined || value.sender !== undefined || value.channel !== undefined, {
+          message: "contact, sender, or channel is required",
         })
         .parse(req.body);
-      manager.store.markConversationRead({ contactKey: body.contact?.toLowerCase(), channelIdx: body.channel });
+      manager.store.markConversationRead({
+        contactKey: body.contact?.toLowerCase(),
+        contactPrefix: body.sender?.toLowerCase(),
+        channelIdx: body.channel,
+      });
       res.json({ ok: true });
     }),
   );

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type {
   Channel,
   Contact,
@@ -16,24 +16,12 @@ import type { Db } from "./index.js";
 
 const now = () => Math.floor(Date.now() / 1000);
 
-export function dedupeHash(
-  kind: MessageKind,
-  counterparty: string,
-  senderTimestamp: number,
-  direction: MessageDirection,
-  text: string,
-  authorPrefix?: string | null,
-): string {
-  // authorPrefix only participates when present so historical hashes stay valid
-  return createHash("sha256")
-    .update(`${kind}|${counterparty}|${senderTimestamp}|${direction}|${text}${authorPrefix ? `|${authorPrefix}` : ""}`)
-    .digest("hex");
-}
-
 interface MessageRow {
   id: number;
+  ingestion_id: string | null;
   kind: MessageKind;
   contact_key: string | null;
+  contact_prefix: string | null;
   channel_idx: number | null;
   direction: MessageDirection;
   text: string;
@@ -50,8 +38,10 @@ interface MessageRow {
 function rowToMessage(row: MessageRow): Message {
   return {
     id: row.id,
+    ingestionId: row.ingestion_id,
     kind: row.kind,
     contactKey: row.contact_key,
+    contactPrefix: row.contact_prefix,
     contactName: row.contact_name ?? null,
     channelIdx: row.channel_idx,
     channelName: row.channel_name ?? null,
@@ -94,7 +84,7 @@ export class Store {
     return row ? (JSON.parse(row.raw_json) as SelfInfo) : null;
   }
 
-  upsertContact(contact: Contact): void {
+  upsertContact(contact: Contact): string[] {
     this.db
       .prepare(
         `INSERT INTO contacts (public_key, name, type, flags, out_path_len, lat, lon, last_advert, last_seen, updated_at)
@@ -107,6 +97,7 @@ export class Store {
            updated_at = excluded.updated_at`,
       )
       .run({ ...contact, updatedAt: now() });
+    return this.reconcileContactMessages(contact.publicKey);
   }
 
   touchContactSeen(publicKey: string): void {
@@ -142,9 +133,30 @@ export class Store {
     }));
   }
 
-  findContactByPrefix(pubKeyPrefixHex: string): Contact | null {
-    const contact = this.getContacts().find((c) => c.publicKey.startsWith(pubKeyPrefixHex));
-    return contact ?? null;
+  findUniqueContactByPrefix(pubKeyPrefixHex: string): Contact | null {
+    const matches = this.getContacts().filter((c) => c.publicKey.startsWith(pubKeyPrefixHex));
+    return matches.length === 1 ? matches[0]! : null;
+  }
+
+  private reconcileContactMessages(publicKey: string): string[] {
+    const prefixes = this.db
+      .prepare(
+        `SELECT DISTINCT contact_prefix FROM messages
+         WHERE kind = 'dm' AND contact_key IS NULL AND contact_prefix IS NOT NULL
+           AND ? LIKE contact_prefix || '%'
+           AND (SELECT COUNT(*) FROM contacts WHERE public_key LIKE messages.contact_prefix || '%') = 1`,
+      )
+      .all(publicKey) as Array<{ contact_prefix: string }>;
+    if (!prefixes.length) return [];
+    this.db
+      .prepare(
+        `UPDATE messages SET contact_key = ?
+         WHERE kind = 'dm' AND contact_key IS NULL AND contact_prefix IS NOT NULL
+           AND ? LIKE contact_prefix || '%'
+           AND (SELECT COUNT(*) FROM contacts WHERE public_key LIKE messages.contact_prefix || '%') = 1`,
+      )
+      .run(publicKey, publicKey);
+    return prefixes.map((row) => row.contact_prefix);
   }
 
   removeContact(publicKey: string): void {
@@ -173,13 +185,11 @@ export class Store {
     return rows.map((r) => ({ idx: r.idx, name: r.name, secret: r.secret_hex }));
   }
 
-  /**
-   * Insert a message unless its dedupe hash already exists.
-   * Returns the stored message, or null when it was a duplicate.
-   */
+  /** Insert a message once per stable ingestion ID. */
   insertMessage(input: {
     kind: MessageKind;
     contactKey?: string | null;
+    contactPrefix?: string | null;
     channelIdx?: number | null;
     direction: MessageDirection;
     text: string;
@@ -188,18 +198,23 @@ export class Store {
     ackCrc?: number | null;
     status?: MessageStatus;
     authorPrefix?: string | null;
+    ingestionId?: string;
   }): Message | null {
-    const counterparty = input.kind === "dm" ? input.contactKey ?? "" : String(input.channelIdx ?? "");
-    const hash = dedupeHash(input.kind, counterparty, input.senderTimestamp, input.direction, input.text, input.authorPrefix);
+    const contactKey =
+      input.kind === "dm" && !input.contactKey && input.contactPrefix
+        ? this.findUniqueContactByPrefix(input.contactPrefix)?.publicKey ?? null
+        : input.contactKey ?? null;
+    const ingestionId = input.ingestionId ?? randomUUID();
     const result = this.db
       .prepare(
         `INSERT OR IGNORE INTO messages
-           (kind, contact_key, channel_idx, direction, text, sender_timestamp, path_len, ack_crc, status, dedupe_hash, created_at, author_prefix)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (kind, contact_key, contact_prefix, channel_idx, direction, text, sender_timestamp, path_len, ack_crc, status, dedupe_hash, created_at, author_prefix, ingestion_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.kind,
-        input.contactKey ?? null,
+        contactKey,
+        input.contactPrefix ?? null,
         input.channelIdx ?? null,
         input.direction,
         input.text,
@@ -207,9 +222,10 @@ export class Store {
         input.pathLen ?? null,
         input.ackCrc ?? null,
         input.status ?? (input.direction === "in" ? "sent" : "pending"),
-        hash,
+        randomUUID(), // Legacy non-null unique column; no longer an identity.
         now(),
         input.authorPrefix ?? null,
+        ingestionId,
       );
     if (result.changes === 0) return null;
     return this.getMessage(Number(result.lastInsertRowid));
@@ -220,37 +236,16 @@ export class Store {
     return row ? rowToMessage(row) : null;
   }
 
-  /**
-   * Late status update for a message that already exists (matched by content
-   * hash) — how browser-direct sessions report delivery acks after sync-back.
-   * Only moves status forward from pending/sent.
-   */
-  updateMessageStatusByContent(input: {
-    kind: MessageKind;
-    contactKey?: string | null;
-    channelIdx?: number | null;
-    direction: MessageDirection;
-    text: string;
-    senderTimestamp: number;
+  /** Late delivery-state update for a retried browser ingestion. */
+  updateMessageStatusByIngestionId(input: {
+    ingestionId: string;
     status: MessageStatus;
-    authorPrefix?: string | null;
   }): Message | null {
-    const counterparty = input.kind === "dm" ? input.contactKey ?? "" : String(input.channelIdx ?? "");
-    const hash = dedupeHash(input.kind, counterparty, input.senderTimestamp, input.direction, input.text, input.authorPrefix);
     const row = this.db
-      .prepare("SELECT id FROM messages WHERE dedupe_hash = ? AND status IN ('pending','sent')")
-      .get(hash) as { id: number } | undefined;
+      .prepare("SELECT id FROM messages WHERE ingestion_id = ? AND status IN ('pending','sent')")
+      .get(input.ingestionId) as { id: number } | undefined;
     if (!row) return null;
     this.db.prepare("UPDATE messages SET status = ? WHERE id = ?").run(input.status, row.id);
-    return this.getMessage(row.id);
-  }
-
-  markDeliveredByAck(ackCrc: number): Message | null {
-    const row = this.db
-      .prepare("SELECT id FROM messages WHERE ack_crc = ? AND status IN ('pending','sent') ORDER BY id DESC LIMIT 1")
-      .get(ackCrc) as { id: number } | undefined;
-    if (!row) return null;
-    this.db.prepare("UPDATE messages SET status = 'delivered' WHERE id = ?").run(row.id);
     return this.getMessage(row.id);
   }
 
@@ -267,6 +262,7 @@ export class Store {
 
   getConversation(opts: {
     contactKey?: string;
+    contactPrefix?: string;
     channelIdx?: number;
     beforeId?: number;
     limit: number;
@@ -276,6 +272,9 @@ export class Store {
     if (opts.contactKey !== undefined) {
       clauses.push("m.kind = 'dm' AND m.contact_key = @contactKey");
       params.contactKey = opts.contactKey;
+    } else if (opts.contactPrefix !== undefined) {
+      clauses.push("m.kind = 'dm' AND m.contact_key IS NULL AND m.contact_prefix = @contactPrefix");
+      params.contactPrefix = opts.contactPrefix;
     } else if (opts.channelIdx !== undefined) {
       clauses.push("m.kind = 'channel' AND m.channel_idx = @channelIdx");
       params.channelIdx = opts.channelIdx;
@@ -300,6 +299,7 @@ export class Store {
   searchMessages(opts: {
     query: string;
     contactKey?: string;
+    contactPrefix?: string;
     channelIdx?: number;
     limit: number;
   }): MessageSearchResult[] {
@@ -311,6 +311,9 @@ export class Store {
     if (opts.contactKey !== undefined) {
       clauses.push("m.kind = 'dm' AND m.contact_key = @contactKey");
       params.contactKey = opts.contactKey;
+    } else if (opts.contactPrefix !== undefined) {
+      clauses.push("m.kind = 'dm' AND m.contact_key IS NULL AND m.contact_prefix = @contactPrefix");
+      params.contactPrefix = opts.contactPrefix;
     } else if (opts.channelIdx !== undefined) {
       clauses.push("m.kind = 'channel' AND m.channel_idx = @channelIdx");
       params.channelIdx = opts.channelIdx;
@@ -332,12 +335,15 @@ export class Store {
   }
 
   /** Every message of a conversation (or everything), oldest first, for export. */
-  getMessagesForExport(opts: { contactKey?: string; channelIdx?: number } = {}): Message[] {
+  getMessagesForExport(opts: { contactKey?: string; contactPrefix?: string; channelIdx?: number } = {}): Message[] {
     const clauses: string[] = [];
     const params: Record<string, unknown> = {};
     if (opts.contactKey !== undefined) {
       clauses.push("m.kind = 'dm' AND m.contact_key = @contactKey");
       params.contactKey = opts.contactKey;
+    } else if (opts.contactPrefix !== undefined) {
+      clauses.push("m.kind = 'dm' AND m.contact_key IS NULL AND m.contact_prefix = @contactPrefix");
+      params.contactPrefix = opts.contactPrefix;
     } else if (opts.channelIdx !== undefined) {
       clauses.push("m.kind = 'channel' AND m.channel_idx = @channelIdx");
       params.channelIdx = opts.channelIdx;
@@ -347,11 +353,31 @@ export class Store {
     return rows.map(rowToMessage);
   }
 
-  markConversationRead(opts: { contactKey?: string; channelIdx?: number }): void {
+  getUnknownDirectMessages(): Message[] {
+    const rows = this.db
+      .prepare(
+        `${MESSAGE_SELECT}
+         WHERE m.kind = 'dm' AND m.contact_key IS NULL AND m.contact_prefix IS NOT NULL
+           AND m.id IN (
+             SELECT MAX(id) FROM messages
+             WHERE kind = 'dm' AND contact_key IS NULL AND contact_prefix IS NOT NULL
+             GROUP BY contact_prefix
+           )
+         ORDER BY m.id DESC`,
+      )
+      .all() as MessageRow[];
+    return rows.map(rowToMessage);
+  }
+
+  markConversationRead(opts: { contactKey?: string; contactPrefix?: string; channelIdx?: number }): void {
     if (opts.contactKey !== undefined) {
       this.db
         .prepare("UPDATE messages SET read = 1 WHERE kind = 'dm' AND contact_key = ? AND direction = 'in'")
         .run(opts.contactKey);
+    } else if (opts.contactPrefix !== undefined) {
+      this.db
+        .prepare("UPDATE messages SET read = 1 WHERE kind = 'dm' AND contact_key IS NULL AND contact_prefix = ? AND direction = 'in'")
+        .run(opts.contactPrefix);
     } else if (opts.channelIdx !== undefined) {
       this.db
         .prepare("UPDATE messages SET read = 1 WHERE kind = 'channel' AND channel_idx = ? AND direction = 'in'")

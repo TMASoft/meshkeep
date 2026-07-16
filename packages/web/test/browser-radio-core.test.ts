@@ -76,18 +76,18 @@ describe("contactFromRaw", () => {
 describe("ingestItemFromSync", () => {
   const known = contact("aabbccddeeff" + "0".repeat(52), "Alice");
 
-  it("resolves DM contacts by pubkey prefix and pads unknown prefixes", () => {
+  it("resolves DM contacts by pubkey prefix and preserves unknown prefixes", () => {
     const base = { pathLen: 2, txtType: 0, senderTimestamp: 111, text: "hi" };
     const knownItem = ingestItemFromSync(
       { contactMessage: { ...base, pubKeyPrefix: Uint8Array.from([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]) } },
       [known],
     );
-    expect(knownItem).toMatchObject({ kind: "dm", contactKey: known.publicKey, pathLen: 2, status: "sent" });
+    expect(knownItem).toMatchObject({ kind: "dm", contactKey: known.publicKey, contactPrefix: "aabbccddeeff", pathLen: 2, status: "sent" });
     const unknownItem = ingestItemFromSync(
       { contactMessage: { ...base, pubKeyPrefix: Uint8Array.from([1, 2, 3, 4, 5, 6]) } },
       [known],
     );
-    expect(unknownItem!.contactKey).toBe("010203040506".padEnd(64, "0"));
+    expect(unknownItem).toMatchObject({ contactKey: undefined, contactPrefix: "010203040506" });
   });
 
   it("maps direct-path 0xff to null and carries the signed author prefix", () => {
@@ -121,7 +121,15 @@ describe("localMessageFromItem", () => {
   it("synthesizes a private-session message with author resolution", () => {
     const author = contact("deadbeef" + "0".repeat(56), "Author");
     const message = localMessageFromItem(
-      { kind: "dm", contactKey: author.publicKey, direction: "in", text: "x", senderTimestamp: 7, authorPrefix: "deadbeef" },
+      {
+        kind: "dm",
+        contactKey: author.publicKey,
+        direction: "in",
+        text: "x",
+        senderTimestamp: 7,
+        authorPrefix: "deadbeef",
+        ingestionId: "00000000-0000-4000-8000-000000000007",
+      },
       [author],
       -3,
       1_000,

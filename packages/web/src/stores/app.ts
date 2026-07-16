@@ -17,10 +17,28 @@ import { notifyIncoming } from "../notifications";
 // lives outside the store: holds a live connection object, must not be reactive
 let browserSource: BrowserRadioSource | null = null;
 
-export type ConversationId = { kind: "dm"; contactKey: string } | { kind: "channel"; channelIdx: number };
+export type ConversationId =
+  | { kind: "dm"; contactKey: string; contactPrefix?: undefined }
+  | { kind: "dm"; contactKey?: undefined; contactPrefix: string }
+  | { kind: "channel"; channelIdx: number };
 
 export function conversationKey(id: ConversationId): string {
-  return id.kind === "dm" ? `dm:${id.contactKey}` : `ch:${id.channelIdx}`;
+  return id.kind === "dm" ? `dm:${id.contactKey ?? `unknown:${id.contactPrefix}`}` : `ch:${id.channelIdx}`;
+}
+
+function conversationForMessage(message: Message): ConversationId {
+  if (message.kind === "channel") return { kind: "channel", channelIdx: message.channelIdx ?? 0 };
+  return message.contactKey
+    ? { kind: "dm", contactKey: message.contactKey }
+    : { kind: "dm", contactPrefix: message.contactPrefix ?? "" };
+}
+
+function dmQuery(id: Extract<ConversationId, { kind: "dm" }>): string {
+  return id.contactKey ? `contact=${encodeURIComponent(id.contactKey)}` : `sender=${encodeURIComponent(id.contactPrefix ?? "")}`;
+}
+
+function finalStatus(current: Message["status"], next: Message["status"]): Message["status"] {
+  return current === "delivered" || current === "failed" ? current : next;
 }
 
 export const useAppStore = defineStore("app", {
@@ -33,6 +51,7 @@ export const useAppStore = defineStore("app", {
     // messages per conversation key, ascending by id
     conversations: {} as Record<string, Message[]>,
     recent: [] as Message[],
+    unknownSenders: [] as Message[],
     activeConversation: null as ConversationId | null,
     unread: {} as Record<string, number>,
     // room servers / repeaters this session has authenticated with
@@ -69,7 +88,7 @@ export const useAppStore = defineStore("app", {
       if (this.loaded) return;
       this.session = await api<{ passwordRequired: boolean; authorized: boolean }>("/auth/session");
       if (this.needsLogin) return; // LoginGate takes over; bootstrap resumes after login()
-      await Promise.all([this.refreshStatus(), this.refreshContacts(), this.refreshChannels()]);
+      await Promise.all([this.refreshStatus(), this.refreshContacts(), this.refreshChannels(), this.refreshUnknownSenders()]);
       this.stopEvents = connectEvents(
         (event) => this.onEvent(event),
         (status) => {
@@ -105,6 +124,12 @@ export const useAppStore = defineStore("app", {
     async refreshContacts() {
       const { contacts } = await api<{ contacts: Contact[] }>("/contacts");
       this.contacts = contacts;
+      this.reconcileUnknownConversations();
+    },
+
+    async refreshUnknownSenders() {
+      const { messages } = await api<{ messages: Message[] }>("/messages/unknown-senders");
+      this.unknownSenders = messages;
     },
 
     async refreshChannels() {
@@ -115,8 +140,7 @@ export const useAppStore = defineStore("app", {
     async openConversation(id: ConversationId) {
       this.activeConversation = id;
       const key = conversationKey(id);
-      const query =
-        id.kind === "dm" ? `contact=${encodeURIComponent(id.contactKey)}` : `channel=${id.channelIdx}`;
+      const query = id.kind === "dm" ? dmQuery(id) : `channel=${id.channelIdx}`;
       const { messages } = await api<{ messages: Message[] }>(`/messages?${query}&limit=100`);
       // Messages can arrive over the WebSocket while history is loading. Preserve
       // those newer objects (including delivery-state updates) when merging.
@@ -128,7 +152,7 @@ export const useAppStore = defineStore("app", {
       }
       void api("/messages/read", {
         method: "POST",
-        body: JSON.stringify(id.kind === "dm" ? { contact: id.contactKey } : { channel: id.channelIdx }),
+        body: JSON.stringify(id.kind === "dm" ? (id.contactKey ? { contact: id.contactKey } : { sender: id.contactPrefix }) : { channel: id.channelIdx }),
       }).catch(() => {});
     },
 
@@ -146,8 +170,7 @@ export const useAppStore = defineStore("app", {
     async openConversationAt(id: ConversationId, messageId: number): Promise<boolean> {
       await this.openConversation(id);
       const key = conversationKey(id);
-      const query =
-        id.kind === "dm" ? `contact=${encodeURIComponent(id.contactKey)}` : `channel=${id.channelIdx}`;
+      const query = id.kind === "dm" ? dmQuery(id) : `channel=${id.channelIdx}`;
       for (let page = 0; page < 25; page++) {
         const list = this.conversations[key] ?? [];
         if (list.some((message) => message.id === messageId)) return true;
@@ -163,10 +186,11 @@ export const useAppStore = defineStore("app", {
     },
 
     async sendMessage(id: ConversationId, text: string) {
+      if (id.kind === "dm" && !id.contactKey) {
+        throw new Error("Cannot reply until this sender's full public key is known");
+      }
       // messages to repeaters are CLI commands, like the official app's remote console
-      const cli =
-        id.kind === "dm" &&
-        this.contacts.find((c) => c.publicKey === id.contactKey)?.type === "repeater";
+      const cli = id.kind === "dm" && this.contacts.find((c) => c.publicKey === id.contactKey)?.type === "repeater";
       if (browserSource && this.browserRadio?.state === "connected") {
         const message =
           id.kind === "dm"
@@ -235,15 +259,28 @@ export const useAppStore = defineStore("app", {
     },
 
     /**
-     * Hand the radio to this browser: release the server's claim on a same-host
-     * radio, then open WebSerial/WebBLE (Chromium device picker).
-     */
+      * Hand the radio to this browser: release the server's claim on a same-host
+      * radio and confirm standby before opening WebSerial/WebBLE (Chromium device picker).
+      */
     async startBrowserRadio(kind: BrowserRadioKind, privateSession: boolean) {
       if (browserSource) await this.stopBrowserRadio(false);
-      const serverState = this.status?.connection.state;
-      if (serverState === "connected" || serverState === "syncing" || serverState === "connecting") {
-        await api("/connection/release", { method: "POST" }).catch(() => {});
+      const reclaimServer = async () => {
+        await api("/connection/claim", { method: "POST" });
         await this.refreshStatus().catch(() => {});
+      };
+      try {
+        const release = await api<{ ok: boolean; state: ConnectionState }>("/connection/release", { method: "POST" });
+        if (release.state !== "standby") {
+          throw new Error("Server did not enter standby before browser radio startup");
+        }
+      } catch (error) {
+        try {
+          await reclaimServer();
+        } catch (claimError) {
+          const detail = claimError instanceof Error ? claimError.message : "unknown error";
+          throw new Error(`Server ownership could not be confirmed or restored: ${detail}`);
+        }
+        throw error;
       }
       this.browserRadio = { kind, state: "connecting", error: null, privateSession, batteryMilliVolts: null };
       const source = new BrowserRadioSource(kind, privateSession, {
@@ -255,11 +292,9 @@ export const useAppStore = defineStore("app", {
         },
         onLocalMessage: (message) => this.appendMessage(message),
         onLocalStatus: (id, status) => {
-          for (const list of Object.values(this.conversations)) {
-            const message = list.find((m) => m.id === id);
-            if (message) message.status = status;
-          }
+          this.updateMessageStatus(id, status);
         },
+        onSyncedMessage: (message) => this.appendMessage(message),
         onSelf: (self) => {
           if (this.status) this.status.self = self;
         },
@@ -273,6 +308,12 @@ export const useAppStore = defineStore("app", {
       } catch (error) {
         browserSource = null;
         this.browserRadio = null;
+        try {
+          await reclaimServer();
+        } catch (claimError) {
+          const detail = claimError instanceof Error ? claimError.message : "unknown error";
+          throw new Error(`Browser radio startup failed and server ownership could not be restored: ${detail}`);
+        }
         throw error;
       }
       // synced traffic lands in the server DB; refresh what we mirror from it
@@ -294,22 +335,86 @@ export const useAppStore = defineStore("app", {
     },
 
     appendMessage(message: Message) {
-      const id: ConversationId =
-        message.kind === "dm"
-          ? { kind: "dm", contactKey: message.contactKey ?? "" }
-          : { kind: "channel", channelIdx: message.channelIdx ?? 0 };
+      const id = conversationForMessage(message);
       const key = conversationKey(id);
       const list = (this.conversations[key] ??= []);
-      if (!list.some((m) => m.id === message.id)) {
-        list.push(message);
+      const prior = this.findMessage(message);
+      if (prior && prior.message.id !== message.id) {
+        prior.list.splice(prior.index, 1);
+        const merged = { ...prior.message, ...message, status: finalStatus(prior.message.status, message.status) };
+        list.push(merged);
+        this.recent = [merged, ...this.recent.filter((m) => m.id !== prior.message.id && m.id !== message.id)].slice(0, 50);
+        return;
       }
+      if (prior) {
+        const merged = { ...prior.message, ...message, status: finalStatus(prior.message.status, message.status) };
+        prior.list[prior.index] = merged;
+        this.recent = [merged, ...this.recent.filter((m) => m.id !== message.id)].slice(0, 50);
+        return;
+      }
+      list.push(message);
       this.recent = [message, ...this.recent.filter((m) => m.id !== message.id)].slice(0, 50);
+      if (message.kind === "dm" && !message.contactKey && message.contactPrefix) {
+        this.unknownSenders = [message, ...this.unknownSenders.filter((m) => m.contactPrefix !== message.contactPrefix)];
+      }
       const isActive = this.activeConversation && conversationKey(this.activeConversation) === key;
       if (message.direction === "in" && !isActive) {
         this.unread[key] = (this.unread[key] ?? 0) + 1;
       }
       if (message.direction === "in") {
         notifyIncoming(message, { conversationActive: Boolean(isActive) });
+      }
+    },
+
+    updateMessageStatus(id: number, status: Message["status"]) {
+      for (const list of Object.values(this.conversations)) {
+        const message = list.find((m) => m.id === id);
+        if (message) message.status = finalStatus(message.status, status);
+      }
+      this.recent = this.recent.map((message) =>
+        message.id === id ? { ...message, status: finalStatus(message.status, status) } : message,
+      );
+    },
+
+    findMessage(message: Message): { list: Message[]; index: number; message: Message } | null {
+      for (const list of Object.values(this.conversations)) {
+        const index = list.findIndex(
+          (existing) =>
+            existing.id === message.id ||
+            (message.ingestionId !== undefined && message.ingestionId !== null && existing.ingestionId === message.ingestionId),
+        );
+        if (index >= 0) return { list, index, message: list[index]! };
+      }
+      return null;
+    },
+
+    reconcileUnknownConversations() {
+      for (const unknown of [...this.unknownSenders]) {
+        const prefix = unknown.contactPrefix;
+        if (!prefix) continue;
+        const matches = this.contacts.filter((contact) => contact.publicKey.startsWith(prefix));
+        if (matches.length !== 1) continue;
+        const contact = matches[0]!;
+        const oldId: ConversationId = { kind: "dm", contactPrefix: prefix };
+        const newId: ConversationId = { kind: "dm", contactKey: contact.publicKey };
+        const oldKey = conversationKey(oldId);
+        const newKey = conversationKey(newId);
+        const moved = (this.conversations[oldKey] ?? []).map((message) => ({ ...message, contactKey: contact.publicKey }));
+        if (moved.length) {
+          const merged = new Map((this.conversations[newKey] ?? []).map((message) => [message.id, message]));
+          for (const message of moved) merged.set(message.id, message);
+          this.conversations[newKey] = [...merged.values()].sort((a, b) => a.id - b.id);
+          delete this.conversations[oldKey];
+        }
+        if (this.unread[oldKey]) {
+          this.unread[newKey] = (this.unread[newKey] ?? 0) + this.unread[oldKey];
+          delete this.unread[oldKey];
+        }
+        if (this.activeConversation && conversationKey(this.activeConversation) === oldKey) this.activeConversation = newId;
+        this.recent = this.recent.map((message) =>
+          message.contactPrefix === prefix && !message.contactKey ? { ...message, contactKey: contact.publicKey } : message,
+        );
+        this.unknownSenders = this.unknownSenders.filter((message) => message.contactPrefix !== prefix);
       }
     },
 
@@ -322,10 +427,7 @@ export const useAppStore = defineStore("app", {
           this.appendMessage(event.message);
           break;
         case "message.status": {
-          for (const list of Object.values(this.conversations)) {
-            const message = list.find((m) => m.id === event.id);
-            if (message) message.status = event.status;
-          }
+          this.updateMessageStatus(event.id, event.status);
           break;
         }
         case "contact.updated": {
@@ -335,6 +437,7 @@ export const useAppStore = defineStore("app", {
           } else {
             this.contacts.push(event.contact);
           }
+          this.reconcileUnknownConversations();
           break;
         }
         case "contact.removed": {

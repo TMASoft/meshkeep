@@ -4,6 +4,10 @@ import type { Message, WsEvent } from "@meshkeep/shared";
 
 const apiMock = vi.hoisted(() => vi.fn());
 const connectEventsMock = vi.hoisted(() => vi.fn(() => () => {}));
+const browserRadioMock = vi.hoisted(() => ({
+  start: vi.fn<() => Promise<void>>(),
+  stop: vi.fn<() => Promise<void>>(),
+}));
 
 vi.mock("../src/api/client", () => ({
   api: apiMock,
@@ -19,7 +23,15 @@ vi.mock("../src/api/client", () => ({
 }));
 
 vi.mock("../src/sources/browser-radio", () => ({
-  BrowserRadioSource: class {},
+  BrowserRadioSource: class {
+    start() {
+      return browserRadioMock.start();
+    }
+
+    stop() {
+      return browserRadioMock.stop();
+    }
+  },
 }));
 
 import { useAppStore, conversationKey } from "../src/stores/app";
@@ -46,6 +58,10 @@ beforeEach(() => {
   setActivePinia(createPinia());
   apiMock.mockReset();
   connectEventsMock.mockClear();
+  browserRadioMock.start.mockReset();
+  browserRadioMock.stop.mockReset();
+  browserRadioMock.start.mockResolvedValue();
+  browserRadioMock.stop.mockResolvedValue();
 });
 
 describe("bootstrap and auth state", () => {
@@ -70,6 +86,8 @@ describe("bootstrap and auth state", () => {
           return Promise.resolve({ contacts: [{ publicKey: KEY_A, name: "Alice", type: "chat" }] });
         case "/channels":
           return Promise.resolve({ channels: [] });
+        case "/messages/unknown-senders":
+          return Promise.resolve({ messages: [] });
         default:
           return Promise.reject(new Error(`unexpected ${path}`));
       }
@@ -88,6 +106,71 @@ describe("bootstrap and auth state", () => {
     apiMock.mockRejectedValueOnce(new ApiError(401, "wrong password"));
     const store = useAppStore();
     await expect(store.login("bad")).rejects.toThrow("Wrong password");
+  });
+});
+
+describe("browser radio ownership", () => {
+  it("requires server standby before opening the browser transport", async () => {
+    apiMock.mockResolvedValue({ ok: true, state: "standby" });
+    const store = useAppStore();
+    store.status = {
+      connection: { state: "error", transport: "serial", target: "/dev/ttyUSB0", lastError: "stale failure", connectedAt: null },
+      self: null,
+      batteryMilliVolts: null,
+      counts: { contacts: 0, messages: 0, unread: 0 },
+      version: "test",
+    };
+
+    await store.startBrowserRadio("webserial", true);
+
+    expect(apiMock).toHaveBeenCalledWith("/connection/release", { method: "POST" });
+    expect(browserRadioMock.start).toHaveBeenCalledOnce();
+    expect(apiMock.mock.invocationCallOrder[0]).toBeLessThan(browserRadioMock.start.mock.invocationCallOrder[0]!);
+
+    await store.stopBrowserRadio(false);
+  });
+
+  it("does not open the browser transport unless release confirms standby", async () => {
+    apiMock.mockImplementation((path: string) => {
+      if (path === "/connection/release") return Promise.resolve({ ok: true, state: "connecting" });
+      if (path === "/connection/claim") return Promise.resolve({ ok: true, state: "connecting" });
+      if (path === "/status") return Promise.resolve({ connection: { state: "connecting" } });
+      return Promise.reject(new Error(`unexpected ${path}`));
+    });
+    const store = useAppStore();
+
+    await expect(store.startBrowserRadio("webserial", true)).rejects.toThrow("did not enter standby");
+    expect(browserRadioMock.start).not.toHaveBeenCalled();
+    expect(apiMock).toHaveBeenCalledWith("/connection/claim", { method: "POST" });
+  });
+
+  it("does not open the browser transport when the server release request fails", async () => {
+    apiMock.mockImplementation((path: string) => {
+      if (path === "/connection/release") return Promise.reject(new Error("network unavailable"));
+      if (path === "/connection/claim") return Promise.resolve({ ok: true, state: "connecting" });
+      if (path === "/status") return Promise.resolve({ connection: { state: "connecting" } });
+      return Promise.reject(new Error(`unexpected ${path}`));
+    });
+    const store = useAppStore();
+
+    await expect(store.startBrowserRadio("webserial", true)).rejects.toThrow("network unavailable");
+    expect(browserRadioMock.start).not.toHaveBeenCalled();
+    expect(apiMock).toHaveBeenCalledWith("/connection/claim", { method: "POST" });
+  });
+
+  it("reclaims the server if browser picker or transport startup fails", async () => {
+    apiMock.mockImplementation((path: string) => {
+      if (path === "/connection/release") return Promise.resolve({ ok: true, state: "standby" });
+      if (path === "/connection/claim") return Promise.resolve({ ok: true, state: "connecting" });
+      if (path === "/status") return Promise.resolve({ connection: { state: "connecting" } });
+      return Promise.reject(new Error(`unexpected ${path}`));
+    });
+    browserRadioMock.start.mockRejectedValue(new Error("No device selected"));
+    const store = useAppStore();
+
+    await expect(store.startBrowserRadio("webserial", true)).rejects.toThrow("No device selected");
+    expect(apiMock).toHaveBeenCalledWith("/connection/claim", { method: "POST" });
+    expect(store.browserRadio).toBeNull();
   });
 });
 
@@ -115,6 +198,25 @@ describe("message handling", () => {
     expect(store.unread["ch:3"]).toBe(2); // outgoing messages never count
   });
 
+  it("exposes an unknown sender and moves its live conversation after unique contact resolution", () => {
+    const store = useAppStore();
+    const prefix = "abcdef123456";
+    const fullKey = `${prefix}${"a".repeat(52)}`;
+    store.appendMessage(message({ contactKey: null, contactPrefix: prefix }));
+    const unknownKey = conversationKey({ kind: "dm", contactPrefix: prefix });
+    expect(store.unknownSenders).toHaveLength(1);
+    expect(store.conversations[unknownKey]).toHaveLength(1);
+
+    store.activeConversation = { kind: "dm", contactPrefix: prefix };
+    store.contacts = [{ publicKey: fullKey, name: "Alice", type: "chat", flags: 0, outPathLen: -1, lat: null, lon: null, lastAdvert: 0, lastSeen: null }];
+    store.reconcileUnknownConversations();
+
+    const knownKey = conversationKey({ kind: "dm", contactKey: fullKey });
+    expect(store.unknownSenders).toHaveLength(0);
+    expect(store.conversations[knownKey][0].contactKey).toBe(fullKey);
+    expect(store.activeConversation).toEqual({ kind: "dm", contactKey: fullKey });
+  });
+
   it("openConversation merges history under live WebSocket arrivals", async () => {
     const store = useAppStore();
     // a live message (with a delivery upgrade) arrived before history loaded
@@ -132,6 +234,20 @@ describe("message handling", () => {
     expect(store.unread[key]).toBe(0);
     // marks the conversation read on the server
     expect(apiMock).toHaveBeenCalledWith("/messages/read", expect.objectContaining({ method: "POST" }));
+  });
+
+  it("replaces an offline negative row by ingestion ID without downgrading delivered status", () => {
+    const store = useAppStore();
+    const ingestionId = "00000000-0000-4000-8000-000000000031";
+    const key = conversationKey({ kind: "dm", contactKey: KEY_A });
+    store.appendMessage(message({ id: -1, direction: "out", status: "sent", ingestionId }));
+    store.updateMessageStatus(-1, "delivered");
+
+    store.onEvent({ type: "message.new", message: message({ id: 31, direction: "out", status: "sent", ingestionId }) } as WsEvent);
+    store.onEvent({ type: "message.status", id: 31, status: "sent" } as WsEvent);
+
+    expect(store.conversations[key]).toEqual([expect.objectContaining({ id: 31, ingestionId, status: "delivered" })]);
+    expect(store.recent).toEqual([expect.objectContaining({ id: 31, status: "delivered" })]);
   });
 
   it("sendMessage posts a dm and appends the created message", async () => {

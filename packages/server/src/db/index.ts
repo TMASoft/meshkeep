@@ -99,6 +99,35 @@ const MIGRATIONS: string[] = [
   ALTER TABLE telemetry ADD COLUMN contact_key TEXT;
   CREATE INDEX idx_telemetry_contact ON telemetry (contact_key, ts);
   `,
+  // 5: direct-message sender prefixes are not full contact identities. Older
+  // server rows stored short prefixes directly; browser rows padded 6-byte
+  // prefixes to a fake 64-character key.
+  `
+  ALTER TABLE messages ADD COLUMN contact_prefix TEXT;
+   UPDATE messages
+   SET contact_prefix = CASE
+         WHEN length(contact_key) < 64 THEN contact_key
+         WHEN length(contact_key) = 64 AND trim(substr(contact_key, 13), '0') = ''
+           AND NOT EXISTS (SELECT 1 FROM contacts WHERE public_key = messages.contact_key)
+           THEN substr(contact_key, 1, 12)
+       END,
+       contact_key = NULL
+   WHERE kind = 'dm'
+     AND contact_key IS NOT NULL
+     AND (length(contact_key) < 64 OR (
+       length(contact_key) = 64 AND trim(substr(contact_key, 13), '0') = ''
+       AND NOT EXISTS (SELECT 1 FROM contacts WHERE public_key = messages.contact_key)
+     ));
+   CREATE INDEX idx_messages_contact_prefix ON messages (contact_prefix, id);
+   `,
+  // 6: content and a whole-second sender timestamp are not a message identity.
+  // Keep dedupe_hash for existing databases, but use a stable ingestion ID for
+  // new browser sync-backs and generated IDs for server-owned records.
+  `
+   ALTER TABLE messages ADD COLUMN ingestion_id TEXT;
+   UPDATE messages SET ingestion_id = lower(hex(randomblob(16))) WHERE ingestion_id IS NULL;
+   CREATE UNIQUE INDEX idx_messages_ingestion_id ON messages (ingestion_id);
+  `,
 ];
 
 export type Db = Database.Database;

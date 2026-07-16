@@ -64,7 +64,7 @@ describe("ingest", () => {
     return { db, store, bus, events };
   }
 
-  it("inserts messages idempotently and reports duplicates", () => {
+  it("dedupes retried ingestion IDs without collapsing repeated messages", () => {
     const { store, bus, events } = setup();
     const items = [
       {
@@ -73,6 +73,7 @@ describe("ingest", () => {
         direction: "in" as const,
         text: "from the browser",
         senderTimestamp: 1_752_000_000,
+        ingestionId: "00000000-0000-4000-8000-000000000001",
       },
     ];
     expect(ingestMessages(store, bus, items)).toMatchObject({ inserted: 1, duplicates: 0 });
@@ -81,6 +82,15 @@ describe("ingest", () => {
     // key was normalized to lowercase
     const stored = store.getRecentMessages(5)[0];
     expect(stored.contactKey).toBe("ab".repeat(32));
+    expect(stored.ingestionId).toBe(items[0].ingestionId);
+    expect((events.find((event) => event.type === "message.new") as Extract<WsEvent, { type: "message.new" }>).message.ingestionId).toBe(
+      items[0].ingestionId,
+    );
+
+    expect(
+      ingestMessages(store, bus, [{ ...items[0], ingestionId: "00000000-0000-4000-8000-000000000002" }]),
+    ).toMatchObject({ inserted: 1, duplicates: 0 });
+    expect(store.counts().messages).toBe(2);
   });
 
   it("moves a duplicate's status forward when the re-post carries an ack", () => {
@@ -91,6 +101,7 @@ describe("ingest", () => {
       direction: "out" as const,
       text: "sent from browser",
       senderTimestamp: 1_752_000_100,
+      ingestionId: "00000000-0000-4000-8000-000000000003",
     };
     const first = ingestMessages(store, bus, [{ ...base, status: "sent" }]);
     expect(first.inserted).toBe(1);

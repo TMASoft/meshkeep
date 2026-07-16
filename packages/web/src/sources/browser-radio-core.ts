@@ -11,6 +11,7 @@ export const GEO_SCALE = 1e6;
 export interface IngestItem {
   kind: "dm" | "channel";
   contactKey?: string;
+  contactPrefix?: string;
   channelIdx?: number;
   direction: "in" | "out";
   text: string;
@@ -18,6 +19,8 @@ export interface IngestItem {
   pathLen?: number | null;
   status?: Message["status"];
   authorPrefix?: string | null;
+  /** Generated once while handling the radio frame; preserved across retries. */
+  ingestionId: string;
 }
 
 export interface QueueEntry {
@@ -33,6 +36,10 @@ export interface IngestQueue {
 
 export function bytesToHex(bytes: Uint8Array): string {
   return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export function newIngestionId(): string {
+  return crypto.randomUUID();
 }
 
 export function normalizeDeviceText(value: string): string {
@@ -130,13 +137,15 @@ export function ingestItemFromSync(next: SyncedMessage, contacts: Contact[]): In
     const contact = contacts.find((c) => c.publicKey.startsWith(prefixHex));
     return {
       kind: "dm",
-      contactKey: contact?.publicKey ?? prefixHex.padEnd(64, "0"),
+      contactKey: contact?.publicKey,
+      contactPrefix: prefixHex,
       direction: "in",
       text: m.text,
       senderTimestamp: m.senderTimestamp,
       pathLen: m.pathLen === 0xff ? null : m.pathLen,
       status: "sent",
       authorPrefix: m.signedAuthorPrefix ?? null,
+      ingestionId: newIngestionId(),
     };
   }
   if (next.channelMessage) {
@@ -149,6 +158,7 @@ export function ingestItemFromSync(next: SyncedMessage, contacts: Contact[]): In
       senderTimestamp: m.senderTimestamp,
       pathLen: m.pathLen === 0xff ? null : m.pathLen,
       status: "sent",
+      ingestionId: newIngestionId(),
     };
   }
   return null;
@@ -159,8 +169,10 @@ export function localMessageFromItem(item: IngestItem, contacts: Contact[], id: 
   const contact = item.contactKey ? contacts.find((c) => c.publicKey === item.contactKey) : null;
   return {
     id,
+    ingestionId: item.ingestionId,
     kind: item.kind,
     contactKey: item.contactKey ?? null,
+    contactPrefix: item.contactPrefix ?? null,
     contactName: contact?.name ?? null,
     channelIdx: item.channelIdx ?? null,
     channelName: null,

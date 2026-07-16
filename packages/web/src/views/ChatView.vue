@@ -46,6 +46,7 @@ const activeTitle = computed(() => {
   const id = active.value;
   if (!id) return "";
   if (id.kind === "dm") {
+    if (!id.contactKey) return `Unknown sender ${shortKey(id.contactPrefix ?? "")}`;
     return store.contacts.find((contact) => contact.publicKey === id.contactKey)?.name ?? shortKey(id.contactKey);
   }
   return store.channels.find((channel) => channel.idx === id.channelIdx)?.name ?? `channel ${id.channelIdx}`;
@@ -55,6 +56,7 @@ const activeMeta = computed(() => {
   const id = active.value;
   if (!id) return "";
   if (id.kind === "channel") return `Shared channel ${id.channelIdx}`;
+  if (!id.contactKey) return `Sender prefix · ${shortKey(id.contactPrefix ?? "")}`;
   const contact = store.contacts.find((item) => item.publicKey === id.contactKey);
   return contact ? `${contact.type} node · ${shortKey(contact.publicKey)}` : shortKey(id.contactKey);
 });
@@ -164,12 +166,16 @@ watch(search, (value) => {
 
 function resultConversation(result: MessageSearchResult): ConversationId {
   return result.kind === "dm"
-    ? { kind: "dm", contactKey: result.contactKey ?? "" }
+    ? result.contactKey
+      ? { kind: "dm", contactKey: result.contactKey }
+      : { kind: "dm", contactPrefix: result.contactPrefix ?? "" }
     : { kind: "channel", channelIdx: result.channelIdx ?? 0 };
 }
 
 function resultTitle(result: MessageSearchResult): string {
-  if (result.kind === "dm") return result.contactName ?? shortKey(result.contactKey ?? "");
+  if (result.kind === "dm") {
+    return result.contactName ?? (result.contactKey ? shortKey(result.contactKey) : `Unknown sender ${shortKey(result.contactPrefix ?? "")}`);
+  }
   return result.channelName ?? `channel ${result.channelIdx}`;
 }
 
@@ -231,7 +237,7 @@ watch(active, () => {
 
 const activeContact = computed<Contact | null>(() => {
   const id = active.value;
-  if (!id || id.kind !== "dm") return null;
+  if (!id || id.kind !== "dm" || !id.contactKey) return null;
   return store.contacts.find((contact) => contact.publicKey === id.contactKey) ?? null;
 });
 
@@ -239,7 +245,7 @@ const exportHref = computed(() => {
   const id = active.value;
   if (!id) return "#";
   return id.kind === "dm"
-    ? `/api/v1/messages/export?format=csv&contact=${id.contactKey}`
+    ? `/api/v1/messages/export?format=csv&${id.contactKey ? `contact=${id.contactKey}` : `sender=${id.contactPrefix}`}`
     : `/api/v1/messages/export?format=csv&channel=${id.channelIdx}`;
 });
 
@@ -567,6 +573,9 @@ function fmtUptime(secs: number): string {
 }
 
 const composerPlaceholder = computed(() => {
+  if (active.value?.kind === "dm" && !active.value.contactKey) {
+    return "Reply unavailable until the sender is identified";
+  }
   if (activeContact.value?.type === "repeater") {
     return isLoggedIn.value ? `CLI command for ${activeTitle.value}` : "CLI command (log in via ⓘ first)";
   }
@@ -754,6 +763,32 @@ function fmtLastAdvert(epoch: number): string {
           </p>
           <p v-else-if="!filteredContacts.length" class="group-empty">No matching nodes</p>
         </section>
+
+        <section v-if="store.unknownSenders.length" class="conversation-group" aria-labelledby="unknown-senders-heading">
+          <div class="group-heading">
+            <h2 id="unknown-senders-heading">Unknown senders</h2>
+            <span class="group-heading-tools">{{ store.unknownSenders.length.toString().padStart(2, "0") }}</span>
+          </div>
+          <button
+            v-for="message in store.unknownSenders"
+            :key="message.contactPrefix ?? message.id"
+            class="conversation-row"
+            :class="{ active: active?.kind === 'dm' && active.contactPrefix === message.contactPrefix }"
+            type="button"
+            :disabled="opening"
+            :aria-current="active?.kind === 'dm' && active.contactPrefix === message.contactPrefix ? 'true' : undefined"
+            @click="open({ kind: 'dm', contactPrefix: message.contactPrefix ?? '' }, $event)"
+          >
+            <span class="conversation-avatar"><AppIcon name="user" :size="18" /></span>
+            <span class="conversation-copy">
+              <strong>Unknown sender</strong>
+              <small>{{ shortKey(message.contactPrefix ?? "") }}</small>
+            </span>
+            <span v-if="store.unread[`dm:unknown:${message.contactPrefix}`]" class="unread-badge">
+              {{ store.unread[`dm:unknown:${message.contactPrefix}`] }}
+            </span>
+          </button>
+        </section>
       </div>
     </aside>
 
@@ -807,6 +842,10 @@ function fmtLastAdvert(epoch: number): string {
               <dt>Secret · base64</dt>
               <dd class="secret-value">{{ activeChannelSecretBase64 }}</dd>
             </div>
+          </dl>
+          <dl v-else-if="active?.kind === 'dm'" class="details-facts">
+            <div><dt>Sender prefix</dt><dd>{{ shortKey(active.contactPrefix ?? "") }}</dd></div>
+            <div><dt>Reply</dt><dd>Available after a unique contact matches this sender.</dd></div>
           </dl>
 
           <form
@@ -985,11 +1024,12 @@ function fmtLastAdvert(epoch: number): string {
               :placeholder="composerPlaceholder"
               maxlength="2000"
               rows="1"
+              :disabled="active.kind === 'dm' && !active.contactKey"
               @keydown.enter.exact.prevent="send"
             />
           </label>
           <span class="character-count" :class="{ near: draft.length > 1800 }">{{ draft.length }}/2000</span>
-          <button class="send-button" type="submit" :disabled="sending || opening || !draft.trim()" aria-label="Send message">
+          <button class="send-button" type="submit" :disabled="sending || opening || !draft.trim() || (active.kind === 'dm' && !active.contactKey)" aria-label="Send message">
             <span v-if="sending" class="send-spinner" />
             <AppIcon v-else name="send" :size="19" />
           </button>

@@ -1,4 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
+import { Constants, type Connection } from "@liamcottle/meshcore.js";
 import type { Message, WsEvent } from "@meshkeep/shared";
 import { MockRadio } from "../src/radio/mock/mock-radio.js";
 import { ConnectionManager } from "../src/radio/manager.js";
@@ -61,7 +63,7 @@ describe("mock radio end-to-end", () => {
     await mock.start();
     db = openDb(":memory:");
     bus = new Bus();
-    manager = new ConnectionManager(testConfig(mock.port), db, bus, "test");
+    manager = new ConnectionManager(testConfig(mock.port), db, bus, "test", 50);
     await manager.start();
     await waitForState(manager, "connected");
   });
@@ -113,6 +115,91 @@ describe("mock radio end-to-end", () => {
     expect(echo.message.contactName).toBe("Mock Alice");
   });
 
+  it("retains an acknowledgement that arrives before the send response", async () => {
+    const originalConnection = (manager as unknown as { connection: Connection }).connection;
+    const emitter = new EventEmitter();
+    const connection = Object.assign(emitter, {
+      async sendTextMessage() {
+        emitter.emit(Constants.PushCodes.SendConfirmed, { ackCode: 4321, roundTrip: 0 });
+        return { result: 0, expectedAckCrc: 4321, estTimeout: 50 };
+      },
+    }) as unknown as Connection;
+    (manager as unknown as { connection: Connection }).connection = connection;
+    (manager as unknown as { attachListeners(connection: Connection): void }).attachListeners(connection);
+
+    try {
+      const message = await manager.sendDirectMessage("ab".repeat(32), "early ack");
+      expect(message.status).toBe("delivered");
+      expect(manager.store.getMessage(message.id)?.status).toBe("delivered");
+    } finally {
+      (manager as unknown as { connection: Connection }).connection = originalConnection;
+    }
+  });
+
+  it("serializes same-CRC sends so each acknowledgement updates its own message", async () => {
+    const originalConnection = (manager as unknown as { connection: Connection }).connection;
+    const emitter = new EventEmitter();
+    const sent: string[] = [];
+    const connection = Object.assign(emitter, {
+      async sendTextMessage(_key: Uint8Array, text: string) {
+        sent.push(text);
+        return { result: 0, expectedAckCrc: 4321, estTimeout: 50 };
+      },
+    }) as unknown as Connection;
+    (manager as unknown as { connection: Connection }).connection = connection;
+    (manager as unknown as { attachListeners(connection: Connection): void }).attachListeners(connection);
+
+    try {
+      const first = manager.sendDirectMessage("ab".repeat(32), "first");
+      const second = manager.sendDirectMessage("ab".repeat(32), "second");
+      const firstMessage = await first;
+      expect(sent).toEqual(["first"]);
+
+      emitter.emit(Constants.PushCodes.SendConfirmed, { ackCode: 4321, roundTrip: 0 });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(sent).toEqual(["first", "second"]);
+      const secondMessage = await second;
+      emitter.emit(Constants.PushCodes.SendConfirmed, { ackCode: 4321, roundTrip: 0 });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(manager.store.getMessage(firstMessage.id)?.status).toBe("delivered");
+      expect(manager.store.getMessage(secondMessage.id)?.status).toBe("delivered");
+    } finally {
+      (manager as unknown as { connection: Connection }).connection = originalConnection;
+    }
+  });
+
+  it("expires an unacknowledged send before dispatching the next one", async () => {
+    const originalConnection = (manager as unknown as { connection: Connection }).connection;
+    const emitter = new EventEmitter();
+    const sent: string[] = [];
+    const connection = Object.assign(emitter, {
+      async sendTextMessage(_key: Uint8Array, text: string) {
+        sent.push(text);
+        return { result: 0, expectedAckCrc: 4321, estTimeout: sent.length === 1 ? 10 : 500 };
+      },
+    }) as unknown as Connection;
+    (manager as unknown as { connection: Connection }).connection = connection;
+    (manager as unknown as { attachListeners(connection: Connection): void }).attachListeners(connection);
+
+    try {
+      const first = await manager.sendDirectMessage("ab".repeat(32), "first");
+      const second = manager.sendDirectMessage("ab".repeat(32), "second");
+      expect(sent).toEqual(["first"]);
+
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(sent).toEqual(["first", "second"]);
+      const secondMessage = await second;
+      emitter.emit(Constants.PushCodes.SendConfirmed, { ackCode: 4321, roundTrip: 0 });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(manager.store.getMessage(first.id)?.status).toBe("sent");
+      expect(manager.store.getMessage(secondMessage.id)?.status).toBe("delivered");
+    } finally {
+      (manager as unknown as { connection: Connection }).connection = originalConnection;
+    }
+  });
+
   it("sends and receives channel messages", async () => {
     const echoed = waitForEvent(
       bus,
@@ -146,6 +233,79 @@ describe("mock radio end-to-end", () => {
     expect(await manager.refreshChannels()).toHaveLength(1);
   });
 
+  it("keeps stored channels when a channel read returns an error", async () => {
+    manager.store.upsertChannel({ idx: 3, name: "Stored", secret: "a".repeat(32) });
+    const originalConnection = (manager as unknown as { connection: Connection }).connection;
+    const connection = channelReader((idx, emitter) => {
+      if (idx === 3) emitter.emit(Constants.ResponseCodes.Err);
+      else emitter.emit(Constants.ResponseCodes.ChannelInfo, { channelIdx: idx, name: "", secret: new Uint8Array(16) });
+    });
+    (manager as unknown as { connection: Connection }).connection = connection;
+
+    try {
+      await expect(manager.refreshChannels()).rejects.toThrow("radio rejected reading channel 3");
+      expect(manager.store.getChannels()).toEqual([
+        { idx: 0, name: "Public", secret: expect.any(String) },
+        { idx: 3, name: "Stored", secret: "a".repeat(32) },
+      ]);
+    } finally {
+      (manager as unknown as { connection: Connection }).connection = originalConnection;
+    }
+  });
+
+  it("keeps stored channels when a channel read times out", async () => {
+    manager.store.upsertChannel({ idx: 3, name: "Stored", secret: "a".repeat(32) });
+    const originalConnection = (manager as unknown as { connection: Connection }).connection;
+    const connection = channelReader((idx, emitter) => {
+      if (idx !== 3) {
+        emitter.emit(Constants.ResponseCodes.ChannelInfo, { channelIdx: idx, name: "", secret: new Uint8Array(16) });
+      }
+    });
+    (manager as unknown as { connection: Connection }).connection = connection;
+
+    try {
+      await expect(manager.refreshChannels()).rejects.toThrow("timed out reading channel 3");
+      expect(manager.store.getChannels()).toEqual([
+        { idx: 0, name: "Public", secret: expect.any(String) },
+        { idx: 3, name: "Stored", secret: "a".repeat(32) },
+      ]);
+    } finally {
+      (manager as unknown as { connection: Connection }).connection = originalConnection;
+    }
+  });
+
+  it("serializes concurrent channel writes so each receives its own response", async () => {
+    const originalConnection = (manager as unknown as { connection: Connection }).connection;
+    const emitter = new EventEmitter();
+    const sent: string[] = [];
+    const connection = Object.assign(emitter, {
+      sendCommandSetChannel(_idx: number, name: string): Promise<void> {
+        sent.push(name);
+        return Promise.resolve();
+      },
+    }) as unknown as Connection;
+    (manager as unknown as { connection: Connection }).connection = connection;
+
+    try {
+      const first = manager.setChannel(2, "first", "a".repeat(32));
+      const second = manager.setChannel(3, "second", "b".repeat(32));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(sent).toEqual(["first"]);
+
+      emitter.emit(Constants.ResponseCodes.Ok);
+      await expect(first).resolves.toMatchObject({ idx: 2, name: "first" });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(sent).toEqual(["first", "second"]);
+
+      emitter.emit(Constants.ResponseCodes.Err);
+      await expect(second).rejects.toThrow("radio rejected channel update");
+      expect(manager.store.getChannels().map((channel) => channel.idx)).toContain(2);
+      expect(manager.store.getChannels().map((channel) => channel.idx)).not.toContain(3);
+    } finally {
+      (manager as unknown as { connection: Connection }).connection = originalConnection;
+    }
+  });
+
   it("receives unsolicited incoming messages via MsgWaiting push", async () => {
     const incoming = waitForEvent(bus, (e) => e.type === "message.new");
     mock.injectDirectMessage("Mock Bob", "ping from the field");
@@ -154,15 +314,15 @@ describe("mock radio end-to-end", () => {
     expect(event.message.contactName).toBe("Mock Bob");
   });
 
-  it("dedupes identical incoming messages", async () => {
+  it("preserves repeated incoming messages", async () => {
     const first = waitForEvent(bus, (e) => e.type === "message.new");
     mock.injectDirectMessage("Mock Bob", "same message");
     await first;
     const before = manager.store.counts().messages;
-    // same sender/timestamp/text within the same second → same dedupe hash
+    // The protocol offers no frame ID, so distinct received frames are kept.
     mock.injectDirectMessage("Mock Bob", "same message");
     await new Promise((resolve) => setTimeout(resolve, 300));
-    expect(manager.store.counts().messages).toBe(before);
+    expect(manager.store.counts().messages).toBe(before + 1);
   });
 
   it("updates device settings", async () => {
@@ -313,3 +473,107 @@ describe("mock radio end-to-end", () => {
     await manager2.stop();
   });
 });
+
+describe("connection lifecycle races", () => {
+  let db: Db;
+  let manager: ConnectionManager;
+
+  afterEach(async () => {
+    await manager?.stop();
+    db?.close();
+    vi.useRealTimers();
+  });
+
+  it("does not restore a connection after release while it is connecting", async () => {
+    const delayed = delayedConnection();
+    db = openDb(":memory:");
+    manager = new ConnectionManager(testConfig(1), db, new Bus(), "test", 50, () => delayed.connection);
+
+    const starting = manager.start();
+    expect(manager.getState()).toBe("connecting");
+    await manager.release();
+    delayed.emitter.emit(Constants.PushCodes.NewAdvert, {
+      publicKey: new Uint8Array(32).fill(7),
+      type: 1,
+      flags: 0,
+      outPathLen: 0,
+      advName: "stale advert",
+      lastAdvert: 0,
+      advLat: 0,
+      advLon: 0,
+    });
+    delayed.emitter.emit("connected");
+    await starting;
+
+    expect(delayed.close).toHaveBeenCalledOnce();
+    expect(manager.getState()).toBe("standby");
+    expect(manager.store.getContacts()).toHaveLength(0);
+  });
+
+  it("does not restore a connection after stop while it is connecting", async () => {
+    const delayed = delayedConnection();
+    db = openDb(":memory:");
+    manager = new ConnectionManager(testConfig(1), db, new Bus(), "test", 50, () => delayed.connection);
+
+    const starting = manager.start();
+    await manager.stop();
+    delayed.emitter.emit("connected");
+    await starting;
+
+    expect(manager.getState()).toBe("disconnected");
+  });
+
+  it("does not let a stale connection override a new disabled transport", async () => {
+    const delayed = delayedConnection();
+    db = openDb(":memory:");
+    manager = new ConnectionManager(testConfig(1), db, new Bus(), "test", 50, () => delayed.connection);
+
+    const starting = manager.start();
+    await manager.setConnectionOverride({ connection: "none" });
+    delayed.emitter.emit("connected");
+    await starting;
+
+    expect(manager.getState()).toBe("disconnected");
+    expect(manager.status().connection.transport).toBe("none");
+  });
+
+  it("cancels a scheduled reconnect when released", async () => {
+    vi.useFakeTimers();
+    const emitter = new EventEmitter();
+    const connect = vi.fn().mockRejectedValue(new Error("offline"));
+    const connection = Object.assign(emitter, {
+      connect,
+      close: vi.fn().mockResolvedValue(undefined),
+    }) as unknown as Connection;
+    db = openDb(":memory:");
+    manager = new ConnectionManager(testConfig(1), db, new Bus(), "test", 50, () => connection);
+
+    await manager.start();
+    expect(manager.getState()).toBe("error");
+    await manager.release();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(connect).toHaveBeenCalledOnce();
+    expect(manager.getState()).toBe("standby");
+  });
+});
+
+function delayedConnection(): { emitter: EventEmitter; connection: Connection; close: ReturnType<typeof vi.fn> } {
+  const emitter = new EventEmitter();
+  const close = vi.fn().mockResolvedValue(undefined);
+  return {
+    emitter,
+    connection: Object.assign(emitter, { connect: vi.fn().mockResolvedValue(undefined), close }) as unknown as Connection,
+    close,
+  };
+}
+
+function channelReader(respond: (idx: number, emitter: EventEmitter) => void): Connection {
+  const emitter = new EventEmitter();
+  return Object.assign(emitter, {
+    sendCommandGetChannel(idx: number): Promise<void> {
+      respond(idx, emitter);
+      return Promise.resolve();
+    },
+  }) as unknown as Connection;
+}

@@ -6,8 +6,8 @@ import {
   flushQueueOnce,
   ingestItemFromSync,
   localMessageFromItem,
+  newIngestionId,
   selfInfoFromRaw,
-  takePendingAck,
   type IngestItem,
   type IngestQueue,
   type QueueEntry,
@@ -49,6 +49,8 @@ export interface BrowserRadioCallbacks {
   /** Private-session traffic that never reaches the server (synthetic negative ids). */
   onLocalMessage(message: Message): void;
   onLocalStatus(id: number, status: Message["status"]): void;
+  /** Server ingestion response, including rows replayed from the offline queue. */
+  onSyncedMessage(message: Message): void;
   onSelf(self: SelfInfo): void;
   onBattery(batteryMilliVolts: number): void;
 }
@@ -77,9 +79,13 @@ const defaultDeps: BrowserRadioDeps = {
 };
 
 interface PendingAck {
-  ackCrc: number;
-  localId: number;
+  ackCrc: number | null;
+  earlyAckCode: number | null;
+  localId: number | null;
   item: IngestItem;
+  timeout: ReturnType<typeof setTimeout> | null;
+  finished: Promise<void>;
+  finish: () => void;
 }
 
 export class BrowserRadioSource {
@@ -88,7 +94,8 @@ export class BrowserRadioSource {
   private bufferUtils: typeof import("@liamcottle/meshcore.js/src/buffer_utils.js")["default"] | null = null;
   private releaseLock: (() => void) | null = null;
   private contacts: Contact[] = [];
-  private pendingAcks: PendingAck[] = [];
+  private pendingAck: PendingAck | null = null;
+  private directSendQueue: Promise<void> = Promise.resolve();
   private draining = false;
   private drainAgain = false;
   private batteryTimer: ReturnType<typeof setInterval> | null = null;
@@ -289,11 +296,6 @@ export class BrowserRadioSource {
 
   async sendDirectMessage(contactKey: string, text: string, cli = false): Promise<Message> {
     const connection = this.requireConnection();
-    const sent = await connection.sendTextMessage(
-      this.bufferUtils!.hexToBytes(contactKey),
-      text,
-      cli ? this.constants!.TxtTypes.CliData : this.constants!.TxtTypes.Plain,
-    );
     const item: IngestItem = {
       kind: "dm",
       contactKey,
@@ -301,10 +303,26 @@ export class BrowserRadioSource {
       text,
       senderTimestamp: Math.floor(Date.now() / 1000),
       status: "sent",
+      ingestionId: newIngestionId(),
     };
-    const message = await this.recordOutgoing(item);
-    this.pendingAcks.push({ ackCrc: sent.expectedAckCrc, localId: message.id, item });
-    return message;
+    return this.runDirectSend(item, async (pending) => {
+      const sent = await connection.sendTextMessage(
+        this.bufferUtils!.hexToBytes(contactKey),
+        text,
+        cli ? this.constants!.TxtTypes.CliData : this.constants!.TxtTypes.Plain,
+      );
+      pending.ackCrc = sent.expectedAckCrc;
+      const message = await this.recordOutgoing(item);
+      pending.localId = message.id;
+
+      if (pending.earlyAckCode === sent.expectedAckCrc) {
+        await this.finishPendingAck(pending, true);
+        return { ...message, status: "delivered" };
+      }
+
+      pending.timeout = setTimeout(() => void this.finishPendingAck(pending, false), sent.estTimeout);
+      return message;
+    });
   }
 
   async sendChannelMessage(channelIdx: number, text: string): Promise<Message> {
@@ -317,6 +335,7 @@ export class BrowserRadioSource {
       text,
       senderTimestamp: Math.floor(Date.now() / 1000),
       status: "sent",
+      ingestionId: newIngestionId(),
     });
   }
 
@@ -333,6 +352,7 @@ export class BrowserRadioSource {
     if (!this.privateSession) {
       try {
         const result = (await this.deps.postIngest("messages", { messages: [item] })) as { messages: Message[] };
+        this.reportIngestResult("messages", result);
         if (result.messages[0]) return result.messages[0];
       } catch {
         await this.deps.queue.put({ kind: "messages", payload: { messages: [item] } });
@@ -344,15 +364,63 @@ export class BrowserRadioSource {
   }
 
   private async handleSendConfirmed(ackCode: number): Promise<void> {
-    const pending = takePendingAck(this.pendingAcks, ackCode);
+    const pending = this.pendingAck;
     if (!pending) return;
-    if (this.privateSession) {
-      this.callbacks.onLocalStatus(pending.localId, "delivered");
+    // A push can arrive before sendTextMessage resolves with expectedAckCrc.
+    if (pending.ackCrc === null) {
+      pending.earlyAckCode = ackCode;
       return;
     }
-    // re-post with the final status; the server upgrades the duplicate and
-    // pushes message.status over the WebSocket
-    await this.postOrQueue("messages", { messages: [{ ...pending.item, status: "delivered" as const }] });
+    if (pending.ackCrc !== ackCode) return;
+    await this.finishPendingAck(pending, true);
+  }
+
+  private runDirectSend(item: IngestItem, operation: (pending: PendingAck) => Promise<Message>): Promise<Message> {
+    let resolveResult!: (message: Message) => void;
+    let rejectResult!: (reason: unknown) => void;
+    const result = new Promise<Message>((resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    });
+    const queued = this.directSendQueue.then(async () => {
+      const pending = this.createPendingAck(item);
+      this.pendingAck = pending;
+      try {
+        resolveResult(await operation(pending));
+        await pending.finished;
+      } catch (error) {
+        await this.finishPendingAck(pending, false);
+        rejectResult(error);
+      }
+    });
+    this.directSendQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private createPendingAck(item: IngestItem): PendingAck {
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    return { ackCrc: null, earlyAckCode: null, localId: null, item, timeout: null, finished, finish };
+  }
+
+  private async finishPendingAck(pending: PendingAck, delivered: boolean): Promise<void> {
+    if (this.pendingAck !== pending) return;
+    this.pendingAck = null;
+    if (pending.timeout !== null) clearTimeout(pending.timeout);
+    if (delivered && pending.localId !== null) {
+      this.callbacks.onLocalStatus(pending.localId, "delivered");
+      if (!this.privateSession) {
+        // Re-post the same stable ingestion ID so the server updates only this
+        // record, even after an offline retry.
+        await this.postOrQueue("messages", { messages: [{ ...pending.item, status: "delivered" as const }] });
+      }
+    }
+    pending.finish();
   }
 
   private async pollBattery(): Promise<void> {
@@ -372,7 +440,8 @@ export class BrowserRadioSource {
 
   private async postOrQueue(kind: QueueEntry["kind"], payload: unknown): Promise<void> {
     try {
-      await this.deps.postIngest(kind, payload);
+      const result = await this.deps.postIngest(kind, payload);
+      this.reportIngestResult(kind, result);
     } catch {
       await this.deps.queue.put({ kind, payload });
     }
@@ -381,8 +450,16 @@ export class BrowserRadioSource {
   /** Replay queued sync-backs (server was unreachable when they happened). */
   private async flushQueue(): Promise<void> {
     await flushQueueOnce(this.deps.queue, async (kind, payload) => {
-      await this.deps.postIngest(kind, payload);
+      const result = await this.deps.postIngest(kind, payload);
+      this.reportIngestResult(kind, result);
     });
+  }
+
+  private reportIngestResult(kind: QueueEntry["kind"], result: unknown): void {
+    if (kind !== "messages" || !result || typeof result !== "object" || !("messages" in result)) return;
+    const messages = (result as { messages?: unknown }).messages;
+    if (!Array.isArray(messages)) return;
+    for (const message of messages) this.callbacks.onSyncedMessage(message as Message);
   }
 
   private requireConnection(): MeshConnection {

@@ -123,6 +123,8 @@ The two endpoints the hll-meshkeep plugin consumes:
 
 - `GET /api/v1/status` — connection state, node info, battery, counts
 - `GET /api/v1/messages/recent?limit=20` — newest messages with resolved names
+- `GET /api/v1/messages/unknown-senders` — latest message for each unresolved DM sender prefix; use `sender=<prefix>` on message history, search, export, and read routes to access its conversation
+- `POST /api/v1/ingest/messages` — browser-direct sync records require a UUID `ingestionId`; retry the same record with the same ID, and use a new ID for an intentional repeat. The response and `message.new` event include that ID so offline browser rows can be replaced by their server IDs without losing a delivered or failed status.
 
 ## Development
 

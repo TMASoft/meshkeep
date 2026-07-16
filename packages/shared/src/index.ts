@@ -51,8 +51,13 @@ export type MessageStatus = "pending" | "sent" | "delivered" | "failed";
 
 export interface Message {
   id: number;
+  /** Stable browser/client ingestion identity, used to reconcile offline rows. */
+  ingestionId?: string | null;
   kind: MessageKind;
+  /** Full public key when a direct-message sender has been uniquely resolved. */
   contactKey: string | null;
+  /** Sender public-key prefix for incoming direct messages, including unresolved senders. */
+  contactPrefix?: string | null;
   contactName?: string | null;
   channelIdx: number | null;
   channelName?: string | null;
