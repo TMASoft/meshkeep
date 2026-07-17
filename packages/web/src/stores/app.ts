@@ -530,6 +530,14 @@ export const useAppStore = defineStore("app", {
           replaced = true;
           return [merged];
         });
+        // An offline unknown-sender row reconciling to its server row: repoint
+        // the unknown-conversation entry at the merged row (or drop it once the
+        // sender resolves) so no stale local id lingers after recovery.
+        if (this.unknownSenders.some((m) => m.id === prior.message.id || m.id === message.id)) {
+          this.unknownSenders = this.unknownSenders
+            .map((m) => (m.id === prior.message.id || m.id === message.id ? merged : m))
+            .filter((m) => !m.contactKey && m.contactPrefix);
+        }
         return;
       }
       list.push(message);

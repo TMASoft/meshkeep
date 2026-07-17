@@ -372,6 +372,35 @@ describe("offline queue", () => {
     await recovered.source.stop();
   });
 
+  it("renders incoming messages locally while the server is unreachable, then reconciles on replay", async () => {
+    const failing = harness({ postFails: true });
+    await failing.source.start();
+    failing.localMessages.length = 0; // ignore anything drained during start
+    failing.connection.queuedSyncMessages.push({
+      channelMessage: { channelIdx: 0, pathLen: 1, txtType: 0, senderTimestamp: 9, text: "offline inbound" },
+    });
+    failing.connection.emit(Constants.PushCodes.MsgWaiting);
+
+    // shown right away with a synthetic negative id and queued for sync-back
+    await vi.waitFor(() => {
+      expect(failing.localMessages.some((m) => m.text === "offline inbound" && m.id < 0)).toBe(true);
+    });
+    const rendered = failing.localMessages.find((m) => m.text === "offline inbound")!;
+    expect(failing.queue.entries.some((e) => e.kind === "messages")).toBe(true);
+    await failing.source.stop();
+
+    // server back: replay reports the server row carrying the same ingestionId
+    const recovered = harness();
+    recovered.queue.entries = failing.queue.entries;
+    await recovered.source.start();
+    await vi.waitFor(() => {
+      const synced = recovered.syncedMessages.find((m) => m.text === "offline inbound");
+      expect(synced).toBeTruthy();
+      expect(synced!.ingestionId).toBe(rendered.ingestionId);
+    });
+    await recovered.source.stop();
+  });
+
   it("keeps a local ACK status and reports the server row when an offline send replays", async () => {
     const failing = harness({ postFails: true });
     await failing.source.start();

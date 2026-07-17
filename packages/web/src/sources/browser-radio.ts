@@ -283,8 +283,7 @@ export class BrowserRadioSource {
         if (this.privateSession) {
           for (const item of items) this.callbacks.onLocalMessage(this.toLocalMessage(item));
         } else {
-          // synced mode: the server broadcasts message.new over the WebSocket
-          await this.postOrQueue("messages", { messages: items });
+          await this.ingestIncoming(items);
         }
       }
     } finally {
@@ -293,6 +292,25 @@ export class BrowserRadioSource {
         this.drainAgain = false;
         void this.drainMessages();
       }
+    }
+  }
+
+  /**
+   * Sync incoming radio messages to the server. On success they arrive over the
+   * normal feed (the server broadcasts message.new and echoes the stored rows).
+   * When the server is unreachable, render them locally right away so offline
+   * incoming traffic is visible, and queue the batch for replay — recovery
+   * reconciles each local row with its server row by stable ingestionId, so no
+   * duplicate message, unread increment, recent entry, or notification is
+   * produced on flush.
+   */
+  private async ingestIncoming(items: IngestItem[]): Promise<void> {
+    try {
+      const result = await this.deps.postIngest("messages", { messages: items });
+      this.reportIngestResult("messages", result);
+    } catch {
+      for (const item of items) this.callbacks.onLocalMessage(this.toLocalMessage(item));
+      await this.deps.queue.put({ kind: "messages", payload: { messages: items } });
     }
   }
 

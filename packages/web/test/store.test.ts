@@ -463,6 +463,29 @@ describe("message handling", () => {
     expect(store.recent).toEqual([expect.objectContaining({ id: 31, status: "delivered" })]);
   });
 
+  it("reconciles an offline incoming unknown-sender row to its server row without duplicate side effects", () => {
+    const store = useAppStore();
+    const prefix = "abcdef123456";
+    const ingestionId = "00000000-0000-4000-8000-000000000059";
+    const unknownKey = conversationKey({ kind: "dm", contactPrefix: prefix });
+
+    // rendered locally while the server was unreachable (synthetic negative id)
+    store.appendMessage(message({ id: -1, contactKey: null, contactPrefix: prefix, ingestionId }));
+    expect(store.unread[unknownKey]).toBe(1);
+    expect(store.unknownSenders).toEqual([expect.objectContaining({ id: -1 })]);
+    expect(notifyIncomingMock).toHaveBeenCalledTimes(1);
+
+    // recovery: the same ingestion id replays (queue flush) and re-broadcasts (WS)
+    store.onEvent({ type: "message.new", message: message({ id: 59, contactKey: null, contactPrefix: prefix, ingestionId }) } as WsEvent);
+    store.onEvent({ type: "message.new", message: message({ id: 59, contactKey: null, contactPrefix: prefix, ingestionId }) } as WsEvent);
+
+    expect(store.conversations[unknownKey]).toEqual([expect.objectContaining({ id: 59, ingestionId })]);
+    expect(store.recent).toEqual([expect.objectContaining({ id: 59 })]);
+    expect(store.unknownSenders).toEqual([expect.objectContaining({ id: 59 })]); // repointed, not duplicated
+    expect(store.unread[unknownKey]).toBe(1); // counted once
+    expect(notifyIncomingMock).toHaveBeenCalledTimes(1); // notified once
+  });
+
   it("sendMessage posts a dm and appends the created message", async () => {
     const store = useAppStore();
     const created = message({ id: 9, direction: "out", text: "outbound", status: "pending" });
