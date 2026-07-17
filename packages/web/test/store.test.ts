@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import type { Message, WsEvent } from "@meshkeep/shared";
+import type { Message, MessageSearchResult, WsEvent } from "@meshkeep/shared";
 
 const apiMock = vi.hoisted(() => vi.fn());
 const connectEventsMock = vi.hoisted(() => vi.fn(() => () => {}));
@@ -48,6 +48,16 @@ vi.mock("../src/sources/browser-radio", () => ({
 import { useAppStore, conversationKey } from "../src/stores/app";
 
 const KEY_A = "a".repeat(64);
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+function searchResult(overrides: Partial<MessageSearchResult> = {}): MessageSearchResult {
+  return { ...message(), snippet: "hello", ...overrides };
+}
 
 function message(overrides: Partial<Message> = {}): Message {
   return {
@@ -134,6 +144,123 @@ describe("bootstrap and auth state", () => {
     apiMock.mockRejectedValueOnce(new ApiError(401, "wrong password"));
     const store = useAppStore();
     await expect(store.login("bad")).rejects.toThrow("Wrong password");
+  });
+});
+
+describe("bootstrap resilience", () => {
+  it("surfaces a snapshot failure, still starts the event feed, and recovers on retry", async () => {
+    let statusFails = true;
+    apiMock.mockImplementation((path: string) => {
+      switch (path) {
+        case "/auth/session":
+          return Promise.resolve({ passwordRequired: false, authorized: true });
+        case "/status":
+          return statusFails
+            ? Promise.reject(new Error("radio offline"))
+            : Promise.resolve({ connection: { state: "connected" }, self: null, batteryMilliVolts: null });
+        case "/contacts":
+          return Promise.resolve({ contacts: [] });
+        case "/channels":
+          return Promise.resolve({ channels: [] });
+        case "/messages/unknown-senders":
+          return Promise.resolve({ messages: [] });
+        case "/messages/unread":
+          return Promise.resolve({ conversations: [] });
+        default:
+          return Promise.reject(new Error(`unexpected ${path}`));
+      }
+    });
+    const store = useAppStore();
+
+    await store.bootstrap();
+    expect(store.bootstrapPhase).toBe("error");
+    expect(store.bootstrapError).toBe("radio offline");
+    expect(store.loaded).toBe(false);
+    // the live feed starts independently of the initial snapshot
+    expect(connectEventsMock).toHaveBeenCalledOnce();
+
+    statusFails = false;
+    await store.retryBootstrap();
+    expect(store.bootstrapPhase).toBe("ready");
+    expect(store.loaded).toBe(true);
+    expect(store.connectionState).toBe("connected");
+    // retry re-fetches the snapshot only; it must not restart the event feed
+    expect(connectEventsMock).toHaveBeenCalledOnce();
+  });
+
+  it("fails bootstrap without opening the event feed when the session request fails", async () => {
+    apiMock.mockRejectedValueOnce(new Error("network down"));
+    const store = useAppStore();
+    await store.bootstrap();
+    expect(store.bootstrapPhase).toBe("error");
+    expect(store.bootstrapError).toBe("network down");
+    expect(store.loaded).toBe(false);
+    expect(connectEventsMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("message search sequencing", () => {
+  it("discards an out-of-order stale response so the latest query wins", async () => {
+    const first = deferred<{ results: MessageSearchResult[] }>();
+    const second = deferred<{ results: MessageSearchResult[] }>();
+    apiMock.mockImplementationOnce(() => first.promise).mockImplementationOnce(() => second.promise);
+    const store = useAppStore();
+
+    const stale = store.searchMessages("alpha");
+    const latest = store.searchMessages("beta");
+    // the newer query resolves first, then the stale one lands late
+    second.resolve({ results: [searchResult({ id: 2, text: "beta" })] });
+    first.resolve({ results: [searchResult({ id: 1, text: "alpha" })] });
+
+    expect(await latest).toEqual([searchResult({ id: 2, text: "beta" })]);
+    expect(await stale).toBeNull(); // superseded — must not overwrite the latest
+  });
+
+  it("aborts a superseded in-flight search request", () => {
+    const signals: AbortSignal[] = [];
+    apiMock.mockImplementation((_path: string, options: RequestInit = {}) => {
+      signals.push(options.signal as AbortSignal);
+      return new Promise(() => {}); // never resolves
+    });
+    const store = useAppStore();
+
+    void store.searchMessages("alpha");
+    void store.searchMessages("beta");
+
+    expect(signals).toHaveLength(2);
+    expect(signals[0].aborted).toBe(true); // cancelled when the newer search started
+    expect(signals[1].aborted).toBe(false);
+  });
+});
+
+describe("diagnostics fetch", () => {
+  it("returns the server diagnostics payload", async () => {
+    const payload = { server: { version: "test" }, guidance: [] };
+    apiMock.mockResolvedValueOnce(payload);
+    const store = useAppStore();
+    const result = await store.fetchDiagnostics();
+    expect(apiMock).toHaveBeenCalledWith("/diagnostics");
+    expect(result).toBe(payload);
+  });
+});
+
+describe("battery display follows the active radio driver", () => {
+  it("prefers the browser-direct live reading over the stored server value", () => {
+    const store = useAppStore();
+    store.status = { batteryMilliVolts: 3600 } as typeof store.status;
+    // server driver: the stored value is shown
+    expect(store.batteryMilliVolts).toBe(3600);
+
+    // a browser-direct session reports its own live reading and wins
+    store.browserRadio = {
+      kind: "webserial",
+      state: "connected",
+      error: null,
+      privateSession: false,
+      batteryMilliVolts: 4100,
+    };
+    expect(store.batteryMilliVolts).toBe(4100);
+    expect(store.batteryPercent).toBe(89); // (4100-3300)/900 → 89%
   });
 });
 

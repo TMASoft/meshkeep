@@ -5,6 +5,7 @@ import { useAppStore } from "./stores/app";
 import AppIcon from "./components/AppIcon.vue";
 import LoginGate from "./components/LoginGate.vue";
 import {
+  clearNotificationNavigator,
   notificationsSupported,
   requestNotifyPermission,
   savedNotifyPref,
@@ -59,6 +60,7 @@ const navLinks = [
   { to: "/chat", label: "Comms", icon: "chat" as const },
   { to: "/map", label: "Network", icon: "map" as const },
   { to: "/device", label: "Radio", icon: "radio" as const },
+  { to: "/diagnostics", label: "Health", icon: "signal" as const },
 ];
 
 function applyAppearance() {
@@ -142,6 +144,7 @@ onBeforeUnmount(() => {
   media.removeEventListener("change", handleSystemTheme);
   document.removeEventListener("pointerdown", handlePointerDown);
   document.removeEventListener("keydown", handleKeydown);
+  clearNotificationNavigator();
 });
 
 const canLogout = computed(() => store.session?.passwordRequired && store.session.authorized);
@@ -246,7 +249,23 @@ const stateColor = computed(() => {
       </header>
 
       <main id="app-content" ref="appContent" class="app-content" tabindex="-1">
-        <RouterView />
+        <div
+          v-if="store.bootstrapPhase === 'loading' && !store.loaded"
+          class="bootstrap-state"
+          aria-live="polite"
+        >
+          <span class="bootstrap-spinner" aria-hidden="true" />
+          <p>Connecting to MeshKeep…</p>
+        </div>
+        <div v-else-if="store.bootstrapPhase === 'error'" class="bootstrap-state" role="alert">
+          <AppIcon name="radio" :size="30" />
+          <div>
+            <h2>Couldn't load MeshKeep</h2>
+            <p class="bootstrap-detail">{{ store.bootstrapError }}</p>
+          </div>
+          <button type="button" class="bootstrap-retry" @click="store.retryBootstrap()">Retry</button>
+        </div>
+        <RouterView v-else />
       </main>
     </section>
 
@@ -351,6 +370,14 @@ const stateColor = computed(() => {
 .state-light.standby { background: var(--cyan); box-shadow: 0 0 0 3px color-mix(in srgb, var(--cyan) 15%, transparent); }
 .app-content { min-height: 0; flex: 1; overflow: hidden; }
 .app-content:focus { outline: 0; }
+.bootstrap-state { display: flex; height: 100%; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px; color: var(--text-muted); text-align: center; }
+.bootstrap-state h2 { margin: 0 0 6px; font-size: 16px; color: var(--text); }
+.bootstrap-detail { margin: 0; max-width: 420px; font-size: 13px; color: var(--text-faint); word-break: break-word; }
+.bootstrap-spinner { width: 26px; height: 26px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: bootstrap-spin 700ms linear infinite; }
+.bootstrap-retry { min-height: 40px; padding: 0 18px; border: 1px solid var(--accent); border-radius: var(--radius-sm); background: var(--accent); color: var(--accent-ink); font-size: 13px; font-weight: 700; cursor: pointer; }
+.bootstrap-retry:hover { filter: brightness(1.05); }
+@keyframes bootstrap-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .bootstrap-spinner { animation-duration: 2.4s; } }
 .mobile-nav { display: none; }
 .mobile-appearance { display: none; width: 44px; height: 44px; place-items: center; border: 1px solid var(--border); border-radius: var(--radius-sm); background: transparent; color: var(--text-muted); }
 .appearance-panel { position: fixed; z-index: 3000; bottom: 82px; left: 100px; width: min(340px, calc(100vw - 32px)); border: 1px solid var(--border-strong); border-radius: var(--radius-lg); background: var(--surface-raised); padding: 18px; box-shadow: var(--shadow); }
@@ -383,7 +410,7 @@ const stateColor = computed(() => {
   .status-metric { height: 32px; border: 0; padding: 0 3px; }
   .connection-metric span:last-child { display: none; }
   .mobile-appearance { display: grid; }
-  .mobile-nav { position: relative; z-index: 1000; display: grid; height: calc(62px + env(safe-area-inset-bottom)); flex: 0 0 calc(62px + env(safe-area-inset-bottom)); grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--border); background: var(--surface-1); padding-bottom: env(safe-area-inset-bottom); }
+  .mobile-nav { position: relative; z-index: 1000; display: grid; height: calc(62px + env(safe-area-inset-bottom)); flex: 0 0 calc(62px + env(safe-area-inset-bottom)); grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--border); background: var(--surface-1); padding-bottom: env(safe-area-inset-bottom); }
   .mobile-nav-link { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; color: var(--text-faint); font-size: 10px; font-weight: 700; text-decoration: none; }
   .mobile-nav-link.router-link-active { color: var(--accent); }
   .mobile-nav-link.router-link-active::before { position: absolute; top: -1px; width: 32px; height: 2px; background: var(--accent); content: ""; }

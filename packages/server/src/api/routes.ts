@@ -6,7 +6,10 @@ import { listSerialPorts, scanBleRadios } from "../radio/detect.js";
 import type { MapCache } from "../map/cache.js";
 import type { Bus } from "../bus.js";
 import type { Auth } from "./auth.js";
-import { messagesToCsv } from "./export.js";
+import type { Db } from "../db/index.js";
+import type { ServerConfig } from "../config.js";
+import { csvHeaderRow, messageToCsvRow } from "./export.js";
+import { buildDiagnostics, buildSupportBundle } from "./diagnostics.js";
 import {
   ingestContactSchema,
   ingestContacts,
@@ -28,6 +31,13 @@ function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
     try {
       await fn(req, res);
     } catch (error) {
+      if (res.headersSent) {
+        // a streaming response already began — we cannot send an error body, so
+        // just log and abort the connection so the client sees a truncated body
+        console.error("[api] error after response started:", error);
+        res.destroy();
+        return;
+      }
       if (error instanceof z.ZodError) {
         res.status(400).json({ error: "invalid request", details: error.issues });
       } else if (error instanceof RadioUnavailableError) {
@@ -44,7 +54,13 @@ function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
   };
 }
 
-export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: Auth, bus: Bus): Router {
+export function buildApi(
+  manager: ConnectionManager,
+  mapCache: MapCache,
+  auth: Auth,
+  bus: Bus,
+  deps: { db: Db; config: ServerConfig; version: string },
+): Router {
   const api = Router();
   api.use(json({ limit: "1mb" }));
   // cross-site mutation defense applies to every route, including login
@@ -87,6 +103,28 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
     "/status",
     handle((_req, res) => {
       res.json(manager.status());
+    }),
+  );
+
+  // ---- diagnostics ----
+  // Aggregated, secret-free diagnostics for any authenticated client.
+  api.get(
+    "/diagnostics",
+    handle((_req, res) => {
+      res.json(buildDiagnostics(manager, deps.db, mapCache, deps.config, deps.version));
+    }),
+  );
+  // The support bundle carries effective config and recent logs; keep it
+  // session-only so an API token cannot exfiltrate it.
+  api.get(
+    "/diagnostics/bundle",
+    auth.sessionGuard,
+    handle((_req, res) => {
+      const bundle = buildSupportBundle(manager, deps.db, mapCache, deps.config, deps.version);
+      const stamp = new Date().toISOString().slice(0, 19).replaceAll(":", "-");
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="meshkeep-diagnostics-${stamp}.json"`);
+      res.json(bundle);
     }),
   );
 
@@ -217,7 +255,7 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
   );
   api.get(
     "/messages/export",
-    handle((req, res) => {
+    handle(async (req, res) => {
       const query = z
         .object({
           format: z.enum(["csv", "json"]).default("csv"),
@@ -227,20 +265,57 @@ export function buildApi(manager: ConnectionManager, mapCache: MapCache, auth: A
         })
         .refine(...atMostOneConversationFilter)
         .parse(req.query);
-      const messages = manager.store.getMessagesForExport({
+      // Stream matching history row-by-row so a large database neither buffers
+      // the whole export in memory nor blocks the event loop: backpressure
+      // (awaiting "drain") paces the write loop and yields to other requests.
+      const messages = manager.store.iterateMessagesForExport({
         contactKey: query.contact?.toLowerCase(),
         contactPrefix: query.sender?.toLowerCase(),
         channelIdx: query.channel,
       });
       const stamp = new Date().toISOString().slice(0, 10);
+      let clientGone = false;
+      res.on("close", () => {
+        clientGone = !res.writableEnded;
+      });
+      // Await backpressure relief, but never hang if the client disconnects
+      // while the buffer is full ("drain" would never arrive) — "close" resolves
+      // the wait so the loop can observe clientGone and finalize the iterator.
+      const write = (chunk: string): Promise<void> =>
+        new Promise<void>((resolve) => {
+          if (res.write(chunk)) {
+            resolve();
+            return;
+          }
+          const done = () => {
+            res.off("drain", done);
+            res.off("close", done);
+            resolve();
+          };
+          res.once("drain", done);
+          res.once("close", done);
+        });
       if (query.format === "json") {
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
         res.setHeader("Content-Disposition", `attachment; filename="meshkeep-messages-${stamp}.json"`);
-        res.json({ exportedAt: Math.floor(Date.now() / 1000), messages });
+        await write(`{"exportedAt":${Math.floor(Date.now() / 1000)},"messages":[`);
+        let first = true;
+        for (const message of messages) {
+          if (clientGone) return; // generator's finally finalizes the SQLite iterator
+          await write(`${first ? "" : ","}${JSON.stringify(message)}`);
+          first = false;
+        }
+        await write("]}");
       } else {
         res.setHeader("Content-Type", "text/csv; charset=utf-8");
         res.setHeader("Content-Disposition", `attachment; filename="meshkeep-messages-${stamp}.csv"`);
-        res.send(messagesToCsv(messages));
+        await write(csvHeaderRow());
+        for (const message of messages) {
+          if (clientGone) return;
+          await write(messageToCsvRow(message));
+        }
       }
+      res.end();
     }),
   );
   api.get(

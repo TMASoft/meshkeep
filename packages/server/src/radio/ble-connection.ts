@@ -1,6 +1,7 @@
 import { Connection, Constants } from "@liamcottle/meshcore.js";
 import { createBluetooth } from "node-ble";
 import type { Adapter, Device, GattCharacteristic } from "node-ble";
+import { leaseDiscovery, type DiscoveryLease } from "./ble-discovery.js";
 
 const DISCOVER_TIMEOUT_MS = 30_000;
 
@@ -22,7 +23,7 @@ export class BleNodeConnection extends Connection {
   private device: Device | null = null;
   private rx: GattCharacteristic | null = null;
   private tx: GattCharacteristic | null = null;
-  private startedDiscovery = false;
+  private releaseDiscovery: DiscoveryLease | null = null;
 
   constructor(private readonly address: string) {
     super();
@@ -33,14 +34,9 @@ export class BleNodeConnection extends Connection {
     this.destroyBluetooth = destroy;
     try {
       this.adapter = await bluetooth.defaultAdapter();
-      if (!(await this.adapter.isDiscovering())) {
-        try {
-          await this.adapter.startDiscovery();
-          this.startedDiscovery = true;
-        } catch {
-          // another BlueZ client may already be discovering; waitDevice still works
-        }
-      }
+      // Own discovery through the lease; close() releases it on every failure
+      // path (wait timeout, pairing, connect, GATT), never leaving it running.
+      this.releaseDiscovery = await leaseDiscovery(this.adapter);
 
       this.device = await this.adapter.waitDevice(this.address.toUpperCase(), DISCOVER_TIMEOUT_MS);
 
@@ -74,9 +70,9 @@ export class BleNodeConnection extends Connection {
         this.onDisconnected();
       });
 
-      if (this.startedDiscovery) {
-        void this.adapter.stopDiscovery().catch(() => {});
-      }
+      // connected — discovery is no longer needed
+      await this.releaseDiscovery();
+      this.releaseDiscovery = null;
 
       await this.onConnected();
     } catch (error) {
@@ -95,11 +91,11 @@ export class BleNodeConnection extends Connection {
       await this.device.disconnect().catch(() => {});
       this.device = null;
     }
-    if (this.startedDiscovery && this.adapter) {
-      await this.adapter.stopDiscovery().catch(() => {});
+    if (this.releaseDiscovery) {
+      await this.releaseDiscovery();
+      this.releaseDiscovery = null;
     }
     this.adapter = null;
-    this.startedDiscovery = false;
     if (this.destroyBluetooth) {
       this.destroyBluetooth();
       this.destroyBluetooth = null;

@@ -523,7 +523,7 @@ onMounted(() => {
               </div>
               <div>
                 <dt>Battery</dt>
-                <dd>{{ store.status?.batteryMilliVolts ?? "—" }} <small>mV</small></dd>
+                <dd>{{ store.batteryMilliVolts ?? "—" }} <small>mV</small></dd>
               </div>
             </dl>
 

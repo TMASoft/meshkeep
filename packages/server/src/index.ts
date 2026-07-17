@@ -10,8 +10,12 @@ import { ConnectionManager } from "./radio/manager.js";
 import { MapCache } from "./map/cache.js";
 import { Auth } from "./api/auth.js";
 import { buildApi } from "./api/routes.js";
+import { buildHealth } from "./api/health.js";
 import { attachWs } from "./api/ws.js";
 import { gracefulShutdown } from "./shutdown.js";
+import { logger } from "./logger.js";
+
+const log = logger("meshkeep");
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 
@@ -34,10 +38,8 @@ const auth = new Auth(db, config.uiPassword);
 
 const app = express();
 app.disable("x-powered-by");
-app.get("/api/healthz", (_req, res) => {
-  res.json({ ok: true, version });
-});
-app.use("/api/v1", buildApi(manager, mapCache, auth, bus));
+app.use("/api", buildHealth(db, version));
+app.use("/api/v1", buildApi(manager, mapCache, auth, bus, { db, config, version }));
 
 // serve the built web app when present (production image); dev uses vite
 const webDist = [join(here, "..", "..", "web", "dist"), join(here, "..", "public")].find((dir) =>
@@ -54,9 +56,12 @@ const server = createServer(app);
 const wss = attachWs(server, bus, auth);
 
 server.listen(config.port, () => {
-  console.log(`[meshkeep] v${version} listening on :${config.port}`);
-  console.log(`[meshkeep] data dir: ${resolve(config.dataDir)}`);
-  console.log(`[meshkeep] radio transport: ${config.connection ?? "none (set MESHKEEP_CONNECTION)"}`);
+  log.info("listening", {
+    version,
+    port: config.port,
+    dataDir: resolve(config.dataDir),
+    transport: config.connection ?? "none",
+  });
 });
 
 void manager.start();
@@ -64,11 +69,11 @@ void manager.start();
 let shuttingDown = false;
 async function shutdown(): Promise<void> {
   if (shuttingDown) {
-    console.error("[meshkeep] second signal — exiting immediately");
+    log.error("second signal — exiting immediately");
     process.exit(1);
   }
   shuttingDown = true;
-  console.log("[meshkeep] shutting down");
+  log.info("shutting down");
   const result = await gracefulShutdown({ manager, wss, server, db });
   process.exit(result === "clean" ? 0 : 1);
 }

@@ -384,6 +384,19 @@ export class Store {
 
   /** Every message of a conversation (or everything), oldest first, for export. */
   getMessagesForExport(opts: { contactKey?: string; contactPrefix?: string; channelIdx?: number } = {}): Message[] {
+    return [...this.iterateMessagesForExport(opts)];
+  }
+
+  /**
+   * Stream matching messages oldest-first without materializing the whole
+   * history: better-sqlite3's row iterator keeps only one row in memory at a
+   * time, so a large persistent database exports with bounded memory. The
+   * underlying statement iterator is finalized when the consumer stops early
+   * (a broken `for..of` calls the generator's `return`).
+   */
+  *iterateMessagesForExport(
+    opts: { contactKey?: string; contactPrefix?: string; channelIdx?: number } = {},
+  ): Generator<Message> {
     const clauses: string[] = [];
     const params: Record<string, unknown> = {};
     if (opts.contactKey !== undefined) {
@@ -397,8 +410,10 @@ export class Store {
       params.channelIdx = opts.channelIdx;
     }
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-    const rows = this.db.prepare(`${MESSAGE_SELECT} ${where} ORDER BY m.id ASC`).all(params) as MessageRow[];
-    return rows.map(rowToMessage);
+    const stmt = this.db.prepare(`${MESSAGE_SELECT} ${where} ORDER BY m.id ASC`);
+    for (const row of stmt.iterate(params) as IterableIterator<MessageRow>) {
+      yield rowToMessage(row);
+    }
   }
 
   getUnknownDirectMessages(): Message[] {

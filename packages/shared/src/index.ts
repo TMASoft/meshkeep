@@ -110,6 +110,38 @@ export interface AppStatus {
   version: string;
 }
 
+/** SQLite durability snapshot surfaced by the diagnostics endpoint. */
+export interface DatabaseDiagnostics {
+  integrity: string;
+  foreignKeyViolations: number;
+  journalMode: string;
+  synchronous: number;
+  busyTimeoutMs: number;
+  schemaVersion: number;
+  latestSchemaVersion: number;
+  pageSizeBytes: number;
+  pageCount: number;
+  freelistPages: number;
+  sizeBytes: number;
+  walPages: number;
+}
+
+/**
+ * Aggregated, secret-free diagnostics for the diagnostics page and support
+ * bundle. Contains no message content, credentials, or private keys.
+ */
+export interface ServerDiagnostics {
+  server: { version: string; uptimeSeconds: number; nodeVersion: string; platform: string };
+  connection: ConnectionStatus & { reconnectScheduled: boolean; reconnectDelayMs: number };
+  firmware: { version: number | null; buildDate: string | null; model: string | null };
+  radio: { freqHz: number | null; bandwidthHz: number | null; spreadingFactor: number | null; codingRate: number | null } | null;
+  database: DatabaseDiagnostics;
+  map: { enabled: boolean; fetchedAt: number | null; lastError: string | null };
+  counts: { contacts: number; messages: number; unread: number };
+  /** Actionable operator guidance (e.g. firmware/compatibility warnings). */
+  guidance: string[];
+}
+
 /** Remote node stats returned by a repeater/room server status request. */
 export interface NodeStats {
   battMilliVolts: number;

@@ -9,6 +9,7 @@ import type {
   MessageSearchResult,
   NodeStats,
   SensorReading,
+  ServerDiagnostics,
   WsEvent,
 } from "@meshkeep/shared";
 import { api, ApiError, connectEvents, type WsStatus } from "../api/client";
@@ -17,6 +18,12 @@ import { notifyIncoming } from "../notifications";
 
 // lives outside the store: holds a live connection object, must not be reactive
 let browserSource: BrowserRadioSource | null = null;
+
+// Search request sequencing lives outside the store (an AbortController must not
+// be made reactive). `searchSeq` guards against out-of-order responses; the
+// controller cancels a superseded in-flight request.
+let searchController: AbortController | null = null;
+let searchSeq = 0;
 
 /**
  * What the active radio driver supports. Browser-direct sessions drive a
@@ -97,6 +104,11 @@ export const useAppStore = defineStore("app", {
     // room servers / repeaters this session has authenticated with
     nodeLogins: {} as Record<string, boolean>,
     loaded: false,
+    // Bootstrap lifecycle: "idle" before it runs (and between the login gate and
+    // login), "loading" while fetching the initial snapshot, "ready" once loaded,
+    // "error" when a request failed and the user can retry.
+    bootstrapPhase: "idle" as "idle" | "loading" | "ready" | "error",
+    bootstrapError: null as string | null,
     stopEvents: null as null | (() => void),
     browserRadio: null as null | {
       kind: BrowserRadioKind;
@@ -126,8 +138,15 @@ export const useAppStore = defineStore("app", {
       };
     },
     self: (state) => state.status?.self ?? null,
-    batteryPercent: (state): number | null => {
-      const mv = state.browserRadio?.batteryMilliVolts ?? state.status?.batteryMilliVolts;
+    /**
+     * Battery millivolts from whichever radio driver is active: a browser-direct
+     * session reports its own live reading, so prefer it over the server's stored
+     * value (which belongs to the standby server radio and may be stale).
+     */
+    batteryMilliVolts: (state): number | null =>
+      state.browserRadio?.batteryMilliVolts ?? state.status?.batteryMilliVolts ?? null,
+    batteryPercent(): number | null {
+      const mv = this.batteryMilliVolts;
       if (!mv) return null;
       // rough LiPo curve: 3.3V empty → 4.2V full
       return Math.max(0, Math.min(100, Math.round(((mv - 3300) / 900) * 100)));
@@ -138,23 +157,63 @@ export const useAppStore = defineStore("app", {
 
   actions: {
     async bootstrap() {
-      if (this.loaded) return;
-      this.session = await api<{ passwordRequired: boolean; authorized: boolean }>("/auth/session");
-      if (this.needsLogin) return; // LoginGate takes over; bootstrap resumes after login()
-      await Promise.all([
-        this.refreshStatus(),
-        this.refreshContacts(),
-        this.refreshChannels(),
-        this.refreshUnknownSenders(),
-        this.refreshUnread(),
-      ]);
+      if (this.bootstrapPhase === "loading" || this.bootstrapPhase === "ready") return;
+      this.bootstrapPhase = "loading";
+      this.bootstrapError = null;
+      try {
+        this.session = await api<{ passwordRequired: boolean; authorized: boolean }>("/auth/session");
+      } catch (error) {
+        this.failBootstrap(error);
+        return;
+      }
+      if (this.needsLogin) {
+        // LoginGate takes over; bootstrap resumes after login(). Not loaded and
+        // not an error — reset so the post-login bootstrap() runs.
+        this.bootstrapPhase = "idle";
+        return;
+      }
+      // Start the live event feed independently of the initial snapshot: if a
+      // snapshot request fails and the retry screen is showing, live updates
+      // keep flowing, and a retry only re-fetches the snapshot (never restarts
+      // the feed).
+      this.startEvents();
+      try {
+        await Promise.all([
+          this.refreshStatus(),
+          this.refreshContacts(),
+          this.refreshChannels(),
+          this.refreshUnknownSenders(),
+          this.refreshUnread(),
+        ]);
+      } catch (error) {
+        this.failBootstrap(error);
+        return;
+      }
+      this.loaded = true;
+      this.bootstrapPhase = "ready";
+    },
+
+    /** Open the WebSocket event feed once; subsequent calls are no-ops. */
+    startEvents() {
+      if (this.stopEvents) return;
       this.stopEvents = connectEvents(
         (event) => this.onEvent(event),
         (status) => {
           this.wsStatus = status;
         },
       );
-      this.loaded = true;
+    },
+
+    failBootstrap(error: unknown) {
+      this.bootstrapError = error instanceof Error ? error.message : "Failed to load MeshKeep";
+      this.bootstrapPhase = "error";
+    },
+
+    /** Re-run bootstrap after a failure (used by the retry control). */
+    async retryBootstrap() {
+      if (this.bootstrapPhase === "loading") return;
+      this.bootstrapPhase = "idle";
+      await this.bootstrap();
     },
 
     async login(password: string) {
@@ -239,11 +298,28 @@ export const useAppStore = defineStore("app", {
       }).catch(() => {});
     },
 
-    async searchMessages(query: string): Promise<MessageSearchResult[]> {
-      const { results } = await api<{ results: MessageSearchResult[] }>(
-        `/messages/search?q=${encodeURIComponent(query)}&limit=20`,
-      );
-      return results;
+    /**
+     * Search messages, cancelling any in-flight search first. Returns `null`
+     * when a newer search superseded this one (including its own abort), so the
+     * caller keeps the latest results instead of a stale response winning.
+     */
+    async searchMessages(query: string): Promise<MessageSearchResult[] | null> {
+      searchController?.abort();
+      const controller = new AbortController();
+      searchController = controller;
+      const seq = ++searchSeq;
+      try {
+        const { results } = await api<{ results: MessageSearchResult[] }>(
+          `/messages/search?q=${encodeURIComponent(query)}&limit=20`,
+          { signal: controller.signal },
+        );
+        return seq === searchSeq ? results : null;
+      } catch (error) {
+        if (seq !== searchSeq) return null; // superseded (typically our own abort)
+        throw error;
+      } finally {
+        if (searchController === controller) searchController = null;
+      }
     },
 
     /**
@@ -315,6 +391,11 @@ export const useAppStore = defineStore("app", {
       this.requireServerRadio(this.capabilities.nodeTools);
       const { status } = await api<{ status: NodeStats }>(`/contacts/${contactKey}/status`);
       return status;
+    },
+
+    /** Aggregated, secret-free server diagnostics for the diagnostics page. */
+    async fetchDiagnostics(): Promise<ServerDiagnostics> {
+      return await api<ServerDiagnostics>("/diagnostics");
     },
 
     async fetchTelemetry(contactKey: string): Promise<SensorReading[]> {

@@ -137,6 +137,25 @@ describe("auth: API tokens", () => {
       .set("Authorization", `Bearer ${created.body.token}`)
       .expect(401);
   });
+
+  it("serves the diagnostics bundle to a session but never to a bearer token", async () => {
+    const cookie = await authed();
+    const created = await request(app)
+      .post("/api/v1/tokens")
+      .set("Cookie", cookie)
+      .send({ label: "read-bot" })
+      .expect(201);
+
+    // a session cookie may download the bundle
+    await request(app).get("/api/v1/diagnostics/bundle").set("Cookie", cookie).expect(200);
+    // a valid bearer token can read plain diagnostics…
+    await request(app).get("/api/v1/diagnostics").set("Authorization", `Bearer ${created.body.token}`).expect(200);
+    // …but is refused the config/log-bearing bundle (session-only)
+    await request(app)
+      .get("/api/v1/diagnostics/bundle")
+      .set("Authorization", `Bearer ${created.body.token}`)
+      .expect(403);
+  });
 });
 
 describe("auth: session persistence", () => {

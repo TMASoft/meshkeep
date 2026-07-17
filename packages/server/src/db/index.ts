@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import type { DatabaseDiagnostics } from "@meshkeep/shared";
 
 const MIGRATIONS: string[] = [
   // 1: initial schema
@@ -178,8 +179,39 @@ export function openDb(path: string): Db {
   const db = new Database(path);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
+  // Wait up to 5s for a competing writer instead of failing fast with
+  // SQLITE_BUSY. Writes are short and serialized within the process; contention
+  // only arises from an external reader (a backup, the sqlite3 CLI) briefly
+  // holding the database. WAL keeps readers from blocking the writer.
+  db.pragma("busy_timeout = 5000");
   migrate(db);
   return db;
+}
+
+/**
+ * Read-only durability snapshot for diagnostics. `integrity_check` scans the
+ * whole database, so this is an operator action, not a hot path.
+ */
+export function databaseDiagnostics(db: Db): DatabaseDiagnostics {
+  const integrityRows = db.pragma("integrity_check") as { integrity_check: string }[];
+  const fkRows = db.pragma("foreign_key_check") as unknown[];
+  const pageSize = db.pragma("page_size", { simple: true }) as number;
+  const pageCount = db.pragma("page_count", { simple: true }) as number;
+  const walRow = db.pragma("wal_checkpoint(PASSIVE)") as { log: number; checkpointed: number }[];
+  return {
+    integrity: integrityRows.map((row) => row.integrity_check).join("; "),
+    foreignKeyViolations: fkRows.length,
+    journalMode: db.pragma("journal_mode", { simple: true }) as string,
+    synchronous: db.pragma("synchronous", { simple: true }) as number,
+    busyTimeoutMs: db.pragma("busy_timeout", { simple: true }) as number,
+    schemaVersion: db.pragma("user_version", { simple: true }) as number,
+    latestSchemaVersion: MIGRATIONS.length,
+    pageSizeBytes: pageSize,
+    pageCount,
+    freelistPages: db.pragma("freelist_count", { simple: true }) as number,
+    sizeBytes: pageSize * pageCount,
+    walPages: walRow[0]?.log ?? 0,
+  };
 }
 
 function migrate(db: Db): void {
@@ -190,6 +222,21 @@ function migrate(db: Db): void {
       db.pragma(`user_version = ${version + 1}`);
     });
     apply();
+  }
+}
+
+/**
+ * Cheap liveness-of-storage check for the readiness probe: a trivial query must
+ * succeed and the schema must be fully migrated. Unlike `databaseDiagnostics`
+ * this does no full-table scan, so it is safe to poll frequently.
+ */
+export function databaseReady(db: Db): { ready: boolean; schemaVersion: number; latestSchemaVersion: number } {
+  try {
+    db.prepare("SELECT 1").get();
+    const schemaVersion = db.pragma("user_version", { simple: true }) as number;
+    return { ready: schemaVersion === MIGRATIONS.length, schemaVersion, latestSchemaVersion: MIGRATIONS.length };
+  } catch {
+    return { ready: false, schemaVersion: -1, latestSchemaVersion: MIGRATIONS.length };
   }
 }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Contact, Message, SelfInfo, WsEvent } from "@meshkeep/shared";
-import { messagesToCsv } from "../src/api/export.js";
+import { csvHeaderRow, messageToCsvRow, messagesToCsv } from "../src/api/export.js";
 import { ingestContacts, ingestMessages, ingestSelf } from "../src/api/ingest.js";
 import { openDb } from "../src/db/index.js";
 import { Store } from "../src/db/store.js";
@@ -51,6 +51,48 @@ describe("messagesToCsv", () => {
       message({ kind: "channel", contactKey: null, contactName: null, channelIdx: 2, channelName: null }),
     ]);
     expect(csv).toContain("channel 2");
+  });
+
+  it("composes the same output from the streaming header and per-row helpers", () => {
+    const list = [message(), message({ id: 2, text: "=DANGER,formula" })];
+    const streamed = csvHeaderRow() + list.map(messageToCsvRow).join("");
+    expect(streamed).toBe(messagesToCsv(list));
+    // formula neutralization is preserved on the per-row path used by streaming
+    expect(list.map(messageToCsvRow).join("")).toContain("\"'=DANGER,formula\"");
+  });
+});
+
+describe("streaming message export", () => {
+  it("yields the full history oldest-first, matching the buffered export", () => {
+    const store = new Store(openDb(":memory:"));
+    const count = 500;
+    for (let i = 0; i < count; i++) {
+      store.insertMessage({ kind: "channel", channelIdx: 1, direction: "in", text: `m${i}`, senderTimestamp: 1_000 + i });
+    }
+
+    const streamed = [...store.iterateMessagesForExport({ channelIdx: 1 })];
+    expect(streamed).toHaveLength(count);
+    expect(streamed[0]!.text).toBe("m0");
+    expect(streamed.at(-1)!.text).toBe(`m${count - 1}`);
+    for (let i = 1; i < streamed.length; i++) {
+      expect(streamed[i]!.id).toBeGreaterThan(streamed[i - 1]!.id); // ascending id order
+    }
+    // the buffered convenience wrapper returns the identical sequence
+    expect(store.getMessagesForExport({ channelIdx: 1 }).map((m) => m.id)).toEqual(streamed.map((m) => m.id));
+  });
+
+  it("finalizes the statement cleanly when the consumer stops early", () => {
+    const store = new Store(openDb(":memory:"));
+    for (let i = 0; i < 10; i++) {
+      store.insertMessage({ kind: "channel", channelIdx: 2, direction: "in", text: `x${i}`, senderTimestamp: i });
+    }
+
+    const iterator = store.iterateMessagesForExport({ channelIdx: 2 });
+    expect(iterator.next().value?.text).toBe("x0");
+    // abandoning mid-stream (as a disconnecting client does) must not throw
+    expect(() => iterator.return(undefined)).not.toThrow();
+    // and the store stays usable — the SQLite iterator was released
+    expect(store.getMessagesForExport({ channelIdx: 2 })).toHaveLength(10);
   });
 });
 

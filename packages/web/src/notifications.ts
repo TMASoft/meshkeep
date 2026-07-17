@@ -45,6 +45,15 @@ export function setNotificationNavigator(fn: (id: ConversationId) => void): void
 }
 
 /**
+ * Drop the registered navigator (App unmount). Without this the module-global
+ * callback keeps a stale App instance — and its router — alive, and a
+ * notification click would route through the torn-down instance.
+ */
+export function clearNotificationNavigator(): void {
+  navigate = null;
+}
+
+/**
  * Notify for an incoming message when the tab is hidden or the conversation
  * isn't the active one. Messages arriving in the active, visible conversation
  * never notify (they're already on screen — mirrors the unread accounting).

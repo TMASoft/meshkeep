@@ -185,6 +185,11 @@ export class ConnectionManager {
     };
   }
 
+  /** Whether a reconnect is scheduled and its current backoff delay, for diagnostics. */
+  reconnectState(): { scheduled: boolean; delayMs: number } {
+    return { scheduled: this.reconnectTimer !== null, delayMs: this.reconnectDelay };
+  }
+
   async start(): Promise<void> {
     if (this.connectionSettings().effective.connection === "none") {
       this.setState("disconnected", "no radio transport configured");

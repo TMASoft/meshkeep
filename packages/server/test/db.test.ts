@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { openDb } from "../src/db/index.js";
+import { databaseDiagnostics, openDb } from "../src/db/index.js";
 
 describe("database migrations", () => {
   it("separates legacy sender prefixes without changing known full keys", () => {
@@ -93,6 +93,53 @@ describe("database migrations", () => {
     expect(() => db.prepare("UPDATE messages SET channel_idx = 5 WHERE kind = 'dm' AND contact_key IS NOT NULL").run()).toThrow(
       /no channel index/,
     );
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+});
+
+describe("openDb durability configuration", () => {
+  it("enables WAL, foreign keys, and a busy timeout", () => {
+    const db = openDb(":memory:");
+    // :memory: reports "memory" journal mode; a file database reports "wal"
+    expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+    expect(db.pragma("busy_timeout", { simple: true })).toBe(5000);
+    db.close();
+  });
+
+  it("reports WAL on a real file database", () => {
+    const directory = mkdtempSync(join(tmpdir(), "meshkeep-db-"));
+    const db = openDb(join(directory, "meshkeep.db"));
+    expect(String(db.pragma("journal_mode", { simple: true })).toLowerCase()).toBe("wal");
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+});
+
+describe("databaseDiagnostics", () => {
+  it("reports a clean, fully-migrated database", () => {
+    const db = openDb(":memory:");
+    const diag = databaseDiagnostics(db);
+    expect(diag.integrity).toBe("ok");
+    expect(diag.foreignKeyViolations).toBe(0);
+    expect(diag.busyTimeoutMs).toBe(5000);
+    // a freshly opened database is migrated to the latest schema
+    expect(diag.schemaVersion).toBe(diag.latestSchemaVersion);
+    expect(diag.latestSchemaVersion).toBeGreaterThanOrEqual(8);
+    expect(diag.pageSizeBytes).toBeGreaterThan(0);
+    expect(diag.pageCount).toBeGreaterThan(0);
+    expect(diag.sizeBytes).toBe(diag.pageSizeBytes * diag.pageCount);
+    db.close();
+  });
+
+  it("surfaces a partially-migrated schema version", () => {
+    const directory = mkdtempSync(join(tmpdir(), "meshkeep-db-"));
+    const db = openDb(join(directory, "meshkeep.db"));
+    const latest = databaseDiagnostics(db).latestSchemaVersion;
+    db.pragma("user_version = 3"); // simulate an interrupted/older upgrade
+    const diag = databaseDiagnostics(db);
+    expect(diag.schemaVersion).toBe(3);
+    expect(diag.schemaVersion).toBeLessThan(latest);
     db.close();
     rmSync(directory, { recursive: true, force: true });
   });

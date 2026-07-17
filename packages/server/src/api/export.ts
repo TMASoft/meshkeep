@@ -25,26 +25,32 @@ function csvField(value: string | number | null | undefined): string {
   return text;
 }
 
+/** The CSV header line, terminated with CRLF, for streaming exports. */
+export function csvHeaderRow(): string {
+  return `${CSV_COLUMNS.join(",")}\r\n`;
+}
+
+/** One message rendered as a CRLF-terminated CSV row (formula-neutralized). */
+export function messageToCsvRow(message: Message): string {
+  const counterparty =
+    message.kind === "dm"
+      ? message.contactName ?? message.contactKey
+      : message.channelName ?? `channel ${message.channelIdx}`;
+  return `${[
+    csvField(message.id),
+    csvField(message.kind),
+    csvField(message.direction),
+    csvField(counterparty),
+    csvField(message.contactKey),
+    csvField(message.channelIdx),
+    csvField(message.text),
+    csvField(new Date(message.senderTimestamp * 1000).toISOString()),
+    csvField(message.status),
+  ].join(",")}\r\n`;
+}
+
 export function messagesToCsv(messages: Message[]): string {
-  const lines = [CSV_COLUMNS.join(",")];
-  for (const message of messages) {
-    const counterparty =
-      message.kind === "dm"
-        ? message.contactName ?? message.contactKey
-        : message.channelName ?? `channel ${message.channelIdx}`;
-    lines.push(
-      [
-        csvField(message.id),
-        csvField(message.kind),
-        csvField(message.direction),
-        csvField(counterparty),
-        csvField(message.contactKey),
-        csvField(message.channelIdx),
-        csvField(message.text),
-        csvField(new Date(message.senderTimestamp * 1000).toISOString()),
-        csvField(message.status),
-      ].join(","),
-    );
-  }
-  return `${lines.join("\r\n")}\r\n`;
+  let out = csvHeaderRow();
+  for (const message of messages) out += messageToCsvRow(message);
+  return out;
 }

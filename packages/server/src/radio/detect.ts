@@ -3,6 +3,7 @@ import { SerialPort } from "serialport";
 import { Constants } from "@liamcottle/meshcore.js";
 import { createBluetooth } from "node-ble";
 import type { DetectedSerialPort, BleCandidate } from "@meshkeep/shared";
+import { leaseDiscovery } from "./ble-discovery.js";
 
 // Exact VID:PID matches for boards we can name outright.
 const KNOWN_BOARDS: Record<string, string> = {
@@ -81,41 +82,37 @@ const NUS_SERVICE_UUID = Constants.Ble.ServiceUuid.toLowerCase();
  */
 export async function scanBleRadios(durationMs: number): Promise<BleCandidate[]> {
   const { bluetooth, destroy } = createBluetooth();
-  let startedDiscovery = false;
   try {
     const adapter = await bluetooth.defaultAdapter();
-    if (!(await adapter.isDiscovering())) {
-      try {
-        await adapter.startDiscovery();
-        startedDiscovery = true;
-      } catch {
-        // another BlueZ client is already discovering — its scan feeds us too
-      }
-    }
-    await new Promise((resolve) => setTimeout(resolve, durationMs));
+    const releaseDiscovery = await leaseDiscovery(adapter);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, durationMs));
 
-    const candidates: BleCandidate[] = [];
-    for (const address of await adapter.devices()) {
-      try {
-        const device = await adapter.getDevice(address);
-        const helper = (device as unknown as { helper: { prop(name: string): Promise<unknown> } }).helper;
-        const name = await device.getName().catch(() => null);
-        const uuids = (await helper.prop("UUIDs").catch(() => [])) as string[];
-        const nus = uuids.some((uuid) => uuid.toLowerCase() === NUS_SERVICE_UUID);
-        if (!nus && !name) continue; // anonymous non-radio advertisements are noise
-        candidates.push({
-          address,
-          name,
-          rssi: (await device.getRSSI().catch(() => null)) as number | null,
-          paired: Boolean(await device.isPaired().catch(() => false)),
-          nus,
-        });
-      } catch {
-        // device vanished mid-scan
+      const candidates: BleCandidate[] = [];
+      for (const address of await adapter.devices()) {
+        try {
+          const device = await adapter.getDevice(address);
+          const helper = (device as unknown as { helper: { prop(name: string): Promise<unknown> } }).helper;
+          const name = await device.getName().catch(() => null);
+          const uuids = (await helper.prop("UUIDs").catch(() => [])) as string[];
+          const nus = uuids.some((uuid) => uuid.toLowerCase() === NUS_SERVICE_UUID);
+          if (!nus && !name) continue; // anonymous non-radio advertisements are noise
+          candidates.push({
+            address,
+            name,
+            rssi: (await device.getRSSI().catch(() => null)) as number | null,
+            paired: Boolean(await device.isPaired().catch(() => false)),
+            nus,
+          });
+        } catch {
+          // device vanished mid-scan
+        }
       }
+      return candidates.sort((a, b) => Number(b.nus) - Number(a.nus) || (b.rssi ?? -999) - (a.rssi ?? -999));
+    } finally {
+      // stop discovery even if adapter.devices() (or the wait) threw
+      await releaseDiscovery();
     }
-    if (startedDiscovery) await adapter.stopDiscovery().catch(() => {});
-    return candidates.sort((a, b) => Number(b.nus) - Number(a.nus) || (b.rssi ?? -999) - (a.rssi ?? -999));
   } finally {
     destroy();
   }

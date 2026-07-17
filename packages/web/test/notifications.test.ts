@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Message } from "@meshkeep/shared";
-import { notifyIncoming, setNotificationNavigator, savedNotifyPref } from "../src/notifications";
+import {
+  clearNotificationNavigator,
+  notifyIncoming,
+  setNotificationNavigator,
+  savedNotifyPref,
+} from "../src/notifications";
 
 const constructed: { title: string; options: NotificationOptions; onclick: (() => void) | null; close: () => void }[] =
   [];
@@ -120,5 +125,17 @@ describe("notifyIncoming", () => {
   it("treats a stored garbage preference as off", () => {
     pref = "banana";
     expect(savedNotifyPref()).toBe("off");
+  });
+
+  it("does not navigate after the navigator is cleared on unmount", () => {
+    pref = "dms";
+    clearNotificationNavigator();
+    notifyIncoming(message(), { conversationActive: false });
+    expect(constructed).toHaveLength(1);
+    // the notification still fires, but clicking it must not route through a
+    // torn-down App instance
+    constructed[0]!.onclick?.();
+    expect(focus).toHaveBeenCalled();
+    expect(navigate).not.toHaveBeenCalled();
   });
 });

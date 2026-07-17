@@ -7,6 +7,7 @@ import { ConnectionManager } from "../src/radio/manager.js";
 import { MapCache } from "../src/map/cache.js";
 import { Auth } from "../src/api/auth.js";
 import { buildApi } from "../src/api/routes.js";
+import { buildHealth } from "../src/api/health.js";
 import type { ServerConfig } from "../src/config.js";
 
 export function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
@@ -50,10 +51,8 @@ export function buildHarness(overrides: Partial<ServerConfig> = {}): Harness {
   const auth = new Auth(db, config.uiPassword);
   const app = express();
   app.disable("x-powered-by");
-  app.get("/api/healthz", (_req, res) => {
-    res.json({ ok: true, version: "test" });
-  });
-  app.use("/api/v1", buildApi(manager, mapCache, auth, bus));
+  app.use("/api", buildHealth(db, "test"));
+  app.use("/api/v1", buildApi(manager, mapCache, auth, bus, { db, config, version: "test" }));
   return { app, db, bus, manager, auth };
 }
 

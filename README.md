@@ -101,6 +101,7 @@ a BLE radio near your *browsing* device is often better served by browser-direct
 | `MESHKEEP_TELEMETRY_RETENTION_DAYS` | `30` | trim battery telemetry older than this |
 | `MESHKEEP_MAP_REFRESH_MINUTES` | `10` | min interval between upstream map fetches |
 | `MESHKEEP_MAP_ENABLED` | `true` | set `false` to disable the global map layer |
+| `MESHKEEP_LOG_LEVEL` | `info` | stdout log verbosity: `debug`, `info`, `warn`, `error` |
 
 Connection settings can also be changed at runtime from Radio → Connection; a saved
 override wins over the environment until you reset it. The form detects candidate
@@ -144,6 +145,15 @@ npm run typecheck
 ```
 
 With a real radio: `MESHKEEP_CONNECTION=serial MESHKEEP_SERIAL_PORT=/dev/ttyACM0 npm run dev`.
+
+## Operations
+
+- Liveness `GET /api/healthz`, readiness `GET /api/readyz` (503 until the schema
+  is migrated) — both outside the authenticated API for orchestrator probes.
+- The **Health** tab (and `GET /api/v1/diagnostics`) shows transport, firmware,
+  database, and map diagnostics; download a redacted support bundle from there.
+- Backup, restore, upgrade/rollback, integrity checks, and write-contention
+  behavior are documented in [`docs/operations.md`](docs/operations.md).
 
 ## License
 

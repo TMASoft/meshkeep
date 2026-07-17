@@ -13,11 +13,52 @@ describe("http: status and health", () => {
     expect(res.body).toEqual({ ok: true, version: "test" });
   });
 
+  it("readyz reports readiness once the schema is migrated", async () => {
+    const res = await request(app).get("/api/readyz").expect(200);
+    expect(res.body.ready).toBe(true);
+    expect(res.body.database.schemaVersion).toBe(res.body.database.latestSchemaVersion);
+  });
+
+  it("readyz returns 503 when the schema is behind (mid-migration)", async () => {
+    const { app: staleApp, db } = buildHarness();
+    db.pragma("user_version = 1"); // simulate an interrupted upgrade
+    const res = await request(staleApp).get("/api/readyz").expect(503);
+    expect(res.body.ready).toBe(false);
+    expect(res.body.database.schemaVersion).toBe(1);
+  });
+
   it("reports a sane status while disconnected", async () => {
     const res = await request(app).get("/api/v1/status").expect(200);
     expect(res.body.connection.state).toBe("disconnected");
     expect(res.body.connection.transport).toBe("none");
     expect(res.body.self).toBeNull();
+  });
+});
+
+describe("http: diagnostics", () => {
+  const { app } = buildHarness();
+
+  it("returns aggregated, secret-free diagnostics", async () => {
+    const res = await request(app).get("/api/v1/diagnostics").expect(200);
+    expect(res.body.server.version).toBe("test");
+    expect(typeof res.body.server.uptimeSeconds).toBe("number");
+    expect(res.body.database.integrity).toBe("ok");
+    expect(res.body.database.schemaVersion).toBe(res.body.database.latestSchemaVersion);
+    expect(res.body.connection).toMatchObject({ transport: "none", reconnectScheduled: false });
+    expect(Array.isArray(res.body.guidance)).toBe(true);
+    // no self yet while disconnected
+    expect(res.body.radio).toBeNull();
+  });
+
+  it("serves a redacted support bundle as an attachment", async () => {
+    const res = await request(app).get("/api/v1/diagnostics/bundle").expect(200);
+    expect(res.headers["content-disposition"]).toContain("attachment");
+    expect(res.headers["content-disposition"]).toContain("meshkeep-diagnostics-");
+    // secrets are redacted: the raw password never appears, only a boolean
+    expect(res.body.config).not.toHaveProperty("uiPassword");
+    expect(res.body.config.uiPasswordSet).toBe(false);
+    expect(res.body.diagnostics.server.version).toBe("test");
+    expect(Array.isArray(res.body.logs)).toBe(true);
   });
 });
 

@@ -158,12 +158,15 @@ watch(search, (value) => {
   searchTimer = window.setTimeout(async () => {
     searchBusy.value = true;
     try {
-      searchResults.value = await store.searchMessages(query);
+      const results = await store.searchMessages(query);
+      // null means a newer search superseded this one — leave the results and
+      // the busy flag for that newer request to resolve.
+      if (results === null) return;
+      searchResults.value = results;
     } catch {
       searchResults.value = null;
-    } finally {
-      searchBusy.value = false;
     }
+    searchBusy.value = false;
   }, 250);
 });
 
