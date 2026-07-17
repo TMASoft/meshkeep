@@ -213,6 +213,16 @@ const stateColor = computed(() => {
           <strong>{{ store.self?.name ?? "Awaiting radio" }}</strong>
         </div>
         <div class="status-metrics">
+          <a
+            class="repo-link"
+            href="https://github.com/TMASoft/meshkeep"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="MeshKeep on GitHub"
+            title="MeshKeep on GitHub"
+          >
+            <AppIcon name="github" :size="18" />
+          </a>
           <div v-if="store.batteryPercent !== null" class="status-metric">
             <AppIcon name="battery" :size="18" />
             <span>{{ store.batteryPercent }}%</span>
@@ -364,6 +374,8 @@ const stateColor = computed(() => {
 .node-identity strong { font-size: 14px; font-weight: 650; letter-spacing: .01em; }
 .status-metrics { display: flex; align-items: center; gap: 10px; margin-left: auto; }
 .status-metric { display: flex; height: 34px; align-items: center; gap: 7px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0 11px; color: var(--text-muted); font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px; font-weight: 700; }
+.repo-link { display: grid; width: 34px; height: 34px; place-items: center; border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-muted); transition: border-color 140ms ease, color 140ms ease; }
+.repo-link:hover { border-color: var(--accent); color: var(--text); }
 .state-light { width: 7px; height: 7px; border-radius: 50%; background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 15%, transparent); }
 .state-light.connected { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent), 0 0 12px color-mix(in srgb, var(--accent) 55%, transparent); }
 .state-light.pending { background: var(--amber); box-shadow: 0 0 0 3px color-mix(in srgb, var(--amber) 15%, transparent); }
@@ -408,6 +420,7 @@ const stateColor = computed(() => {
   .mobile-brand { display: flex; }
   .node-identity { display: none; }
   .status-metric { height: 32px; border: 0; padding: 0 3px; }
+  .repo-link { width: 32px; height: 32px; border: 0; }
   .connection-metric span:last-child { display: none; }
   .mobile-appearance { display: grid; }
   .mobile-nav { position: relative; z-index: 1000; display: grid; height: calc(62px + env(safe-area-inset-bottom)); flex: 0 0 calc(62px + env(safe-area-inset-bottom)); grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--border); background: var(--surface-1); padding-bottom: env(safe-area-inset-bottom); }
