@@ -22,7 +22,7 @@ Tags move; digests do not. For reproducible deploys, pin by digest:
 
 ```sh
 # resolve the digest behind a version tag
-docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.3 \
+docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.4 \
   --format '{{ .Manifest.Digest }}'
 ```
 
@@ -36,7 +36,7 @@ pin it for anything you want to stay put.
 cosign verify \
   --certificate-identity-regexp '^https://github.com/TMASoft/meshkeep/.github/workflows/release.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/tmasoft/meshkeep:0.1.4-beta.3
+  ghcr.io/tmasoft/meshkeep:0.1.4-beta.4
 ```
 
 A valid signature prints the verified certificate identity. Treat a verification
@@ -45,9 +45,9 @@ failure as a supply-chain red flag — do not deploy.
 ### Inspect the SBOM and provenance
 
 ```sh
-docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.3 \
+docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.4 \
   --format '{{ json .SBOM }}'
-docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.3 \
+docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.4 \
   --format '{{ json .Provenance }}'
 ```
 

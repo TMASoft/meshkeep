@@ -9,7 +9,7 @@ services:
     # Pin a released version, or an @sha256 digest for a fully immutable deploy.
     # The moving :beta tag tracks the latest prerelease — avoid it in production.
     # Building from source instead? See "Development" in the README.
-    image: ghcr.io/tmasoft/meshkeep:0.1.4-beta.3
+    image: ghcr.io/tmasoft/meshkeep:0.1.4-beta.4
     # image: ghcr.io/tmasoft/meshkeep@sha256:<digest>   # fully reproducible
     restart: unless-stopped
     ports:
