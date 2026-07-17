@@ -94,6 +94,32 @@ describe("mock radio end-to-end", () => {
     expect(channels[0].name).toBe("Public");
   });
 
+  it("drains v3 queued messages during initial sync", async () => {
+    const v3Mock = new MockRadio({ port: 0, messageProtocolVersion: 3 });
+    await v3Mock.start();
+    v3Mock.injectDirectMessage("Mock Alice", "v3 direct message");
+    v3Mock.injectChannelMessage(0, "v3 channel message");
+    const v3Db = openDb(":memory:");
+    const v3Manager = new ConnectionManager(testConfig(v3Mock.port), v3Db, new Bus(), "test", 50);
+
+    try {
+      await v3Manager.start();
+      await waitForState(v3Manager, "connected");
+      expect(
+        v3Manager.store
+          .getConversation({ contactKey: Buffer.from(v3Mock.contacts[0].publicKey).toString("hex"), limit: 10 })
+          .map((message) => message.text),
+      ).toContain("v3 direct message");
+      expect(v3Manager.store.getConversation({ channelIdx: 0, limit: 10 }).map((message) => message.text)).toContain(
+        "v3 channel message",
+      );
+    } finally {
+      await v3Manager.stop();
+      await v3Mock.stop();
+      v3Db.close();
+    }
+  });
+
   it("drops contacts the radio no longer has on refresh but keeps their history", async () => {
     const phantomKey = "f".repeat(64);
     // a contact that was removed on the radio through another app

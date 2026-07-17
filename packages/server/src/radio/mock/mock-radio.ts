@@ -56,6 +56,11 @@ const RESP = {
   ChannelInfo: 18,
 } as const;
 
+const RESP_V3 = {
+  ContactMsgRecv: 0x10,
+  ChannelMsgRecv: 0x11,
+} as const;
+
 const PUSH = {
   Advert: 0x80,
   SendConfirmed: 0x82,
@@ -163,6 +168,7 @@ export interface MockRadioOptions {
   host?: string;
   echoDelayMs?: number;
   log?: (line: string) => void;
+  messageProtocolVersion?: 1 | 3;
 }
 
 export class MockRadio {
@@ -174,6 +180,7 @@ export class MockRadio {
   private log: (line: string) => void;
   private requestedPort: number;
   private timers = new Set<NodeJS.Timeout>();
+  private readonly messageProtocolVersion: 1 | 3;
 
   name = "MockKeep RAK4631";
   publicKey = keyFromSeed(1);
@@ -247,6 +254,7 @@ export class MockRadio {
     this.host = options.host ?? "127.0.0.1";
     this.echoDelayMs = options.echoDelayMs ?? 1500;
     this.log = options.log ?? (() => {});
+    this.messageProtocolVersion = options.messageProtocolVersion ?? 1;
   }
 
   get port(): number {
@@ -452,7 +460,9 @@ export class MockRadio {
           this.send(socket, new FrameWriter().byte(RESP.NoMoreMessages));
         } else if (next.kind === "dm") {
           const frame = new FrameWriter()
-            .byte(RESP.ContactMsgRecv)
+            .byte(this.messageProtocolVersion === 3 ? RESP_V3.ContactMsgRecv : RESP.ContactMsgRecv);
+          if (this.messageProtocolVersion === 3) frame.int8(-12).byte(0).byte(0);
+          frame
             .raw(next.from.publicKey.subarray(0, 6))
             .byte(next.pathLen)
             .byte(next.txtType ?? 0)
@@ -460,16 +470,9 @@ export class MockRadio {
           if (next.authorPrefix) frame.raw(next.authorPrefix); // signed-plain: 4 raw author bytes before the text
           this.send(socket, frame.str(next.text));
         } else {
-          this.send(
-            socket,
-            new FrameWriter()
-              .byte(RESP.ChannelMsgRecv)
-              .int8(next.channelIdx)
-              .byte(next.pathLen)
-              .byte(0)
-              .u32(next.senderTimestamp)
-              .str(next.text),
-          );
+          const frame = new FrameWriter().byte(this.messageProtocolVersion === 3 ? RESP_V3.ChannelMsgRecv : RESP.ChannelMsgRecv);
+          if (this.messageProtocolVersion === 3) frame.int8(-12).byte(0).byte(0);
+          this.send(socket, frame.byte(next.channelIdx).byte(next.pathLen).byte(0).u32(next.senderTimestamp).str(next.text));
         }
         break;
       }
