@@ -7,6 +7,72 @@ file you will normally see `meshkeep.db-wal` and `meshkeep.db-shm`. This guide
 covers backing it up, restoring it, upgrade/rollback behavior, and the health
 and diagnostics surfaces.
 
+## Deploying a published image
+
+Releases publish a multi-arch (amd64/arm64) image to
+`ghcr.io/tmasoft/meshkeep`. Every tagged release is:
+
+- **cosign-signed** (keyless, bound to the release workflow's GitHub OIDC identity),
+- shipped with an **SBOM** and **SLSA build provenance** as OCI attestations, and
+- **Trivy-scanned**, with the SBOM and scan results attached to the Actions run.
+
+### Pin an immutable reference
+
+Tags move; digests do not. For reproducible deploys, pin by digest:
+
+```sh
+# resolve the digest behind a version tag
+docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.3 \
+  --format '{{ .Manifest.Digest }}'
+```
+
+Then set `image: ghcr.io/tmasoft/meshkeep@sha256:<digest>` in your compose file.
+The `:beta` tag always moves to the newest prerelease — handy for a lab, but never
+pin it for anything you want to stay put.
+
+### Verify the signature
+
+```sh
+cosign verify \
+  --certificate-identity-regexp '^https://github.com/TMASoft/meshkeep/.github/workflows/release.yml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/tmasoft/meshkeep:0.1.4-beta.3
+```
+
+A valid signature prints the verified certificate identity. Treat a verification
+failure as a supply-chain red flag — do not deploy.
+
+### Inspect the SBOM and provenance
+
+```sh
+docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.3 \
+  --format '{{ json .SBOM }}'
+docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.3 \
+  --format '{{ json .Provenance }}'
+```
+
+The release workflow also uploads `sbom.spdx.json` and `trivy-results.sarif` as
+artifacts on the corresponding Actions run.
+
+## Secrets and configuration
+
+MeshKeep reads configuration from environment variables (see the README table).
+Keep secrets out of tracked files:
+
+- The tracked `docker/compose.*.yml` are **sanitized examples** with placeholders.
+  Copy one to `compose.yml` (gitignored) — or layer a `compose.override.yml` (also
+  gitignored) — and edit it for your host.
+- Put secrets in a `.env` file next to your compose file. Compose auto-loads it and
+  substitutes `${VAR}` references; `.env` and `docker/.env` are gitignored. Start
+  from `docker/.env.example`.
+- `MESHKEEP_UI_PASSWORD` gates the web UI and REST API; empty/unset = open (trusted
+  LAN only). REST integrations should use scoped API tokens (Radio → API access),
+  which are revocable and can be read-only.
+- For stronger handling, mount secrets as files via Docker/Swarm secrets or your
+  orchestrator's secret store rather than passing them as environment variables.
+- The diagnostics support bundle redacts secrets: the UI password is reported only
+  as `uiPasswordSet: true|false`, and secret-shaped log fields are masked.
+
 ## Health and readiness probes
 
 Two unauthenticated probes live outside the versioned API:

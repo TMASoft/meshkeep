@@ -4,4 +4,7 @@ data/
 *.log
 .DS_Store
 compose.yml
+compose.override.yml
+.env
+docker/.env
 TODO.md

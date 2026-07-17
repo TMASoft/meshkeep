@@ -10,9 +10,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -31,7 +31,18 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      # the mock radio (host side of the smoke test) is standalone and runs from
+      # source via tsx; mirror the Dockerfile's script policy, then give tsx a
+      # working esbuild binary
+      - run: npm ci --ignore-scripts
+      - run: npm rebuild esbuild
 
       - uses: docker/setup-buildx-action@v3
 
@@ -40,6 +51,11 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
-          push: false
+          load: true
+          tags: meshkeep:smoke
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # boot the image wired to the mock radio; assert probes, UI, and a live link
+      - name: Boot smoke test
+        run: IMAGE=meshkeep:smoke scripts/smoke-test.sh

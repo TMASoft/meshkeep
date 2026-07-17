@@ -14,6 +14,12 @@ RUN npm run build --workspace @meshkeep/shared \
   && npm run build --workspace @meshkeep/web
 
 FROM node:22-bookworm-slim
+# Baseline OCI metadata for local builds; the release workflow augments these
+# (revision, version, created) via docker/metadata-action labels.
+LABEL org.opencontainers.image.source="https://github.com/TMASoft/meshkeep" \
+      org.opencontainers.image.title="MeshKeep" \
+      org.opencontainers.image.description="Self-hosted MeshCore companion web client — chat, contacts, channels, and map for your LoRa mesh." \
+      org.opencontainers.image.licenses="MIT"
 ENV NODE_ENV=production
 # udevadm backs serialport's device enumeration (Radio → Connection detection)
 RUN apt-get update && apt-get install -y --no-install-recommends udev && rm -rf /var/lib/apt/lists/*

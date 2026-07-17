@@ -41,6 +41,13 @@ docker compose up -d
 
 Open http://localhost:8080.
 
+The example pulls a published, version-pinned image from GitHub Container Registry
+(`ghcr.io/tmasoft/meshkeep`) — no local build needed. For a fully reproducible deploy,
+pin an `@sha256:` digest instead of a tag; the images are multi-arch (amd64/arm64),
+cosign-signed, and ship SBOM + provenance attestations. See
+[Deploying a published image](docs/operations.md#deploying-a-published-image) for
+pinning and signature verification.
+
 The container runs as a non-root user. Set `group_add` to the numeric group that owns the
 serial device on the Docker host:
 
@@ -48,7 +55,9 @@ serial device on the Docker host:
 stat -c '%g' /dev/serial/by-id/usb-your-radio
 ```
 
-Both values are host-specific — the checked-in file ships placeholders.
+Both values are host-specific — the checked-in file ships placeholders. Copies you edit
+(`compose.yml`, `compose.override.yml`, `.env`) are gitignored; keep secrets like
+`MESHKEEP_UI_PASSWORD` in a `.env` file (see `docker/.env.example`), never in a tracked file.
 
 ## Interface
 
@@ -154,6 +163,9 @@ With a real radio: `MESHKEEP_CONNECTION=serial MESHKEEP_SERIAL_PORT=/dev/ttyACM0
   database, and map diagnostics; download a redacted support bundle from there.
 - Backup, restore, upgrade/rollback, integrity checks, and write-contention
   behavior are documented in [`docs/operations.md`](docs/operations.md).
+- Released images are multi-arch, cosign-signed, and carry SBOM + SLSA provenance
+  attestations; see [deploying a published image](docs/operations.md#deploying-a-published-image)
+  for digest pinning and signature verification.
 
 ## License
 

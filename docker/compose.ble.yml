@@ -5,19 +5,25 @@
 #   scan on ... pair AA:BB:CC:DD:EE:FF ... trust AA:BB:CC:DD:EE:FF
 # USB (compose.usb.yml) and ser2net/TCP (compose.tcp.yml) remain the
 # recommended server transports.
+#
+# This is a sanitized EXAMPLE. Copy it to an untracked file and edit for your
+# host:  cp docker/compose.ble.yml compose.yml   (compose.yml is gitignored)
+# Put secrets in a sibling .env file (gitignored); see docker/.env.example.
 services:
   meshkeep:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: meshkeep:latest
+    # Pin a released version, or an @sha256 digest for a fully immutable deploy.
+    # The moving :beta tag tracks the latest prerelease — avoid it in production.
+    image: ghcr.io/tmasoft/meshkeep:0.1.4-beta.3
+    # image: ghcr.io/tmasoft/meshkeep@sha256:<digest>   # fully reproducible
     restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
       MESHKEEP_CONNECTION: ble
       MESHKEEP_BLE_ADDRESS: "AA:BB:CC:DD:EE:FF"  # radio's BLE MAC
-      # MESHKEEP_UI_PASSWORD: change-me
+      # require login: set MESHKEEP_UI_PASSWORD in .env (never commit it).
+      # empty/unset = open (LAN use).
+      MESHKEEP_UI_PASSWORD: ${MESHKEEP_UI_PASSWORD:-}
     volumes:
       - meshkeep-data:/data
       # BlueZ is reached over the host's system D-Bus

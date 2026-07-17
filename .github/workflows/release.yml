@@ -8,12 +8,13 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write # keyless cosign signing + build provenance attestation
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -25,11 +26,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # ghcr paths must be lowercase; github.repository can carry mixed case
+      - name: Resolve image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.img.outputs.name }}
           # latest is added automatically for non-prerelease semver tags
           tags: |
             type=semver,pattern={{version}}
@@ -38,6 +44,7 @@ jobs:
             type=raw,value=beta,enable=${{ contains(github.ref_name, '-') }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -48,3 +55,43 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # attach SLSA provenance + an SBOM as OCI attestations to the image
+          provenance: mode=max
+          sbom: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # keyless signature bound to this workflow's OIDC identity; verify with
+      # cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: Sign image (keyless)
+        env:
+          IMAGE_DIGEST: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE_DIGEST"
+
+      - name: Generate SBOM artifact (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Vulnerability scan (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          # report-only: a newly disclosed CVE must not block shipping a release
+          exit-code: "0"
+
+      - name: Upload supply-chain artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-${{ github.ref_name }}
+          path: |
+            sbom.spdx.json
+            trivy-results.sarif
+          if-no-files-found: warn
