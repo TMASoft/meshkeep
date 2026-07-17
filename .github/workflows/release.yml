@@ -60,7 +60,7 @@ jobs:
           sbom: true
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v3.10.1
 
       # keyless signature bound to this workflow's OIDC identity; verify with
       # cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com
@@ -69,15 +69,22 @@ jobs:
           IMAGE_DIGEST: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
         run: cosign sign --yes "$IMAGE_DIGEST"
 
+      # everything below is post-publish reporting; the image is already pushed
+      # and signed, so a transient hiccup here must not fail the release
       - name: Generate SBOM artifact (SPDX)
-        uses: anchore/sbom-action@v0
+        continue-on-error: true
+        uses: anchore/sbom-action@v0.24.0
         with:
           image: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
+          upload-artifact: false
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Vulnerability scan (Trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
           format: sarif
@@ -88,6 +95,7 @@ jobs:
           exit-code: "0"
 
       - name: Upload supply-chain artifacts
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: supply-chain-${{ github.ref_name }}
