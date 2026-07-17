@@ -82,7 +82,9 @@ function statusLabel(message: Message): string {
   if (message.direction === "in") return "";
   switch (message.status) {
     case "pending":
-      return "Pending";
+      return "Queued";
+    case "retrying":
+      return "Retrying";
     case "sent":
       return "Sent";
     case "delivered":
@@ -126,6 +128,35 @@ async function send() {
     error.value = cause instanceof Error ? cause.message : "Failed to send";
   } finally {
     sending.value = false;
+  }
+}
+
+// Track the message whose retry/cancel is in flight so its buttons disable.
+const outboundBusy = ref<number | null>(null);
+
+async function retryOutbound(message: Message) {
+  if (outboundBusy.value !== null) return;
+  outboundBusy.value = message.id;
+  error.value = null;
+  try {
+    await store.retryMessage(message.id);
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "Retry failed";
+  } finally {
+    outboundBusy.value = null;
+  }
+}
+
+async function cancelOutbound(message: Message) {
+  if (outboundBusy.value !== null) return;
+  outboundBusy.value = message.id;
+  error.value = null;
+  try {
+    await store.cancelMessage(message.id);
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "Cancel failed";
+  } finally {
+    outboundBusy.value = null;
   }
 }
 
@@ -1002,17 +1033,46 @@ function fmtLastAdvert(epoch: number): string {
                 <time :datetime="new Date(message.senderTimestamp * 1000).toISOString()">
                   {{ formatTime(message.senderTimestamp) }}
                 </time>
-                <span
-                  v-if="message.direction === 'out'"
-                  class="delivery-status"
-                  :class="message.status"
-                  :aria-label="statusLabel(message)"
-                  :title="statusLabel(message)"
-                >
-                  <template v-if="message.status === 'pending'">···</template>
-                  <template v-else-if="message.status === 'sent'">✓</template>
-                  <template v-else-if="message.status === 'delivered'">✓✓</template>
-                  <AppIcon v-else name="alert" :size="12" />
+                <span v-if="message.direction === 'out'" class="delivery">
+                  <span
+                    class="delivery-status"
+                    :class="message.status"
+                    :aria-label="statusLabel(message)"
+                    :title="statusLabel(message)"
+                  >
+                    <template v-if="message.status === 'pending'">···</template>
+                    <template v-else-if="message.status === 'retrying'">↻</template>
+                    <template v-else-if="message.status === 'sent'">✓</template>
+                    <template v-else-if="message.status === 'delivered'">✓✓</template>
+                    <AppIcon v-else name="alert" :size="12" />
+                  </span>
+                  <span
+                    v-if="
+                      store.radioDriver === 'server' &&
+                      (message.status === 'failed' ||
+                        message.status === 'retrying' ||
+                        (message.status === 'pending' && store.connectionState !== 'connected'))
+                    "
+                    class="delivery-actions"
+                  >
+                    <button
+                      v-if="message.status === 'failed'"
+                      type="button"
+                      class="delivery-action"
+                      :disabled="outboundBusy !== null"
+                      @click="retryOutbound(message)"
+                    >
+                      Retry
+                    </button>
+                    <button
+                      type="button"
+                      class="delivery-action cancel"
+                      :disabled="outboundBusy !== null"
+                      @click="cancelOutbound(message)"
+                    >
+                      Cancel
+                    </button>
+                  </span>
                 </span>
               </footer>
             </article>
@@ -1163,9 +1223,16 @@ function fmtLastAdvert(epoch: number): string {
 .message-sender { margin: 0 0 4px; color: var(--cyan); font-family: monospace; font-size: 10px; font-weight: 700; }
 .message-copy { margin: 0; color: var(--text); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-wrap; }
 .message-bubble footer { display: flex; align-items: center; justify-content: flex-end; gap: 5px; margin-top: 5px; color: var(--text-faint); font-family: monospace; font-size: 9px; }
+.delivery { display: inline-flex; align-items: center; gap: 8px; }
 .delivery-status { display: inline-flex; align-items: center; min-width: 15px; color: var(--text-faint); font-size: 10px; font-weight: 800; letter-spacing: -2px; }
 .delivery-status.delivered { color: var(--accent); }
+.delivery-status.retrying { color: var(--cyan); letter-spacing: 0; }
 .delivery-status.failed { color: var(--danger); letter-spacing: 0; }
+.delivery-actions { display: inline-flex; gap: 6px; }
+.delivery-action { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); padding: 2px 8px; color: var(--text); font-size: 10px; font-weight: 700; cursor: pointer; transition: border-color 140ms ease, color 140ms ease; }
+.delivery-action:hover:not(:disabled) { border-color: var(--cyan); color: var(--cyan); }
+.delivery-action.cancel:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
+.delivery-action:disabled { opacity: .5; cursor: not-allowed; }
 .thread-state, .no-conversation { display: flex; height: 100%; flex-direction: column; align-items: center; justify-content: center; color: var(--text-faint); text-align: center; }
 .thread-state h3, .no-conversation h2 { margin: 12px 0 5px; color: var(--text); font-size: 18px; }
 .thread-state p, .no-conversation p { max-width: 350px; margin: 0; font-size: 12px; line-height: 1.55; }

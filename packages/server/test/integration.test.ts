@@ -20,6 +20,7 @@ function testConfig(port: number): ServerConfig {
     bleAddress: null,
     uiPassword: null,
     telemetryRetentionDays: 30,
+    outboundMaxAttempts: 5,
     mapRefreshMinutes: 10,
     mapUpstream: "https://map.meshcore.io/api/v1/nodes",
     mapEnabled: true,
@@ -40,6 +41,14 @@ function waitForEvent(bus: Bus, predicate: (event: WsEvent) => boolean, timeoutM
       }
     });
   });
+}
+
+async function until(predicate: () => boolean, timeoutMs = 3_000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 async function waitForState(manager: ConnectionManager, state: string, timeoutMs = 10_000): Promise<void> {
@@ -164,8 +173,10 @@ describe("mock radio end-to-end", () => {
       (e) => e.type === "message.new" && e.message.direction === "in" && e.message.kind === "dm",
     );
 
+    // Sends are queued: the call returns immediately as pending, and the
+    // outbound worker hands it to the radio and drives it to delivered.
     const sent = await manager.sendDirectMessage(alice.publicKey, "hello mesh");
-    expect(sent.status).toBe("sent");
+    expect(sent.status).toBe("pending");
 
     await delivered;
     expect(manager.store.getMessage(sent.id)?.status).toBe("delivered");
@@ -189,8 +200,10 @@ describe("mock radio end-to-end", () => {
     (manager as unknown as { attachListeners(connection: Connection): void }).attachListeners(connection);
 
     try {
+      const delivered = waitForEvent(bus, (e) => e.type === "message.status" && e.status === "delivered");
       const message = await manager.sendDirectMessage("ab".repeat(32), "early ack");
-      expect(message.status).toBe("delivered");
+      expect(message.status).toBe("pending");
+      await delivered;
       expect(manager.store.getMessage(message.id)?.status).toBe("delivered");
     } finally {
       (manager as unknown as { connection: Connection }).connection = originalConnection;
@@ -211,20 +224,22 @@ describe("mock radio end-to-end", () => {
     (manager as unknown as { attachListeners(connection: Connection): void }).attachListeners(connection);
 
     try {
-      const first = manager.sendDirectMessage("ab".repeat(32), "first");
-      const second = manager.sendDirectMessage("ab".repeat(32), "second");
-      const firstMessage = await first;
+      const firstMessage = await manager.sendDirectMessage("ab".repeat(32), "first");
+      const secondMessage = await manager.sendDirectMessage("ab".repeat(32), "second");
+      // The worker hands off the first and holds the second until the first's ack.
+      await until(() => sent.length === 1);
       expect(sent).toEqual(["first"]);
 
       emitter.emit(Constants.PushCodes.SendConfirmed, { ackCode: 4321, roundTrip: 0 });
-      await new Promise((resolve) => setImmediate(resolve));
+      await until(() => sent.length === 2);
       expect(sent).toEqual(["first", "second"]);
-      const secondMessage = await second;
       emitter.emit(Constants.PushCodes.SendConfirmed, { ackCode: 4321, roundTrip: 0 });
-      await new Promise((resolve) => setImmediate(resolve));
 
-      expect(manager.store.getMessage(firstMessage.id)?.status).toBe("delivered");
-      expect(manager.store.getMessage(secondMessage.id)?.status).toBe("delivered");
+      await until(
+        () =>
+          manager.store.getMessage(firstMessage.id)?.status === "delivered" &&
+          manager.store.getMessage(secondMessage.id)?.status === "delivered",
+      );
     } finally {
       (manager as unknown as { connection: Connection }).connection = originalConnection;
     }
@@ -245,15 +260,17 @@ describe("mock radio end-to-end", () => {
 
     try {
       const first = await manager.sendDirectMessage("ab".repeat(32), "first");
-      const second = manager.sendDirectMessage("ab".repeat(32), "second");
+      const secondMessage = await manager.sendDirectMessage("ab".repeat(32), "second");
+      await until(() => sent.length === 1);
       expect(sent).toEqual(["first"]);
 
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      // first's ack never arrives; it times out (estTimeout 10ms) and the
+      // worker moves on to the second without failing the first.
+      await until(() => sent.length === 2);
       expect(sent).toEqual(["first", "second"]);
-      const secondMessage = await second;
       emitter.emit(Constants.PushCodes.SendConfirmed, { ackCode: 4321, roundTrip: 0 });
-      await new Promise((resolve) => setImmediate(resolve));
 
+      await until(() => manager.store.getMessage(secondMessage.id)?.status === "delivered");
       expect(manager.store.getMessage(first.id)?.status).toBe("sent");
       expect(manager.store.getMessage(secondMessage.id)?.status).toBe("delivered");
     } finally {
@@ -402,6 +419,41 @@ describe("mock radio end-to-end", () => {
     await manager.claim();
     await waitForState(manager, "connected");
     expect(manager.isStandby()).toBe(false);
+  });
+
+  it("delivers a message that was queued while the radio was away, on reconnect", async () => {
+    await manager.release();
+    // a send enqueued while the radio was in another owner's hands (simulated
+    // here by seeding the queue directly): it must not attempt until reclaimed
+    const queued = manager.store.insertMessage({
+      kind: "channel",
+      channelIdx: 0,
+      direction: "out",
+      text: "queued while away",
+      senderTimestamp: 1_000,
+      status: "pending",
+    })!;
+    manager.store.enqueueOutbound({
+      messageId: queued.id,
+      kind: "channel",
+      channelIdx: 0,
+      text: "queued while away",
+      maxAttempts: 5,
+      nextAttemptAt: 1_000,
+    });
+    expect(manager.store.getOutbound(queued.id)?.state).toBe("pending");
+
+    const echoed = waitForEvent(
+      bus,
+      (e) => e.type === "message.new" && e.message.direction === "in" && e.message.text.includes("queued while away"),
+    );
+    await manager.claim();
+    await waitForState(manager, "connected");
+    await echoed;
+
+    // handed off on reconnect: removed from the queue and marked sent
+    await until(() => manager.store.getOutbound(queued.id) === null);
+    expect(manager.store.getMessage(queued.id)?.status).toBe("sent");
   });
 
   it("round-trips a contact through export and import URIs", async () => {
@@ -636,6 +688,87 @@ describe("connection lifecycle races", () => {
 
     expect(connect).toHaveBeenCalledOnce();
     expect(manager.getState()).toBe("standby");
+  });
+});
+
+describe("outbound retry worker", () => {
+  // A bare manager with an injected connection and a forced "connected" state,
+  // so we can exercise hand-off failures without real hardware or slow backoff.
+  function bareManager(overrides: Partial<ServerConfig> = {}) {
+    const db = openDb(":memory:");
+    const bus = new Bus();
+    const manager = new ConnectionManager({ ...testConfig(0), ...overrides }, db, bus, "test");
+    const internals = manager as unknown as { connection: Connection | null; state: string };
+    return { db, bus, manager, internals };
+  }
+
+  function fakeConnection(sendTextMessage: () => Promise<{ result: number; expectedAckCrc: number; estTimeout: number }>): Connection {
+    return Object.assign(new EventEmitter(), { sendTextMessage }) as unknown as Connection;
+  }
+
+  it("queues a send while offline and leaves it pending without an attempt", async () => {
+    const { db, manager } = bareManager();
+    try {
+      const message = await manager.sendDirectMessage("ab".repeat(32), "offline");
+      expect(message.status).toBe("pending");
+      const entry = manager.store.getOutbound(message.id);
+      expect(entry).toMatchObject({ state: "pending", attempts: 0 });
+    } finally {
+      await manager.stop();
+      db.close();
+    }
+  });
+
+  it("fails a send after exhausting attempts, then re-drives it on retry", async () => {
+    const { db, manager, internals } = bareManager({ outboundMaxAttempts: 1 });
+    try {
+      internals.connection = fakeConnection(() => Promise.reject(new Error("radio rejected")));
+      internals.state = "connected";
+
+      const message = await manager.sendDirectMessage("ab".repeat(32), "will fail");
+      await until(() => manager.store.getMessage(message.id)?.status === "failed");
+      expect(manager.store.getOutbound(message.id)).toMatchObject({ state: "failed", attempts: 1, lastError: "radio rejected" });
+
+      // retrying a non-failed entry is rejected; an unknown id is not found
+      expect(() => manager.retryOutbound(999_999)).toThrow(/not in the outbound queue/);
+
+      // swap in a working radio and retry: it hands off and clears the queue
+      internals.connection = fakeConnection(() => Promise.resolve({ result: 0, expectedAckCrc: 7, estTimeout: 20 }));
+      const retried = manager.retryOutbound(message.id);
+      expect(retried.status).toBe("pending");
+      await until(() => manager.store.getMessage(message.id)?.status === "sent");
+      await until(() => manager.store.getOutbound(message.id) === null);
+    } finally {
+      await manager.stop();
+      db.close();
+    }
+  });
+
+  it("cancels a queued send: drops it from the queue and marks it failed", async () => {
+    const { db, manager } = bareManager();
+    try {
+      const message = await manager.sendDirectMessage("ab".repeat(32), "cancel me");
+      expect(manager.store.getOutbound(message.id)?.state).toBe("pending");
+
+      const cancelled = manager.cancelOutbound(message.id);
+      expect(cancelled.status).toBe("failed");
+      expect(manager.store.getOutbound(message.id)).toBeNull();
+      expect(() => manager.cancelOutbound(message.id)).toThrow(/not in the outbound queue/);
+    } finally {
+      await manager.stop();
+      db.close();
+    }
+  });
+
+  it("rejects sends while the radio is in standby", async () => {
+    const { db, manager } = bareManager();
+    try {
+      await manager.release(); // standby
+      await expect(manager.sendDirectMessage("ab".repeat(32), "nope")).rejects.toThrow(/standby/);
+    } finally {
+      await manager.stop();
+      db.close();
+    }
   });
 });
 

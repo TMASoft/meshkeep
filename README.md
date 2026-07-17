@@ -108,6 +108,7 @@ a BLE radio near your *browsing* device is often better served by browser-direct
 | `MESHKEEP_DATA_DIR` | `/data` | SQLite + caches |
 | `MESHKEEP_UI_PASSWORD` | unset | require login when set; unset = open (LAN use) |
 | `MESHKEEP_TELEMETRY_RETENTION_DAYS` | `30` | trim battery telemetry older than this |
+| `MESHKEEP_OUTBOUND_MAX_ATTEMPTS` | `5` | delivery hand-off attempts before an outbound message is marked failed |
 | `MESHKEEP_MAP_REFRESH_MINUTES` | `10` | min interval between upstream map fetches |
 | `MESHKEEP_MAP_ENABLED` | `true` | set `false` to disable the global map layer |
 | `MESHKEEP_LOG_LEVEL` | `info` | stdout log verbosity: `debug`, `info`, `warn`, `error` |
@@ -135,6 +136,14 @@ The two endpoints the hll-meshkeep plugin consumes:
 - `GET /api/v1/messages/recent?limit=20` — newest messages with resolved names
 - `GET /api/v1/messages/unknown-senders` — latest message for each unresolved DM sender prefix; use `sender=<prefix>` on message history, search, export, and read routes to access its conversation
 - `POST /api/v1/ingest/messages` — browser-direct sync records require a UUID `ingestionId`; retry the same record with the same ID, and use a new ID for an intentional repeat. The response and `message.new` event include that ID so offline browser rows can be replaced by their server IDs without losing a delivered or failed status.
+
+Outbound sends are queued. `POST /api/v1/messages` (and `POST /api/v1/contacts/:key/cli`) accept a
+message into a persisted retry queue and return `201` immediately with status `pending` — they
+no longer block until the radio accepts. The worker hands it to the radio (retrying with backoff
+if the radio is offline or rejects it) and the outcome arrives via the `message.status` WebSocket
+event: `pending → sent → delivered`, or `retrying → failed` after `MESHKEEP_OUTBOUND_MAX_ATTEMPTS`.
+Inspect and manage the queue with `GET /api/v1/messages/outbound`, `POST /api/v1/messages/:id/retry`,
+and `POST /api/v1/messages/:id/cancel` (retry/cancel need write scope).
 
 ## Development
 

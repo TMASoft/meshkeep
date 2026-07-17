@@ -9,6 +9,7 @@ import type {
   MessageKind,
   MessageSearchResult,
   MessageStatus,
+  OutboundQueueEntry,
   SelfInfo,
   SensorReading,
   TelemetryPoint,
@@ -16,6 +17,45 @@ import type {
 import type { Db } from "./index.js";
 
 const now = () => Math.floor(Date.now() / 1000);
+
+/** Store-internal outbound entry: the shared shape plus the `cli` flag the worker needs. */
+export interface OutboundEntry extends OutboundQueueEntry {
+  cli: boolean;
+}
+
+interface OutboundRow {
+  message_id: number;
+  kind: MessageKind;
+  contact_key: string | null;
+  channel_idx: number | null;
+  text: string;
+  cli: number;
+  attempts: number;
+  max_attempts: number;
+  next_attempt_at: number;
+  last_error: string | null;
+  state: OutboundQueueEntry["state"];
+  created_at: number;
+  updated_at: number;
+}
+
+function rowToOutbound(row: OutboundRow): OutboundEntry {
+  return {
+    messageId: row.message_id,
+    kind: row.kind,
+    contactKey: row.contact_key,
+    channelIdx: row.channel_idx,
+    text: row.text,
+    cli: row.cli === 1,
+    attempts: row.attempts,
+    maxAttempts: row.max_attempts,
+    nextAttemptAt: row.next_attempt_at,
+    lastError: row.last_error,
+    state: row.state,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
 
 interface MessageRow {
   id: number;
@@ -34,6 +74,7 @@ interface MessageRow {
   contact_name?: string | null;
   channel_name?: string | null;
   author_name?: string | null;
+  queue_state?: "pending" | "retrying" | "failed" | null;
 }
 
 function rowToMessage(row: MessageRow): Message {
@@ -50,7 +91,9 @@ function rowToMessage(row: MessageRow): Message {
     text: row.text,
     senderTimestamp: row.sender_timestamp,
     pathLen: row.path_len,
-    status: row.status,
+    // A queued send whose last hand-off attempt failed reports `retrying`; the
+    // stored coarse status stays `pending` until it terminally succeeds/fails.
+    status: row.queue_state === "retrying" ? "retrying" : row.status,
     createdAt: row.created_at,
     authorPrefix: row.author_prefix,
     authorName: row.author_name ?? null,
@@ -67,10 +110,11 @@ const AUTHOR_NAME_SELECT = `(
   ) AS author_name`;
 
 const MESSAGE_SELECT = `
-  SELECT m.*, c.name AS contact_name, ch.name AS channel_name, ${AUTHOR_NAME_SELECT}
+  SELECT m.*, c.name AS contact_name, ch.name AS channel_name, q.state AS queue_state, ${AUTHOR_NAME_SELECT}
   FROM messages m
   LEFT JOIN contacts c ON c.public_key = m.contact_key
   LEFT JOIN channels ch ON ch.idx = m.channel_idx
+  LEFT JOIN outbound_queue q ON q.message_id = m.id
 `;
 
 export class Store {
@@ -302,6 +346,109 @@ export class Store {
     this.db.prepare("UPDATE messages SET status = ? WHERE id = ?").run(status, id);
   }
 
+  // ---- outbound retry queue ----
+
+  /** Record an outbound message awaiting hand-off to the radio. */
+  enqueueOutbound(input: {
+    messageId: number;
+    kind: MessageKind;
+    contactKey?: string | null;
+    channelIdx?: number | null;
+    text: string;
+    cli?: boolean;
+    maxAttempts: number;
+    nextAttemptAt: number;
+  }): OutboundEntry {
+    const ts = now();
+    this.db
+      .prepare(
+        `INSERT INTO outbound_queue
+           (message_id, kind, contact_key, channel_idx, text, cli, attempts, max_attempts, next_attempt_at, last_error, state, created_at, updated_at)
+         VALUES (@messageId, @kind, @contactKey, @channelIdx, @text, @cli, 0, @maxAttempts, @nextAttemptAt, NULL, 'pending', @ts, @ts)`,
+      )
+      .run({
+        messageId: input.messageId,
+        kind: input.kind,
+        contactKey: input.contactKey ?? null,
+        channelIdx: input.channelIdx ?? null,
+        text: input.text,
+        cli: input.cli ? 1 : 0,
+        maxAttempts: input.maxAttempts,
+        nextAttemptAt: input.nextAttemptAt,
+        ts,
+      });
+    return this.getOutbound(input.messageId)!;
+  }
+
+  getOutbound(messageId: number): OutboundEntry | null {
+    const row = this.db
+      .prepare("SELECT * FROM outbound_queue WHERE message_id = ?")
+      .get(messageId) as OutboundRow | undefined;
+    return row ? rowToOutbound(row) : null;
+  }
+
+  /**
+   * Entries whose backoff has elapsed and are eligible for an attempt
+   * (`pending` or `retrying`), oldest-due first. `failed` entries are excluded —
+   * they only re-enter the queue via an explicit user retry.
+   */
+  takeDueOutbound(atTs: number): OutboundEntry[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM outbound_queue
+         WHERE state IN ('pending','retrying') AND next_attempt_at <= ?
+         ORDER BY next_attempt_at ASC, message_id ASC`,
+      )
+      .all(atTs) as OutboundRow[];
+    return rows.map(rowToOutbound);
+  }
+
+  /** The full ledger (pending/retrying/failed), newest first, for the queue view. */
+  listOutbound(): OutboundEntry[] {
+    const rows = this.db
+      .prepare("SELECT * FROM outbound_queue ORDER BY created_at DESC, message_id DESC")
+      .all() as OutboundRow[];
+    return rows.map(rowToOutbound);
+  }
+
+  /** Persist the outcome of an attempt (new state + backoff + error). */
+  markOutboundAttempt(
+    messageId: number,
+    patch: { state: OutboundEntry["state"]; attempts: number; nextAttemptAt: number; lastError: string | null },
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE outbound_queue
+         SET state = @state, attempts = @attempts, next_attempt_at = @nextAttemptAt,
+             last_error = @lastError, updated_at = @ts
+         WHERE message_id = @messageId`,
+      )
+      .run({ messageId, ...patch, ts: now() });
+  }
+
+  /** Re-arm a failed entry for another round of attempts (user-initiated retry). */
+  resetOutboundForRetry(messageId: number, nextAttemptAt: number): void {
+    this.db
+      .prepare(
+        `UPDATE outbound_queue
+         SET state = 'pending', attempts = 0, next_attempt_at = ?, last_error = NULL, updated_at = ?
+         WHERE message_id = ?`,
+      )
+      .run(nextAttemptAt, now(), messageId);
+  }
+
+  removeOutbound(messageId: number): void {
+    this.db.prepare("DELETE FROM outbound_queue WHERE message_id = ?").run(messageId);
+  }
+
+  /** Earliest scheduled attempt among still-eligible entries, or null when none remain. */
+  nextOutboundAttemptAt(): number | null {
+    const row = this.db
+      .prepare("SELECT MIN(next_attempt_at) AS n FROM outbound_queue WHERE state IN ('pending','retrying')")
+      .get() as { n: number | null };
+    return row.n ?? null;
+  }
+
   getRecentMessages(limit: number): Message[] {
     const rows = this.db
       .prepare(`${MESSAGE_SELECT} ORDER BY m.id DESC LIMIT ?`)
@@ -369,12 +516,13 @@ export class Store {
     }
     const rows = this.db
       .prepare(
-        `SELECT m.*, c.name AS contact_name, ch.name AS channel_name, ${AUTHOR_NAME_SELECT},
+        `SELECT m.*, c.name AS contact_name, ch.name AS channel_name, q.state AS queue_state, ${AUTHOR_NAME_SELECT},
                 snippet(messages_fts, 0, char(1), char(2), '…', 12) AS snippet
          FROM messages_fts
          JOIN messages m ON m.id = messages_fts.rowid
          LEFT JOIN contacts c ON c.public_key = m.contact_key
          LEFT JOIN channels ch ON ch.idx = m.channel_idx
+         LEFT JOIN outbound_queue q ON q.message_id = m.id
          WHERE ${clauses.join(" AND ")}
          ORDER BY rank LIMIT @limit`,
       )

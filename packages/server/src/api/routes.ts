@@ -1,7 +1,7 @@
 import { Router, json, type Request, type Response } from "express";
 import { z } from "zod";
 import type { ConnectionManager } from "../radio/manager.js";
-import { RadioUnavailableError } from "../radio/manager.js";
+import { OutboundNotFoundError, OutboundStateError, RadioUnavailableError } from "../radio/manager.js";
 import { listSerialPorts, scanBleRadios } from "../radio/detect.js";
 import type { MapCache } from "../map/cache.js";
 import type { Bus } from "../bus.js";
@@ -42,6 +42,10 @@ function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
         res.status(400).json({ error: "invalid request", details: error.issues });
       } else if (error instanceof RadioUnavailableError) {
         res.status(503).json({ error: error.message });
+      } else if (error instanceof OutboundNotFoundError) {
+        res.status(404).json({ error: error.message });
+      } else if (error instanceof OutboundStateError) {
+        res.status(409).json({ error: error.message });
       } else if (error instanceof Error && error.constructor === Error && !("code" in error)) {
         // deliberately thrown operational message (e.g. "radio rejected the message")
         res.status(500).json({ error: error.message });
@@ -230,6 +234,12 @@ export function buildApi(
     }),
   );
   api.get(
+    "/messages/outbound",
+    handle((_req, res) => {
+      res.json({ queue: manager.store.listOutbound() });
+    }),
+  );
+  api.get(
     "/messages/search",
     handle((req, res) => {
       const query = z
@@ -356,6 +366,20 @@ export function buildApi(
           ? await manager.sendDirectMessage(body.to.toLowerCase(), body.text)
           : await manager.sendChannelMessage(body.channelIdx, body.text);
       res.status(201).json({ message });
+    }),
+  );
+  api.post(
+    "/messages/:id/retry",
+    handle((req, res) => {
+      const id = z.coerce.number().int().positive().parse(req.params.id);
+      res.json({ message: manager.retryOutbound(id) });
+    }),
+  );
+  api.post(
+    "/messages/:id/cancel",
+    handle((req, res) => {
+      const id = z.coerce.number().int().positive().parse(req.params.id);
+      res.json({ message: manager.cancelOutbound(id) });
     }),
   );
   api.post(

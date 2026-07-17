@@ -160,6 +160,23 @@ Back up to a different filesystem and verify a restore periodically (see below).
   Always take a backup before upgrading across a schema change.
 - Check the current vs. latest schema version any time on the Health page or via
   `GET /api/v1/diagnostics` (`database.schemaVersion` / `database.latestSchemaVersion`).
+- **Migration 9 (outbound retry queue)** is additive: it creates the `outbound_queue`
+  table and touches no existing table or row, so upgrading is safe and rolling back to a
+  pre-9 build simply ignores the new table. On downgrade, any messages still queued
+  (status `pending`/`retrying`) revert to plain `pending` rows with no automatic retry.
+
+## Outbound message queue
+
+Outbound sends are persisted in `outbound_queue` and delivered by a background worker, so a
+send survives a radio that is briefly offline. A message is `pending` until handed to the
+radio, then follows the normal `sent → delivered` (ack) path. If the hand-off fails the
+worker retries with exponential backoff (`retrying`), giving up after
+`MESHKEEP_OUTBOUND_MAX_ATTEMPTS` (default 5) and marking the message `failed`. A radio that
+is simply offline keeps the message `pending` and does **not** burn an attempt — it delivers
+on reconnect. Operators/users can requeue a failed send (`POST /api/v1/messages/:id/retry`)
+or drop it (`POST /api/v1/messages/:id/cancel`); `GET /api/v1/messages/outbound` shows the
+current ledger. While the server radio is in **standby** (released to a browser session),
+the server rejects sends rather than queuing them — send from the browser session instead.
 
 ## Integrity and recovery
 

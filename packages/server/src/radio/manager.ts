@@ -14,7 +14,7 @@ import {
 import type { ServerConfig } from "../config.js";
 import type { Bus } from "../bus.js";
 import { getSetting, setSetting, type Db } from "../db/index.js";
-import { Store } from "../db/store.js";
+import { Store, type OutboundEntry } from "../db/store.js";
 import { createConnection, describeTarget } from "./transports.js";
 import { describeConnectError, nextReconnectDelay, reconnectPolicyFor, validateConnectionSettings } from "./reconnect-policy.js";
 
@@ -25,6 +25,21 @@ const CLOCK_DRIFT_TOLERANCE_SECS = 30;
 const BATTERY_POLL_MS = 5 * 60_000;
 const MAX_CHANNELS = 8;
 const CONNECTION_OVERRIDE_KEY = "connection.override";
+
+// Outbound retry backoff: hand-off failures (radio rejected the frame) back off
+// exponentially between these bounds; a radio that is simply offline is left
+// pending without burning an attempt and resumes on reconnect.
+const OUTBOUND_MIN_BACKOFF_MS = 3_000;
+const OUTBOUND_MAX_BACKOFF_MS = 120_000;
+// Idle re-check ceiling so the worker periodically re-evaluates due entries.
+const OUTBOUND_TIMER_CAP_MS = 60_000;
+
+const nowSecs = () => Math.floor(Date.now() / 1000);
+
+/** Exponential backoff (ms) after `attempts` failed hand-offs (attempts ≥ 1). */
+function outboundBackoffMs(attempts: number): number {
+  return Math.min(OUTBOUND_MIN_BACKOFF_MS * 2 ** (attempts - 1), OUTBOUND_MAX_BACKOFF_MS);
+}
 
 class LifecycleCancelledError extends Error {}
 
@@ -108,6 +123,11 @@ export class ConnectionManager {
   // flight until its acknowledgement arrives or times out to avoid collisions.
   private directSendQueue: Promise<void> = Promise.resolve();
   private pendingDirectDelivery: PendingDirectDelivery | null = null;
+  // Outbound retry worker: one drain loop at a time; a kick during a run
+  // requeues one more pass, and a timer fires when a backed-off entry is due.
+  private outboundRunning = false;
+  private outboundKickAgain = false;
+  private outboundTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly config: ServerConfig,
@@ -236,6 +256,10 @@ export class ConnectionManager {
       clearInterval(this.batteryTimer);
       this.batteryTimer = null;
     }
+    if (this.outboundTimer) {
+      clearTimeout(this.outboundTimer);
+      this.outboundTimer = null;
+    }
     if (this.connection) {
       const connection = this.connection;
       this.connection = null;
@@ -303,6 +327,9 @@ export class ConnectionManager {
       this.connectedAt = Math.floor(Date.now() / 1000);
       this.reconnectDelay = 0;
       this.setState("connected", null);
+
+      // Drain anything that queued while we were away (offline sends, backoffs).
+      void this.processOutboundQueue();
 
       this.batteryTimer = setInterval(() => {
         void this.pollBattery(activeConnection, generation, signal);
@@ -569,65 +596,196 @@ export class ConnectionManager {
     }
   }
 
+  /**
+   * Accept a direct message into the outbound queue and return it immediately as
+   * `pending`. The worker hands it to the radio (and drives ack → delivered) in
+   * the background; a failed hand-off retries with backoff and surfaces
+   * `retrying`/`failed` over the bus. Never blocks on radio availability.
+   */
   async sendDirectMessage(contactKey: string, text: string, cli = false): Promise<Message> {
-    const connection = this.requireConnection();
-    const pubKey = BufferUtils.hexToBytes(contactKey);
-    const senderTimestamp = Math.floor(Date.now() / 1000);
-    const stored = this.store.insertMessage({
-      kind: "dm",
-      contactKey,
-      direction: "out",
-      text,
-      senderTimestamp,
-      status: "pending",
-    });
-    if (!stored) throw new Error("duplicate message");
-    try {
-      return await this.runDirectSend(stored.id, async (pending) => {
-        const txtType = cli ? Constants.TxtTypes.CliData : Constants.TxtTypes.Plain;
-        const sent = await connection.sendTextMessage(pubKey, text, txtType);
-        pending.expectedAckCrc = sent.expectedAckCrc;
-        this.db_setAck(stored.id, sent.expectedAckCrc);
-
-        if (pending.earlyAckCode === sent.expectedAckCrc) {
-          this.finishDirectDelivery(pending, true);
-          return { ...stored, status: "delivered" };
-        }
-
-        this.store.setMessageStatus(stored.id, "sent");
-        this.bus.publish({ type: "message.status", id: stored.id, status: "sent" });
-        pending.timeout = setTimeout(() => this.finishDirectDelivery(pending, false), sent.estTimeout);
-        return { ...stored, status: "sent" };
-      });
-    } catch (error) {
-      this.store.setMessageStatus(stored.id, "failed");
-      this.bus.publish({ type: "message.status", id: stored.id, status: "failed" });
-      throw error instanceof Error ? error : new Error("radio rejected the message");
-    }
+    return this.enqueueOutboundMessage({ kind: "dm", contactKey, text, cli });
   }
 
   async sendChannelMessage(channelIdx: number, text: string): Promise<Message> {
-    const connection = this.requireConnection();
-    const senderTimestamp = Math.floor(Date.now() / 1000);
-    const stored = this.store.insertMessage({
-      kind: "channel",
-      channelIdx,
-      direction: "out",
-      text,
-      senderTimestamp,
-      status: "pending",
-    });
-    if (!stored) throw new Error("duplicate message");
-    try {
-      await connection.sendChannelTextMessage(channelIdx, text);
-      this.store.setMessageStatus(stored.id, "sent");
-      this.bus.publish({ type: "message.status", id: stored.id, status: "sent" });
-      return { ...stored, status: "sent" };
-    } catch (error) {
-      this.store.setMessageStatus(stored.id, "failed");
-      this.bus.publish({ type: "message.status", id: stored.id, status: "failed" });
-      throw error instanceof Error ? error : new Error("radio rejected the message");
+    return this.enqueueOutboundMessage({ kind: "channel", channelIdx, text });
+  }
+
+  private enqueueOutboundMessage(
+    input:
+      | { kind: "dm"; contactKey: string; text: string; cli: boolean }
+      | { kind: "channel"; channelIdx: number; text: string },
+  ): Message {
+    // Standby means the radio was handed to a browser: reject rather than queue
+    // a send that would fire much later on reclaim. A merely offline radio
+    // (disconnected/connecting/error) still queues and delivers on reconnect.
+    if (this.isStandby()) {
+      throw new RadioUnavailableError("radio is in standby (released to a browser session)");
     }
+    const senderTimestamp = nowSecs();
+    const stored =
+      input.kind === "dm"
+        ? this.store.insertMessage({
+            kind: "dm",
+            contactKey: input.contactKey,
+            direction: "out",
+            text: input.text,
+            senderTimestamp,
+            status: "pending",
+          })
+        : this.store.insertMessage({
+            kind: "channel",
+            channelIdx: input.channelIdx,
+            direction: "out",
+            text: input.text,
+            senderTimestamp,
+            status: "pending",
+          });
+    if (!stored) throw new Error("duplicate message");
+    this.store.enqueueOutbound({
+      messageId: stored.id,
+      kind: input.kind,
+      contactKey: input.kind === "dm" ? input.contactKey : null,
+      channelIdx: input.kind === "channel" ? input.channelIdx : null,
+      text: input.text,
+      cli: input.kind === "dm" ? input.cli : false,
+      maxAttempts: this.config.outboundMaxAttempts,
+      nextAttemptAt: senderTimestamp,
+    });
+    void this.processOutboundQueue();
+    return stored;
+  }
+
+  /** Re-arm a `failed` outbound message for another round of delivery attempts. */
+  retryOutbound(messageId: number): Message {
+    const entry = this.store.getOutbound(messageId);
+    if (!entry) throw new OutboundNotFoundError("message is not in the outbound queue");
+    if (entry.state !== "failed") throw new OutboundStateError("only failed messages can be retried");
+    this.store.resetOutboundForRetry(messageId, nowSecs());
+    this.store.setMessageStatus(messageId, "pending");
+    const message = this.store.getMessage(messageId);
+    if (message) this.bus.publish({ type: "message.status", id: messageId, status: message.status });
+    void this.processOutboundQueue();
+    if (!message) throw new Error("message not found");
+    return message;
+  }
+
+  /** Give up on an outbound message: drop it from the queue and mark it failed. */
+  cancelOutbound(messageId: number): Message {
+    const entry = this.store.getOutbound(messageId);
+    if (!entry) throw new OutboundNotFoundError("message is not in the outbound queue");
+    this.store.removeOutbound(messageId);
+    this.store.setMessageStatus(messageId, "failed");
+    this.bus.publish({ type: "message.status", id: messageId, status: "failed" });
+    const message = this.store.getMessage(messageId);
+    if (!message) throw new Error("message not found");
+    return message;
+  }
+
+  /**
+   * Drain due outbound entries one at a time while the radio is available.
+   * Success removes the entry (DMs then follow the normal ack/timeout path);
+   * a hand-off failure backs the entry off, and a radio that drops mid-send
+   * leaves the entry pending without burning an attempt.
+   */
+  private async processOutboundQueue(): Promise<void> {
+    if (this.outboundRunning) {
+      this.outboundKickAgain = true;
+      return;
+    }
+    this.outboundRunning = true;
+    try {
+      while (!this.stopped && !this.isStandby() && (this.state === "connected" || this.state === "syncing")) {
+        const connection = this.connection;
+        if (!connection) break;
+        const due = this.store.takeDueOutbound(nowSecs());
+        if (!due.length) break;
+        const entry = due[0]!;
+        try {
+          if (entry.kind === "dm") {
+            await this.deliverDirect(entry, connection);
+          } else {
+            await this.deliverChannel(entry, connection);
+          }
+        } catch (error) {
+          if (error instanceof LifecycleCancelledError) break;
+          // Radio dropped mid-send: retry later without counting it as a failure.
+          if (this.state !== "connected" && this.state !== "syncing") break;
+          this.recordOutboundFailure(entry, error);
+        }
+      }
+    } finally {
+      this.outboundRunning = false;
+      if (this.outboundKickAgain) {
+        this.outboundKickAgain = false;
+        void this.processOutboundQueue();
+      } else {
+        this.scheduleOutboundTimer();
+      }
+    }
+  }
+
+  private async deliverDirect(entry: OutboundEntry, connection: Connection): Promise<void> {
+    if (!entry.contactKey) throw new Error("queued direct message is missing a contact key");
+    const pubKey = BufferUtils.hexToBytes(entry.contactKey);
+    await this.runDirectSend(entry.messageId, async (pending) => {
+      const txtType = entry.cli ? Constants.TxtTypes.CliData : Constants.TxtTypes.Plain;
+      const sent = await connection.sendTextMessage(pubKey, entry.text, txtType);
+      // Handed to the radio: the retry queue's job is done; ack/timeout now
+      // drives delivered vs. unconfirmed exactly as before.
+      pending.expectedAckCrc = sent.expectedAckCrc;
+      this.db_setAck(entry.messageId, sent.expectedAckCrc);
+      this.store.removeOutbound(entry.messageId);
+      if (pending.earlyAckCode === sent.expectedAckCrc) {
+        this.finishDirectDelivery(pending, true);
+        return;
+      }
+      this.store.setMessageStatus(entry.messageId, "sent");
+      this.bus.publish({ type: "message.status", id: entry.messageId, status: "sent" });
+      pending.timeout = setTimeout(() => this.finishDirectDelivery(pending, false), sent.estTimeout);
+    });
+  }
+
+  private async deliverChannel(entry: OutboundEntry, connection: Connection): Promise<void> {
+    if (entry.channelIdx === null) throw new Error("queued channel message is missing a channel index");
+    await connection.sendChannelTextMessage(entry.channelIdx, entry.text);
+    this.store.removeOutbound(entry.messageId);
+    this.store.setMessageStatus(entry.messageId, "sent");
+    this.bus.publish({ type: "message.status", id: entry.messageId, status: "sent" });
+  }
+
+  private recordOutboundFailure(entry: OutboundEntry, error: unknown): void {
+    const attempts = entry.attempts + 1;
+    const lastError = error instanceof Error ? error.message : String(error ?? "send failed");
+    if (attempts >= entry.maxAttempts) {
+      this.store.markOutboundAttempt(entry.messageId, { state: "failed", attempts, nextAttemptAt: nowSecs(), lastError });
+      this.store.setMessageStatus(entry.messageId, "failed");
+      this.bus.publish({ type: "message.status", id: entry.messageId, status: "failed" });
+    } else {
+      const nextAttemptAt = nowSecs() + Math.ceil(outboundBackoffMs(attempts) / 1000);
+      // The message row stays `pending`; the queue's `retrying` state overlays it.
+      this.store.markOutboundAttempt(entry.messageId, { state: "retrying", attempts, nextAttemptAt, lastError });
+      this.bus.publish({ type: "message.status", id: entry.messageId, status: "retrying" });
+    }
+  }
+
+  private scheduleOutboundTimer(): void {
+    if (this.outboundTimer) {
+      clearTimeout(this.outboundTimer);
+      this.outboundTimer = null;
+    }
+    if (this.stopped || this.isStandby()) return;
+    // Only worth a timer while the radio can actually take a send. When offline
+    // the queue just waits; connect() kicks the worker on reconnect. (Scheduling
+    // regardless would busy-loop on a due entry that can never be attempted.)
+    if (this.state !== "connected" && this.state !== "syncing") return;
+    const next = this.store.nextOutboundAttemptAt();
+    if (next === null) return;
+    const delayMs = Math.min(Math.max(next * 1000 - Date.now(), 0), OUTBOUND_TIMER_CAP_MS);
+    this.outboundTimer = setTimeout(() => {
+      this.outboundTimer = null;
+      void this.processOutboundQueue();
+    }, delayMs);
+    this.outboundTimer.unref?.();
   }
 
   async sendAdvert(flood: boolean): Promise<void> {
@@ -926,6 +1084,10 @@ export class ConnectionManager {
 }
 
 export class RadioUnavailableError extends Error {}
+/** The referenced message has no outbound-queue entry (never queued or already delivered). */
+export class OutboundNotFoundError extends Error {}
+/** The outbound entry is not in a state that permits the requested action (e.g. retrying a non-failed send). */
+export class OutboundStateError extends Error {}
 
 interface RawContact {
   publicKey: Uint8Array;

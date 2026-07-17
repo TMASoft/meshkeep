@@ -168,6 +168,29 @@ const MIGRATIONS: string[] = [
   ALTER TABLE api_tokens ADD COLUMN scope TEXT NOT NULL DEFAULT 'read' CHECK (scope IN ('read','write'));
   ALTER TABLE api_tokens ADD COLUMN expires_at INTEGER;
   `,
+  // 9: persisted outbound retry queue. One row per outbound message that has
+  // not yet been handed off to the radio (or has exhausted its attempts). The
+  // message row keeps the coarse status (pending/sent/delivered/failed); the
+  // queue holds the retry ledger and derives the `retrying` display state.
+  // Removed on successful hand-off; a `failed` row lingers for user retry/cancel.
+  `
+  CREATE TABLE outbound_queue (
+    message_id      INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL CHECK (kind IN ('dm','channel')),
+    contact_key     TEXT,
+    channel_idx     INTEGER,
+    text            TEXT NOT NULL,
+    cli             INTEGER NOT NULL DEFAULT 0,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    max_attempts    INTEGER NOT NULL,
+    next_attempt_at INTEGER NOT NULL,
+    last_error      TEXT,
+    state           TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','retrying','failed')),
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+  );
+  CREATE INDEX idx_outbound_queue_due ON outbound_queue (state, next_attempt_at);
+  `,
 ];
 
 export type Db = Database.Database;

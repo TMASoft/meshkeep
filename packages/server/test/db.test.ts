@@ -56,6 +56,7 @@ describe("database migrations", () => {
     // everything migrations 7+ add, then let openDb re-apply them
     const legacy = openDb(path);
     legacy.exec(`
+      DROP TABLE outbound_queue;
       DROP TRIGGER messages_shape_bi;
       DROP TRIGGER messages_shape_bu;
       DROP TABLE sessions;

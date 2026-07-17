@@ -85,7 +85,11 @@ function dmQuery(id: Extract<ConversationId, { kind: "dm" }>): string {
 }
 
 function finalStatus(current: Message["status"], next: Message["status"]): Message["status"] {
-  return current === "delivered" || current === "failed" ? current : next;
+  // Only delivery is truly terminal. `failed` used to be terminal too, but a
+  // failed send can now be retried (failed → pending → sent/delivered), so it
+  // must accept a forward transition. WebSocket events are ordered per socket,
+  // so this cannot regress a live send.
+  return current === "delivered" ? current : next;
 }
 
 export const useAppStore = defineStore("app", {
@@ -375,6 +379,18 @@ export const useAppStore = defineStore("app", {
         body: JSON.stringify(body),
       });
       this.appendMessage(message);
+    },
+
+    /** Re-queue a failed outbound message for another round of delivery attempts. */
+    async retryMessage(messageId: number) {
+      const { message } = await api<{ message: Message }>(`/messages/${messageId}/retry`, { method: "POST" });
+      this.updateMessageStatus(message.id, message.status);
+    },
+
+    /** Give up on a queued/failed outbound message. */
+    async cancelMessage(messageId: number) {
+      const { message } = await api<{ message: Message }>(`/messages/${messageId}/cancel`, { method: "POST" });
+      this.updateMessageStatus(message.id, message.status);
     },
 
     /** Authenticate with a room server or repeater over the server radio. */

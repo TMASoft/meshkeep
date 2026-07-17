@@ -170,15 +170,21 @@ describe("http: internal errors stay generic", () => {
   });
 });
 
-describe("http: radio-touching routes 503 while disconnected", () => {
+describe("http: radio-touching routes while disconnected", () => {
   const { app } = buildHarness();
 
-  it("send dm", async () => {
+  it("send dm queues instead of failing", async () => {
+    // Sends are accepted into the outbound queue even with no radio: they stay
+    // pending and the worker delivers them once a radio is available.
     const res = await request(app)
       .post("/api/v1/messages")
       .send({ kind: "dm", to: KEY_A, text: "hello" })
-      .expect(503);
-    expect(res.body.error).toContain("radio is disconnected");
+      .expect(201);
+    expect(res.body.message.status).toBe("pending");
+
+    const queue = await request(app).get("/api/v1/messages/outbound").expect(200);
+    expect(queue.body.queue).toHaveLength(1);
+    expect(queue.body.queue[0]).toMatchObject({ messageId: res.body.message.id, kind: "dm", state: "pending" });
   });
 
   it("contacts refresh", async () => {
@@ -194,6 +200,37 @@ describe("http: radio-touching routes 503 while disconnected", () => {
       .put("/api/v1/channels/0")
       .send({ name: "test", secret: "0".repeat(32) })
       .expect(503);
+  });
+});
+
+describe("http: outbound queue retry/cancel", () => {
+  const { app } = buildHarness();
+
+  async function queueOne(text: string): Promise<number> {
+    const res = await request(app).post("/api/v1/messages").send({ kind: "dm", to: KEY_A, text }).expect(201);
+    return res.body.message.id as number;
+  }
+
+  it("lists queued sends", async () => {
+    const id = await queueOne("in the queue");
+    const res = await request(app).get("/api/v1/messages/outbound").expect(200);
+    expect(res.body.queue.some((e: { messageId: number }) => e.messageId === id)).toBe(true);
+  });
+
+  it("404s retrying an unknown message and 409s retrying a still-pending one", async () => {
+    await request(app).post("/api/v1/messages/999999/retry").expect(404);
+    const id = await queueOne("still pending");
+    await request(app).post(`/api/v1/messages/${id}/retry`).expect(409);
+  });
+
+  it("cancels a queued send and drops it from the queue", async () => {
+    const id = await queueOne("cancel me");
+    const res = await request(app).post(`/api/v1/messages/${id}/cancel`).expect(200);
+    expect(res.body.message.status).toBe("failed");
+    const queue = await request(app).get("/api/v1/messages/outbound").expect(200);
+    expect(queue.body.queue.some((e: { messageId: number }) => e.messageId === id)).toBe(false);
+    // a second cancel now 404s (no longer queued)
+    await request(app).post(`/api/v1/messages/${id}/cancel`).expect(404);
   });
 });
 

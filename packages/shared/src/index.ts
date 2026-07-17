@@ -47,7 +47,12 @@ export interface Channel {
 
 export type MessageKind = "dm" | "channel";
 export type MessageDirection = "in" | "out";
-export type MessageStatus = "pending" | "sent" | "delivered" | "failed";
+/**
+ * Outbound lifecycle plus the incoming default. `retrying` is derived from the
+ * outbound queue (a persisted `pending` message whose last hand-off attempt
+ * failed and has a backoff scheduled); it is never stored on the message row.
+ */
+export type MessageStatus = "pending" | "sent" | "delivered" | "failed" | "retrying";
 
 export interface Message {
   id: number;
@@ -88,6 +93,26 @@ export interface ConversationUnread {
 export interface MessageSearchResult extends Message {
   /** Excerpt around the match; matched terms are wrapped in \x01…\x02. */
   snippet: string;
+}
+
+/** One outbound message awaiting (or having exhausted) delivery hand-off to the radio. */
+export interface OutboundQueueEntry {
+  messageId: number;
+  kind: MessageKind;
+  /** Set for direct messages. */
+  contactKey: string | null;
+  /** Set for channel messages. */
+  channelIdx: number | null;
+  text: string;
+  attempts: number;
+  maxAttempts: number;
+  /** Epoch seconds the worker may next attempt this entry. */
+  nextAttemptAt: number;
+  lastError: string | null;
+  /** `pending` (awaiting first/next attempt), `retrying` (backing off), `failed` (exhausted). */
+  state: "pending" | "retrying" | "failed";
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface ConnectionStatus {

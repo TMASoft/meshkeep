@@ -507,6 +507,49 @@ describe("message handling", () => {
     await store.sendMessage({ kind: "dm", contactKey: KEY_A }, "status");
     expect(apiMock).toHaveBeenCalledWith(`/contacts/${KEY_A}/cli`, expect.objectContaining({ method: "POST" }));
   });
+
+  it("moves a retrying send forward and lets a failed send be retried", () => {
+    const store = useAppStore();
+    const key = conversationKey({ kind: "dm", contactKey: KEY_A });
+    store.appendMessage(message({ id: 7, direction: "out", status: "pending" }));
+
+    // a hand-off failure surfaces as retrying, then recovers to delivered
+    store.updateMessageStatus(7, "retrying");
+    expect(store.conversations[key][0].status).toBe("retrying");
+    store.updateMessageStatus(7, "sent");
+    store.updateMessageStatus(7, "delivered");
+    expect(store.conversations[key][0].status).toBe("delivered");
+
+    // delivered is terminal: a late event cannot regress it
+    store.updateMessageStatus(7, "retrying");
+    expect(store.conversations[key][0].status).toBe("delivered");
+  });
+
+  it("failed is not terminal: a retry can move it back to pending then sent", () => {
+    const store = useAppStore();
+    const key = conversationKey({ kind: "dm", contactKey: KEY_A });
+    store.appendMessage(message({ id: 8, direction: "out", status: "failed" }));
+    store.updateMessageStatus(8, "pending");
+    expect(store.conversations[key][0].status).toBe("pending");
+    store.updateMessageStatus(8, "sent");
+    expect(store.conversations[key][0].status).toBe("sent");
+  });
+
+  it("retryMessage and cancelMessage call the endpoints and apply the returned status", async () => {
+    const store = useAppStore();
+    store.appendMessage(message({ id: 12, direction: "out", status: "failed" }));
+
+    apiMock.mockResolvedValueOnce({ message: message({ id: 12, direction: "out", status: "pending" }) });
+    await store.retryMessage(12);
+    expect(apiMock).toHaveBeenCalledWith("/messages/12/retry", expect.objectContaining({ method: "POST" }));
+    const key = conversationKey({ kind: "dm", contactKey: KEY_A });
+    expect(store.conversations[key][0].status).toBe("pending");
+
+    apiMock.mockResolvedValueOnce({ message: message({ id: 12, direction: "out", status: "failed" }) });
+    await store.cancelMessage(12);
+    expect(apiMock).toHaveBeenCalledWith("/messages/12/cancel", expect.objectContaining({ method: "POST" }));
+    expect(store.conversations[key][0].status).toBe("failed");
+  });
 });
 
 describe("websocket event application", () => {

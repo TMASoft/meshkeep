@@ -22,6 +22,7 @@ export function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     bleAddress: null,
     uiPassword: null,
     telemetryRetentionDays: 30,
+    outboundMaxAttempts: 5,
     mapRefreshMinutes: 10,
     mapUpstream: "https://map.meshcore.io/api/v1/nodes",
     mapEnabled: true,
