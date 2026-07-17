@@ -1,5 +1,5 @@
 # build from the repo root: docker build -f docker/Dockerfile .
-FROM node:22-bookworm-slim AS build
+FROM node:26-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY packages/shared/package.json packages/shared/
@@ -13,7 +13,7 @@ RUN npm run build --workspace @meshkeep/shared \
   && npm run build --workspace @meshkeep/server \
   && npm run build --workspace @meshkeep/web
 
-FROM node:22-bookworm-slim
+FROM node:26-bookworm-slim
 # Baseline OCI metadata for local builds; the release workflow augments these
 # (revision, version, created) via docker/metadata-action labels.
 LABEL org.opencontainers.image.source="https://github.com/TMASoft/meshkeep" \
