@@ -64,7 +64,9 @@ export function validateConnectionSettings(settings: ConnectionSettings): string
  */
 export function describeConnectError(transport: ConnectionTransport, message: string): string {
   if (transport !== "ble") return message;
-  if (/system_bus_socket|dbus|disconnected before authentication|EACCES.*bus/i.test(message)) {
+  // "stream is closed" is dbus-next's wording when the bus socket died under an
+  // in-flight call (bluetoothd restarted, or the socket mount went away)
+  if (/system_bus_socket|dbus|disconnected before authentication|EACCES.*bus|stream is closed/i.test(message)) {
     return `BlueZ/D-Bus unreachable (${message}) — check the D-Bus socket mount and that bluetoothd is running`;
   }
   if (/no available adapters|adapter not found/i.test(message)) {

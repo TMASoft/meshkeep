@@ -43,6 +43,14 @@ describe("describeConnectError", () => {
     expect(gone).toContain("radio not found");
   });
 
+  it("labels a bus that died mid-call as a D-Bus fault, not a missing radio", () => {
+    // dbus-next's wording when the socket dies under an in-flight call; it names
+    // no device, so without this the UI blamed the radio for a bluetoothd restart
+    const closed = describeConnectError("ble", "Cannot send message, stream is closed");
+    expect(closed).toContain("BlueZ/D-Bus unreachable");
+    expect(closed).toContain("bluetoothd");
+  });
+
   it("passes unknown BLE errors and non-BLE transports through", () => {
     expect(describeConnectError("ble", "le-connection-abort-by-local")).toBe("le-connection-abort-by-local");
     expect(describeConnectError("serial", "operation timed out")).toBe("operation timed out");
