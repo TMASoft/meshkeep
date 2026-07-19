@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
-import type { BleCandidate, ConnectionSettings, DetectedSerialPort, TelemetryPoint } from "@meshkeep/shared";
+import type { BleCandidate, ConnectionSettings, DetectedSerialPort, RadioProfile, TelemetryPoint } from "@meshkeep/shared";
 import { api } from "../api/client";
 import { useAppStore } from "../stores/app";
 import { browserRadioSupport, type BrowserRadioKind } from "../sources/browser-radio";
@@ -290,6 +290,7 @@ const chart = computed(() => {
 interface ConnConfig {
   env: ConnectionSettings;
   override: Partial<ConnectionSettings> | null;
+  activeProfile: RadioProfile | null;
   effective: ConnectionSettings;
 }
 
@@ -305,6 +306,18 @@ function seedConnForm(settings: ConnectionSettings) {
   connForm.bleAddress = settings.bleAddress ?? "";
 }
 
+/** The connection form as an API body (shared by override saves and profile saves). */
+function connFormBody(): Record<string, unknown> {
+  const body: Record<string, unknown> = { connection: connForm.transport };
+  if (connForm.transport === "serial") body.serialPort = connForm.serialPort || null;
+  if (connForm.transport === "tcp") {
+    body.tcpHost = connForm.tcpHost || null;
+    body.tcpPort = Number.parseInt(connForm.tcpPort, 10) || 5000;
+  }
+  if (connForm.transport === "ble") body.bleAddress = connForm.bleAddress || null;
+  return body;
+}
+
 async function loadConnConfig() {
   try {
     connConfig.value = await api<ConnConfig>("/connection/config");
@@ -317,18 +330,24 @@ async function loadConnConfig() {
 
 const saveConnConfig = () =>
   run("Connection update", async () => {
-    const override: Record<string, unknown> = { connection: connForm.transport };
-    if (connForm.transport === "serial") override.serialPort = connForm.serialPort || null;
-    if (connForm.transport === "tcp") {
-      override.tcpHost = connForm.tcpHost || null;
-      override.tcpPort = Number.parseInt(connForm.tcpPort, 10) || 5000;
+    if (editingProfileId.value !== null) {
+      // form is editing a saved profile — update it (the server reconnects if it's active)
+      await api<RadioProfile>(`/radio/profiles/${editingProfileId.value}`, {
+        method: "PUT",
+        body: JSON.stringify(connFormBody()),
+      });
+      editingProfileId.value = null;
+      await loadProfiles();
+      await loadConnConfig();
+    } else {
+      connConfig.value = await api<ConnConfig>("/connection/config", {
+        method: "PUT",
+        body: JSON.stringify({ override: connFormBody() }),
+      });
+      seedConnForm(connConfig.value.effective);
+      // an explicit override replaces any active profile selection
+      activeProfileId.value = null;
     }
-    if (connForm.transport === "ble") override.bleAddress = connForm.bleAddress || null;
-    connConfig.value = await api<ConnConfig>("/connection/config", {
-      method: "PUT",
-      body: JSON.stringify({ override }),
-    });
-    seedConnForm(connConfig.value.effective);
     await store.refreshStatus();
   });
 
@@ -339,8 +358,102 @@ const clearConnConfig = () =>
       body: JSON.stringify({ override: null }),
     });
     seedConnForm(connConfig.value.effective);
+    activeProfileId.value = null;
     await store.refreshStatus();
   });
+
+// ---- radio profiles (saved connection targets) ----
+
+const profiles = ref<RadioProfile[]>([]);
+const activeProfileId = ref<number | null>(null);
+const profilesError = ref(false);
+const newProfileName = ref("");
+const editingProfileId = ref<number | null>(null);
+
+const editingProfile = computed(() => profiles.value.find((p) => p.id === editingProfileId.value) ?? null);
+
+async function loadProfiles() {
+  try {
+    const result = await api<{ profiles: RadioProfile[]; activeProfileId: number | null }>("/radio/profiles");
+    profiles.value = result.profiles;
+    activeProfileId.value = result.activeProfileId;
+    profilesError.value = false;
+  } catch {
+    profilesError.value = true;
+  }
+}
+
+function profileTarget(profile: RadioProfile): string {
+  switch (profile.connection) {
+    case "serial":
+      return profile.serialPort ?? "no device set";
+    case "tcp":
+      return profile.tcpHost ? `${profile.tcpHost}:${profile.tcpPort}` : "no host set";
+    case "ble":
+      return profile.bleAddress ?? "no address set";
+    case "none":
+    default:
+      return "no radio";
+  }
+}
+
+const activateProfile = (profile: RadioProfile) =>
+  run(`Profile "${profile.name}"`, async () => {
+    const result = await api<ConnConfig>(`/radio/profiles/${profile.id}/activate`, { method: "POST" });
+    connConfig.value = result;
+    seedConnForm(result.effective);
+    activeProfileId.value = profile.id;
+    editingProfileId.value = null;
+    await store.refreshStatus();
+  });
+
+const deactivateProfile = () =>
+  run("Profile deactivation", async () => {
+    const result = await api<ConnConfig>("/radio/profiles/deactivate", { method: "POST" });
+    connConfig.value = result;
+    seedConnForm(result.effective);
+    activeProfileId.value = null;
+    await store.refreshStatus();
+  });
+
+const deleteProfile = (profile: RadioProfile) => {
+  if (!window.confirm(`Delete the radio profile "${profile.name}"?`)) return;
+  void run("Profile deletion", async () => {
+    await api(`/radio/profiles/${profile.id}`, { method: "DELETE" });
+    if (editingProfileId.value === profile.id) cancelProfileEdit();
+    await loadProfiles();
+  });
+};
+
+const saveAsProfile = () =>
+  run("Profile save", async () => {
+    const name = newProfileName.value.trim();
+    if (!name) throw new Error("Name the profile before saving it");
+    await api<RadioProfile>("/radio/profiles", {
+      method: "POST",
+      body: JSON.stringify({ name, ...connFormBody() }),
+    });
+    newProfileName.value = "";
+    await loadProfiles();
+  });
+
+function editProfile(profile: RadioProfile) {
+  editingProfileId.value = profile.id;
+  seedConnForm(profile);
+  serialCustom.value =
+    profile.connection === "serial" &&
+    !!profile.serialPort &&
+    !(serialPorts.value?.some((port) => port.path === profile.serialPort) ?? false);
+  bleCustom.value =
+    profile.connection === "ble" &&
+    !!profile.bleAddress &&
+    !(bleDevices.value?.some((device) => device.address === profile.bleAddress) ?? false);
+}
+
+function cancelProfileEdit() {
+  editingProfileId.value = null;
+  if (connConfig.value) seedConnForm(connConfig.value.effective);
+}
 
 // ---- hardware detection ----
 
@@ -446,6 +559,7 @@ async function copyShareUri() {
 onMounted(() => {
   void loadTelemetry();
   void loadConnConfig();
+  void loadProfiles();
 });
 </script>
 
@@ -772,9 +886,43 @@ onMounted(() => {
         <section class="module connection-module">
           <div class="module-heading">
             <div><span class="module-index">07</span><h2>Connection</h2></div>
-            <span v-if="connConfig?.override" class="module-hint override-hint">override active</span>
+            <span v-if="connConfig?.activeProfile" class="module-hint override-hint">profile · {{ connConfig.activeProfile.name }}</span>
+            <span v-else-if="connConfig?.override" class="module-hint override-hint">override active</span>
             <span v-else class="module-hint">from environment</span>
           </div>
+
+          <div v-if="profilesError" class="token-error" role="alert">Unable to load radio profiles.</div>
+          <div v-else-if="profiles.length" class="profile-list">
+            <article
+              v-for="profile in profiles"
+              :key="profile.id"
+              class="profile-row"
+              :class="{ active: profile.id === activeProfileId, editing: profile.id === editingProfileId }"
+            >
+              <span class="profile-icon"><AppIcon name="radio" :size="16" /></span>
+              <div class="profile-identity">
+                <strong>{{ profile.name }}</strong>
+                <span>{{ profile.connection }} · {{ profileTarget(profile) }}</span>
+              </div>
+              <div class="profile-actions">
+                <span v-if="profile.id === activeProfileId" class="profile-active-badge">Active</span>
+                <button v-else type="button" class="profile-connect" :disabled="busy !== null" @click="activateProfile(profile)">
+                  Connect
+                </button>
+                <button type="button" :disabled="busy !== null" @click="editProfile(profile)">Edit</button>
+                <button
+                  v-if="profile.id !== activeProfileId"
+                  type="button"
+                  class="profile-delete"
+                  :disabled="busy !== null"
+                  @click="deleteProfile(profile)"
+                >
+                  Delete
+                </button>
+              </div>
+            </article>
+          </div>
+
           <div v-if="connError" class="token-error" role="alert">Unable to load connection settings.</div>
           <form v-else class="settings-form" @submit.prevent="saveConnConfig">
             <label class="field field-wide">
@@ -843,13 +991,37 @@ onMounted(() => {
                 This radio isn't paired yet — pair once on the host with bluetoothctl (companion firmware PIN 123456).
               </p>
             </template>
-            <div class="coordinate-note field-wide">
+            <div v-if="editingProfile" class="coordinate-note field-wide">
+              <AppIcon name="info" :size="16" />
+              Editing profile "{{ editingProfile.name }}" — saving updates the profile{{
+                editingProfile.id === activeProfileId ? " and reconnects" : ""
+              }}.
+            </div>
+            <div v-else class="coordinate-note field-wide">
               <AppIcon name="info" :size="16" />
               Saving reconnects the radio immediately. Reset returns to the container's environment settings.
             </div>
             <div class="conn-buttons field-wide">
               <button
-                v-if="connConfig?.override"
+                v-if="editingProfile"
+                class="button secondary"
+                type="button"
+                :disabled="busy !== null"
+                @click="cancelProfileEdit"
+              >
+                Cancel edit
+              </button>
+              <button
+                v-else-if="connConfig?.activeProfile"
+                class="button secondary"
+                type="button"
+                :disabled="busy !== null"
+                @click="deactivateProfile"
+              >
+                <span v-if="busy === 'Profile deactivation'" class="button-spinner" />Use environment
+              </button>
+              <button
+                v-else-if="connConfig?.override"
                 class="button secondary"
                 type="button"
                 :disabled="busy !== null"
@@ -859,7 +1031,18 @@ onMounted(() => {
               </button>
               <button class="button primary" type="submit" :disabled="busy !== null">
                 <span v-if="busy === 'Connection update'" class="button-spinner" />
-                <AppIcon v-else name="check" :size="16" /> Save &amp; reconnect
+                <AppIcon v-else name="check" :size="16" /> {{ editingProfile ? "Save profile" : "Save & reconnect" }}
+              </button>
+            </div>
+            <div v-if="!editingProfile" class="profile-save-row field-wide">
+              <input
+                v-model="newProfileName"
+                placeholder="Profile name — e.g. Bench radio"
+                maxlength="64"
+                autocomplete="off"
+              />
+              <button class="button secondary" type="button" :disabled="busy !== null" @click="saveAsProfile">
+                <span v-if="busy === 'Profile save'" class="button-spinner" />Save as profile
               </button>
             </div>
           </form>
@@ -1068,6 +1251,24 @@ onMounted(() => {
 .source-buttons .button { flex: 1; }
 .source-note { margin: -6px 18px 15px; color: var(--text-faint); font-size: 10px; }
 .conn-buttons { display: flex; justify-content: flex-end; gap: 8px; }
+.profile-list { margin: 0 18px 14px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-2); }
+.profile-row { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: calc(10px * var(--space-unit)) 12px; }
+.profile-row + .profile-row { border-top: 1px solid var(--border); }
+.profile-row.active { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.profile-row.editing { background: color-mix(in srgb, var(--amber) 7%, transparent); }
+.profile-icon { display: grid; place-items: center; color: var(--text-faint); }
+.profile-row.active .profile-icon { color: var(--accent); }
+.profile-identity { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.profile-identity strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.profile-identity span { overflow: hidden; color: var(--text-faint); font-family: monospace; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.profile-actions { display: flex; align-items: center; gap: 2px; }
+.profile-actions button { min-width: 44px; min-height: 44px; border: 0; background: transparent; color: var(--text-muted); font-size: 10px; font-weight: 700; cursor: pointer; }
+.profile-actions button:hover:not(:disabled) { color: var(--text); }
+.profile-actions button.profile-connect { color: var(--accent); }
+.profile-actions button.profile-delete { color: var(--danger); }
+.profile-active-badge { padding: 0 8px; color: var(--accent); font-family: monospace; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.profile-save-row { display: flex; gap: 8px; }
+.profile-save-row input { min-width: 0; flex: 1; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); padding: 10px 12px; color: var(--text); font-size: 12px; }
 .detect-row { display: flex; gap: 6px; }
 .detect-row .field-select { min-width: 0; flex: 1; }
 .detect-button { flex: 0 0 auto; }

@@ -114,8 +114,15 @@ a BLE radio near your *browsing* device is often better served by browser-direct
 | `MESHKEEP_LOG_LEVEL` | `info` | stdout log verbosity: `debug`, `info`, `warn`, `error` |
 
 Connection settings can also be changed at runtime from Radio → Connection; a saved
-override wins over the environment until you reset it. The form detects candidate
-hardware for you: plugged-in USB radios are listed by name (with a free-text escape
+override wins over the environment until you reset it. Settings can also be saved as
+named **radio profiles** and switched with one click from the same card — useful when
+you move one server between several radios (bench, portable, attic ser2net). The
+active profile takes precedence over both the override and the environment; the
+server still drives one radio at a time, and switching profiles reconnects
+immediately. Browser-direct sessions are unaffected: they always pick their own
+device through the browser's serial/Bluetooth chooser, regardless of the server's
+profile selection. Profiles live in the API under `/api/v1/radio/profiles`.
+The form detects candidate hardware for you: plugged-in USB radios are listed by name (with a free-text escape
 hatch for unusual boards), and a BLE scan lists nearby radios with signal strength
 and pairing state.
 

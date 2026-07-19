@@ -10,6 +10,7 @@ import type {
   MessageSearchResult,
   MessageStatus,
   OutboundQueueEntry,
+  RadioProfile,
   SelfInfo,
   SensorReading,
   TelemetryPoint,
@@ -52,6 +53,48 @@ function rowToOutbound(row: OutboundRow): OutboundEntry {
     nextAttemptAt: row.next_attempt_at,
     lastError: row.last_error,
     state: row.state,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+/** Connection fields of a profile; name required on create, defaults fill the rest. */
+export type RadioProfileInput = Pick<RadioProfile, "name" | "connection"> &
+  Partial<Pick<RadioProfile, "serialPort" | "serialBaud" | "tcpHost" | "tcpPort" | "bleAddress">>;
+
+/** A profile name is a user-facing unique handle; surfaced as a conflict, not an internal error. */
+export class DuplicateProfileNameError extends Error {}
+
+function translateProfileNameConflict(error: unknown, name: string): unknown {
+  if (error instanceof Error && "code" in error && error.code === "SQLITE_CONSTRAINT_UNIQUE") {
+    return new DuplicateProfileNameError(`a radio profile named "${name}" already exists`);
+  }
+  return error;
+}
+
+interface RadioProfileRow {
+  id: number;
+  name: string;
+  transport: RadioProfile["connection"];
+  serial_port: string | null;
+  serial_baud: number;
+  tcp_host: string | null;
+  tcp_port: number;
+  ble_address: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+function rowToRadioProfile(row: RadioProfileRow): RadioProfile {
+  return {
+    id: row.id,
+    name: row.name,
+    connection: row.transport,
+    serialPort: row.serial_port,
+    serialBaud: row.serial_baud,
+    tcpHost: row.tcp_host,
+    tcpPort: row.tcp_port,
+    bleAddress: row.ble_address,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -265,6 +308,78 @@ export class Store {
       secret_hex: string;
     }>;
     return rows.map((r) => ({ idx: r.idx, name: r.name, secret: r.secret_hex }));
+  }
+
+  listRadioProfiles(): RadioProfile[] {
+    const rows = this.db
+      .prepare("SELECT * FROM radio_profiles ORDER BY name")
+      .all() as RadioProfileRow[];
+    return rows.map(rowToRadioProfile);
+  }
+
+  getRadioProfile(id: number): RadioProfile | null {
+    const row = this.db.prepare("SELECT * FROM radio_profiles WHERE id = ?").get(id) as
+      | RadioProfileRow
+      | undefined;
+    return row ? rowToRadioProfile(row) : null;
+  }
+
+  createRadioProfile(input: RadioProfileInput): RadioProfile {
+    const ts = now();
+    try {
+      const result = this.db
+        .prepare(
+          `INSERT INTO radio_profiles (name, transport, serial_port, serial_baud, tcp_host, tcp_port, ble_address, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.name,
+          input.connection,
+          input.serialPort ?? null,
+          input.serialBaud ?? 115_200,
+          input.tcpHost ?? null,
+          input.tcpPort ?? 5_000,
+          input.bleAddress ?? null,
+          ts,
+          ts,
+        );
+      return this.getRadioProfile(Number(result.lastInsertRowid))!;
+    } catch (error) {
+      throw translateProfileNameConflict(error, input.name);
+    }
+  }
+
+  /** Apply a partial update; returns the updated profile or null when the id is unknown. */
+  updateRadioProfile(id: number, patch: Partial<RadioProfileInput>): RadioProfile | null {
+    const existing = this.getRadioProfile(id);
+    if (!existing) return null;
+    const defined = Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined));
+    const merged = { ...existing, ...defined };
+    try {
+      this.db
+        .prepare(
+          `UPDATE radio_profiles SET name = ?, transport = ?, serial_port = ?, serial_baud = ?, tcp_host = ?, tcp_port = ?, ble_address = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(
+          merged.name,
+          merged.connection,
+          merged.serialPort,
+          merged.serialBaud,
+          merged.tcpHost,
+          merged.tcpPort,
+          merged.bleAddress,
+          now(),
+          id,
+        );
+    } catch (error) {
+      throw translateProfileNameConflict(error, merged.name);
+    }
+    return this.getRadioProfile(id);
+  }
+
+  deleteRadioProfile(id: number): boolean {
+    return this.db.prepare("DELETE FROM radio_profiles WHERE id = ?").run(id).changes > 0;
   }
 
   /** Insert a message once per stable ingestion ID. */

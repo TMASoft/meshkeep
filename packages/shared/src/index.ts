@@ -217,6 +217,17 @@ export interface ConnectionSettings {
   bleAddress: string | null;
 }
 
+/**
+ * A saved, named connection target (issue #53). The active profile — when one
+ * is selected — takes precedence over env settings and the runtime override.
+ */
+export interface RadioProfile extends ConnectionSettings {
+  id: number;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 // Hardware auto-detection (Radio → Connection).
 export interface DetectedSerialPort {
   /** Stable /dev/serial/by-id path when available, otherwise the raw path. */

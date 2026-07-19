@@ -8,13 +8,14 @@ import {
   type Contact,
   type Message,
   type NodeStats,
+  type RadioProfile,
   type SelfInfo,
   type SensorReading,
 } from "@meshkeep/shared";
 import type { ServerConfig } from "../config.js";
 import type { Bus } from "../bus.js";
 import { getSetting, setSetting, type Db } from "../db/index.js";
-import { Store, type OutboundEntry } from "../db/store.js";
+import { Store, type OutboundEntry, type RadioProfileInput } from "../db/store.js";
 import { createConnection, describeTarget } from "./transports.js";
 import { describeConnectError, nextReconnectDelay, reconnectPolicyFor, validateConnectionSettings } from "./reconnect-policy.js";
 
@@ -25,6 +26,7 @@ const CLOCK_DRIFT_TOLERANCE_SECS = 30;
 const BATTERY_POLL_MS = 5 * 60_000;
 const MAX_CHANNELS = 8;
 const CONNECTION_OVERRIDE_KEY = "connection.override";
+const ACTIVE_PROFILE_KEY = "connection.activeProfileId";
 
 // Outbound retry backoff: hand-off failures (radio rejected the frame) back off
 // exponentially between these bounds; a radio that is simply offline is left
@@ -151,11 +153,14 @@ export class ConnectionManager {
   /**
    * Connection settings come from env, but a runtime override saved through
    * the UI (settings table) wins — env is fixed for the container's lifetime,
-   * so it acts as the default the override falls back to.
+   * so it acts as the default the override falls back to. An activated radio
+   * profile takes precedence over both: the profile is a complete, named
+   * target, never merged with env or the override.
    */
   connectionSettings(): {
     env: ConnectionSettings;
     override: Partial<ConnectionSettings> | null;
+    activeProfile: RadioProfile | null;
     effective: ConnectionSettings;
   } {
     const env: ConnectionSettings = {
@@ -167,12 +172,67 @@ export class ConnectionManager {
       bleAddress: this.config.bleAddress,
     };
     const override = getSetting<Partial<ConnectionSettings>>(this.db, CONNECTION_OVERRIDE_KEY) ?? null;
-    return { env, override, effective: override ? { ...env, ...override } : env };
+    const activeProfile = this.activeProfile();
+    const effective: ConnectionSettings = activeProfile
+      ? {
+          connection: activeProfile.connection,
+          serialPort: activeProfile.serialPort,
+          serialBaud: activeProfile.serialBaud,
+          tcpHost: activeProfile.tcpHost,
+          tcpPort: activeProfile.tcpPort,
+          bleAddress: activeProfile.bleAddress,
+        }
+      : override
+        ? { ...env, ...override }
+        : env;
+    return { env, override, activeProfile, effective };
+  }
+
+  /** The selected radio profile, or null when none is selected (or it was deleted). */
+  activeProfile(): RadioProfile | null {
+    const id = getSetting<number>(this.db, ACTIVE_PROFILE_KEY);
+    return id === null ? null : this.store.getRadioProfile(id);
   }
 
   /** Persist (or clear) a connection override and reconnect with the new settings. */
   async setConnectionOverride(override: Partial<ConnectionSettings> | null): Promise<void> {
     setSetting(this.db, CONNECTION_OVERRIDE_KEY, override);
+    // an explicit override is a direct instruction — it replaces any profile selection
+    setSetting(this.db, ACTIVE_PROFILE_KEY, null);
+    await this.applyConnectionChange();
+  }
+
+  /** Select a radio profile (or null for env/override settings) and reconnect. */
+  async activateProfile(id: number | null): Promise<void> {
+    if (id !== null && !this.store.getRadioProfile(id)) {
+      throw new ProfileNotFoundError(`radio profile ${id} not found`);
+    }
+    setSetting(this.db, ACTIVE_PROFILE_KEY, id);
+    await this.applyConnectionChange();
+  }
+
+  /** Update a profile; editing the active profile reconnects with the new settings. */
+  async updateProfile(id: number, patch: Partial<RadioProfileInput>): Promise<RadioProfile> {
+    const updated = this.store.updateRadioProfile(id, patch);
+    if (!updated) throw new ProfileNotFoundError(`radio profile ${id} not found`);
+    if (getSetting<number>(this.db, ACTIVE_PROFILE_KEY) === id) {
+      await this.applyConnectionChange();
+    }
+    return updated;
+  }
+
+  /** Delete a profile. The active profile cannot be deleted — deactivate it first. */
+  deleteProfile(id: number): void {
+    if (getSetting<number>(this.db, ACTIVE_PROFILE_KEY) === id) {
+      throw new ActiveProfileError("cannot delete the active radio profile — deactivate it first");
+    }
+    if (!this.store.deleteRadioProfile(id)) {
+      throw new ProfileNotFoundError(`radio profile ${id} not found`);
+    }
+  }
+
+  /** Tear down and reconnect (or settle in the right idle state) after a settings change. */
+  private async applyConnectionChange(): Promise<void> {
     await this.teardown();
     if (this.stopped) return;
     if (this.isStandby()) {
@@ -1084,6 +1144,10 @@ export class ConnectionManager {
 }
 
 export class RadioUnavailableError extends Error {}
+/** The referenced radio profile does not exist. */
+export class ProfileNotFoundError extends Error {}
+/** The operation is not allowed on the currently active radio profile. */
+export class ActiveProfileError extends Error {}
 /** The referenced message has no outbound-queue entry (never queued or already delivered). */
 export class OutboundNotFoundError extends Error {}
 /** The outbound entry is not in a state that permits the requested action (e.g. retrying a non-failed send). */

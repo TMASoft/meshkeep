@@ -1,7 +1,14 @@
 import { Router, json, type Request, type Response } from "express";
 import { z } from "zod";
 import type { ConnectionManager } from "../radio/manager.js";
-import { OutboundNotFoundError, OutboundStateError, RadioUnavailableError } from "../radio/manager.js";
+import {
+  ActiveProfileError,
+  OutboundNotFoundError,
+  OutboundStateError,
+  ProfileNotFoundError,
+  RadioUnavailableError,
+} from "../radio/manager.js";
+import { DuplicateProfileNameError } from "../db/store.js";
 import { listSerialPorts, scanBleRadios } from "../radio/detect.js";
 import type { MapCache } from "../map/cache.js";
 import type { Bus } from "../bus.js";
@@ -42,9 +49,13 @@ function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
         res.status(400).json({ error: "invalid request", details: error.issues });
       } else if (error instanceof RadioUnavailableError) {
         res.status(503).json({ error: error.message });
-      } else if (error instanceof OutboundNotFoundError) {
+      } else if (error instanceof OutboundNotFoundError || error instanceof ProfileNotFoundError) {
         res.status(404).json({ error: error.message });
-      } else if (error instanceof OutboundStateError) {
+      } else if (
+        error instanceof OutboundStateError ||
+        error instanceof ActiveProfileError ||
+        error instanceof DuplicateProfileNameError
+      ) {
         res.status(409).json({ error: error.message });
       } else if (error instanceof Error && error.constructor === Error && !("code" in error)) {
         // deliberately thrown operational message (e.g. "radio rejected the message")
@@ -540,6 +551,68 @@ export function buildApi(
         .nullable()
         .parse(req.body?.override ?? null);
       await manager.setConnectionOverride(override);
+      res.json({ ...manager.connectionSettings(), state: manager.getState() });
+    }),
+  );
+
+  // ---- radio profiles (saved, named connection targets — issue #53) ----
+  const profileFields = {
+    connection: z.enum(["serial", "tcp", "ble", "none"]),
+    serialPort: z.string().min(1).max(256).nullish(),
+    serialBaud: z.number().int().min(1).max(10_000_000).optional(),
+    tcpHost: z.string().min(1).max(256).nullish(),
+    tcpPort: z.number().int().min(1).max(65535).optional(),
+    bleAddress: z.string().regex(/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i).nullish(),
+  };
+  const profileName = z.string().trim().min(1).max(64);
+  api.get(
+    "/radio/profiles",
+    handle((_req, res) => {
+      res.json({
+        profiles: manager.store.listRadioProfiles(),
+        activeProfileId: manager.activeProfile()?.id ?? null,
+      });
+    }),
+  );
+  api.post(
+    "/radio/profiles",
+    handle((req, res) => {
+      const body = z.object({ name: profileName, ...profileFields }).parse(req.body);
+      res.status(201).json(manager.store.createRadioProfile(body));
+    }),
+  );
+  api.put(
+    "/radio/profiles/:id",
+    handle(async (req, res) => {
+      const id = z.coerce.number().int().positive().parse(req.params.id);
+      const patch = z
+        .object({ name: profileName.optional(), ...profileFields })
+        .partial()
+        .parse(req.body);
+      res.json(await manager.updateProfile(id, patch));
+    }),
+  );
+  api.delete(
+    "/radio/profiles/:id",
+    handle((req, res) => {
+      const id = z.coerce.number().int().positive().parse(req.params.id);
+      manager.deleteProfile(id);
+      res.json({ ok: true });
+    }),
+  );
+  api.post(
+    "/radio/profiles/:id/activate",
+    handle(async (req, res) => {
+      const id = z.coerce.number().int().positive().parse(req.params.id);
+      await manager.activateProfile(id);
+      res.json({ ...manager.connectionSettings(), state: manager.getState() });
+    }),
+  );
+  // fall back to env + override settings without touching any saved profile
+  api.post(
+    "/radio/profiles/deactivate",
+    handle(async (_req, res) => {
+      await manager.activateProfile(null);
       res.json({ ...manager.connectionSettings(), state: manager.getState() });
     }),
   );

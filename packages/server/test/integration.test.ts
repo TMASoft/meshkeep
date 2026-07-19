@@ -517,6 +517,41 @@ describe("mock radio end-to-end", () => {
     expect(manager.connectionSettings().override).toBeNull();
   });
 
+  it("activates, edits, and deactivates radio profiles", async () => {
+    // a profile pointing at the mock radio becomes the effective connection
+    const profile = manager.store.createRadioProfile({
+      name: "Bench",
+      connection: "tcp",
+      tcpHost: "127.0.0.1",
+      tcpPort: mock.port,
+    });
+    await manager.activateProfile(profile.id);
+    await waitForState(manager, "connected");
+    const settings = manager.connectionSettings();
+    expect(settings.activeProfile?.name).toBe("Bench");
+    expect(settings.effective).toMatchObject({ connection: "tcp", tcpHost: "127.0.0.1", tcpPort: mock.port });
+
+    // the active profile is protected from deletion
+    expect(() => manager.deleteProfile(profile.id)).toThrow(/active/);
+
+    // editing the active profile applies the new settings immediately
+    await manager.updateProfile(profile.id, { connection: "none" });
+    await waitForState(manager, "disconnected");
+    expect(manager.connectionSettings().effective.connection).toBe("none");
+
+    // an explicit override replaces the profile selection
+    await manager.setConnectionOverride({ connection: "tcp", tcpHost: "127.0.0.1", tcpPort: mock.port });
+    await waitForState(manager, "connected");
+    expect(manager.connectionSettings().activeProfile).toBeNull();
+
+    // back to env settings; the now-inactive profile can be deleted
+    await manager.setConnectionOverride(null);
+    await waitForState(manager, "connected");
+    manager.deleteProfile(profile.id);
+    expect(manager.store.listRadioProfiles()).toHaveLength(0);
+    await expect(manager.activateProfile(9999)).rejects.toThrow(/not found/);
+  });
+
   it("logs in to a repeater, reads status, and runs CLI commands", async () => {
     const repeater = manager.store.getContacts().find((c) => c.name === "Mock Repeater")!;
 

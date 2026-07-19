@@ -191,6 +191,24 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX idx_outbound_queue_due ON outbound_queue (state, next_attempt_at);
   `,
+  // 10: named radio connection profiles (issue #53). The selected profile id
+  // lives in settings ('connection.activeProfileId'); with no selection the
+  // effective connection stays env + runtime override, so existing single-radio
+  // setups upgrade without any behavior change.
+  `
+  CREATE TABLE radio_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    transport TEXT NOT NULL CHECK (transport IN ('serial','tcp','ble','none')),
+    serial_port TEXT,
+    serial_baud INTEGER NOT NULL DEFAULT 115200,
+    tcp_host TEXT,
+    tcp_port INTEGER NOT NULL DEFAULT 5000,
+    ble_address TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  `,
 ];
 
 export type Db = Database.Database;
