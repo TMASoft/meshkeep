@@ -4,6 +4,8 @@ import { buildHarness } from "./helpers.js";
 
 const KEY_A = "a".repeat(64);
 const KEY_B = "b".repeat(64);
+// A browser-direct session names its radio by self public key on every ingest batch.
+const RADIO_KEY = "e".repeat(64);
 
 describe("http: status and health", () => {
   const { app } = buildHarness();
@@ -237,9 +239,10 @@ describe("http: outbound queue retry/cancel", () => {
 describe("http: store-backed reads", () => {
   const { app, manager } = buildHarness();
   const store = manager.store;
+  const radioId = store.resolveRadio("ee".repeat(32), "R");
 
   const base = 1_784_000_000;
-  store.upsertContact({
+  store.upsertContact(radioId, {
     publicKey: KEY_A,
     name: "Alice",
     type: "chat",
@@ -251,7 +254,7 @@ describe("http: store-backed reads", () => {
     lastSeen: null,
   });
   for (let i = 0; i < 25; i++) {
-    store.insertMessage({
+    store.insertMessage(radioId, {
       kind: "dm",
       contactKey: KEY_A,
       direction: i % 2 ? "out" : "in",
@@ -260,7 +263,7 @@ describe("http: store-backed reads", () => {
       status: "sent",
     });
   }
-  store.insertMessage({
+  store.insertMessage(radioId, {
     kind: "channel",
     channelIdx: 0,
     direction: "in",
@@ -296,7 +299,7 @@ describe("http: store-backed reads", () => {
 
   it("marks a conversation read", async () => {
     await request(app).post("/api/v1/messages/read").send({ contact: KEY_A }).expect(200);
-    expect(store.counts().unread).toBe(1); // only the channel message remains unread
+    expect(store.counts(radioId).unread).toBe(1); // only the channel message remains unread
   });
 
   it("exports csv with attachment headers", async () => {
@@ -320,7 +323,7 @@ describe("http: store-backed reads", () => {
   });
 
   it("serves telemetry points", async () => {
-    store.recordTelemetry(4100);
+    store.recordTelemetry(radioId, 4100);
     const res = await request(app).get("/api/v1/telemetry?hours=1").expect(200);
     expect(res.body.points).toHaveLength(1);
     expect(res.body.points[0].batteryMv).toBe(4100);
@@ -330,12 +333,13 @@ describe("http: store-backed reads", () => {
 describe("http: per-conversation unread summary", () => {
   const { app, manager } = buildHarness();
   const store = manager.store;
+  const radioId = store.resolveRadio("ee".repeat(32), "R");
   const base = 1_784_000_000;
   const prefix = "abcdef123456";
 
-  const insert = (input: Partial<Parameters<typeof store.insertMessage>[0]>, n = 1) => {
+  const insert = (input: Partial<Parameters<typeof store.insertMessage>[1]>, n = 1) => {
     for (let i = 0; i < n; i++) {
-      store.insertMessage({
+      store.insertMessage(radioId, {
         kind: "dm",
         direction: "in",
         text: `m${i}`,
@@ -345,7 +349,7 @@ describe("http: per-conversation unread summary", () => {
       });
     }
   };
-  store.upsertContact({
+  store.upsertContact(radioId, {
     publicKey: KEY_A,
     name: "Alice",
     type: "chat",
@@ -406,9 +410,9 @@ describe("http: ingest", () => {
       status: "sent",
       ingestionId: "00000000-0000-4000-8000-000000000004",
     };
-    const first = await request(app).post("/api/v1/ingest/messages").send({ messages: [message] }).expect(200);
+    const first = await request(app).post("/api/v1/ingest/messages").send({ radioKey: RADIO_KEY, messages: [message] }).expect(200);
     expect(first.body.inserted).toBe(1);
-    const again = await request(app).post("/api/v1/ingest/messages").send({ messages: [message] }).expect(200);
+    const again = await request(app).post("/api/v1/ingest/messages").send({ radioKey: RADIO_KEY, messages: [message] }).expect(200);
     expect(again.body.inserted).toBe(0);
   });
 
@@ -444,14 +448,15 @@ describe("http: ingest", () => {
       senderTimestamp: i + 1,
       status: "sent",
     }));
-      await request(app).post("/api/v1/ingest/messages").send({ messages }).expect(400);
+      await request(app).post("/api/v1/ingest/messages").send({ radioKey: RADIO_KEY, messages }).expect(400);
   });
 
   it("keeps ambiguous sender prefixes unresolved", async () => {
     const { app, manager } = buildHarness();
     const prefix = "abcdef123456";
+    const radioId = manager.store.resolveRadio(RADIO_KEY, null);
     for (const suffix of ["a", "b"]) {
-      manager.store.upsertContact({
+      manager.store.upsertContact(radioId, {
         publicKey: `${prefix}${suffix.repeat(52)}`,
         name: suffix,
         type: "chat",
@@ -466,6 +471,7 @@ describe("http: ingest", () => {
     const inserted = await request(app)
       .post("/api/v1/ingest/messages")
        .send({
+         radioKey: RADIO_KEY,
          messages: [
            {
              kind: "dm",
@@ -490,6 +496,7 @@ describe("http: ingest", () => {
     await request(app)
       .post("/api/v1/ingest/messages")
        .send({
+         radioKey: RADIO_KEY,
          messages: [
            {
              kind: "dm",
@@ -502,7 +509,7 @@ describe("http: ingest", () => {
          ],
        })
       .expect(200);
-    manager.store.upsertContact({
+    manager.store.upsertContact(manager.store.resolveRadio(RADIO_KEY, null), {
       publicKey: fullKey,
       name: "Alice",
       type: "chat",

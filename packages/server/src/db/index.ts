@@ -3,7 +3,13 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { DatabaseDiagnostics } from "@meshkeep/shared";
 
-const MIGRATIONS: string[] = [
+/**
+ * Ordered schema migrations; index N upgrades a database from user_version N to
+ * N+1. Exported so tests can reconstruct any historical schema version faithfully
+ * (apply MIGRATIONS[0..k) and set user_version = k) instead of hand-rolling a
+ * partial fixture that later migrations then choke on.
+ */
+export const MIGRATIONS: string[] = [
   // 1: initial schema
   `
   CREATE TABLE self (
@@ -208,6 +214,92 @@ const MIGRATIONS: string[] = [
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   );
+  `,
+  // 11: per-device data isolation (issue #53, Stage 2). Stored data is keyed to
+  // the physical radio, identified by its self public key (learned on connect).
+  // A `radios` identity row is seeded from the existing self so every pre-isolation
+  // row attaches to radio_id 1 with no visible change; new radios are created on
+  // first connect. contacts/channels/self are rebuilt to re-key by radio; messages,
+  // telemetry and the outbound queue take a radio_id column (SQLite forbids a
+  // REFERENCES clause on ADD COLUMN with FKs on, so — like the existing
+  // messages↔contacts join — the radios link is enforced in application code).
+  `
+  CREATE TABLE radios (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    public_key TEXT UNIQUE,
+    name TEXT,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  INSERT INTO radios (id, public_key, name, first_seen, last_seen, updated_at)
+    SELECT 1, public_key, name, updated_at, updated_at, updated_at FROM self WHERE id = 1;
+
+  -- self: one row per radio (drop the id=1 singleton).
+  CREATE TABLE self_new (
+    radio_id INTEGER PRIMARY KEY,
+    public_key TEXT NOT NULL,
+    name TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  INSERT INTO self_new (radio_id, public_key, name, raw_json, updated_at)
+    SELECT 1, public_key, name, raw_json, updated_at FROM self;
+  DROP TABLE self;
+  ALTER TABLE self_new RENAME TO self;
+
+  -- contacts: composite (radio_id, public_key) identity.
+  CREATE TABLE contacts_new (
+    radio_id INTEGER NOT NULL DEFAULT 1,
+    public_key TEXT NOT NULL,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'chat',
+    flags INTEGER NOT NULL DEFAULT 0,
+    out_path_len INTEGER NOT NULL DEFAULT -1,
+    lat REAL,
+    lon REAL,
+    last_advert INTEGER NOT NULL DEFAULT 0,
+    last_seen INTEGER,
+    raw_json TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (radio_id, public_key)
+  );
+  INSERT INTO contacts_new
+    SELECT 1, public_key, name, type, flags, out_path_len, lat, lon, last_advert, last_seen, raw_json, updated_at FROM contacts;
+  DROP TABLE contacts;
+  ALTER TABLE contacts_new RENAME TO contacts;
+
+  -- channels: composite (radio_id, idx) identity.
+  CREATE TABLE channels_new (
+    radio_id INTEGER NOT NULL DEFAULT 1,
+    idx INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    secret_hex TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (radio_id, idx)
+  );
+  INSERT INTO channels_new SELECT 1, idx, name, secret_hex, updated_at FROM channels;
+  DROP TABLE channels;
+  ALTER TABLE channels_new RENAME TO channels;
+
+  -- messages: add radio_id and re-lead the conversation indexes with it.
+  ALTER TABLE messages ADD COLUMN radio_id INTEGER NOT NULL DEFAULT 1;
+  DROP INDEX idx_messages_contact;
+  DROP INDEX idx_messages_channel;
+  DROP INDEX idx_messages_contact_prefix;
+  CREATE INDEX idx_messages_contact ON messages (radio_id, contact_key, id);
+  CREATE INDEX idx_messages_channel ON messages (radio_id, channel_idx, id);
+  CREATE INDEX idx_messages_contact_prefix ON messages (radio_id, contact_prefix, id);
+
+  -- telemetry: add radio_id and re-lead its lookup index.
+  ALTER TABLE telemetry ADD COLUMN radio_id INTEGER NOT NULL DEFAULT 1;
+  DROP INDEX idx_telemetry_contact;
+  CREATE INDEX idx_telemetry_contact ON telemetry (radio_id, contact_key, ts);
+
+  -- outbound queue: add radio_id so a queued send only drains when its radio is active.
+  ALTER TABLE outbound_queue ADD COLUMN radio_id INTEGER NOT NULL DEFAULT 1;
+  DROP INDEX idx_outbound_queue_due;
+  CREATE INDEX idx_outbound_queue_due ON outbound_queue (radio_id, state, next_attempt_at);
   `,
 ];
 

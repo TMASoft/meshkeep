@@ -123,6 +123,22 @@ export interface ConnectionStatus {
   connectedAt: number | null;
 }
 
+/**
+ * A physical radio MeshKeep has stored data for, identified by its self public
+ * key (issue #53). Stored contacts/channels/messages/telemetry are isolated per
+ * radio; a switcher lets a client browse any of them. `publicKey` is null only
+ * for a placeholder radio migrated from a pre-isolation database that has not
+ * yet connected to learn its identity.
+ */
+export interface RadioSummary {
+  id: number;
+  publicKey: string | null;
+  name: string | null;
+  lastSeen: number;
+  /** True for the radio the server is currently connected to (or last connected to). */
+  isActive: boolean;
+}
+
 export interface AppStatus {
   connection: ConnectionStatus;
   self: SelfInfo | null;
@@ -132,6 +148,10 @@ export interface AppStatus {
     messages: number;
     unread: number;
   };
+  /** The connected (or last-connected) radio's id, null before the first sync. */
+  activeRadioId: number | null;
+  /** Every radio with stored data, for the browse/switcher UI. */
+  radios: RadioSummary[];
   version: string;
 }
 
@@ -260,14 +280,17 @@ export interface MapNode {
 }
 
 // WebSocket events pushed by the server to browsers.
+// Per-radio events carry the `radioId` they belong to so a browser viewing a
+// different radio can ignore them. `status.changed` is global (it already
+// reports the active radio and the full radio list in AppStatus).
 export type WsEvent =
   | { type: "status.changed"; status: AppStatus }
-  | { type: "message.new"; message: Message }
-  | { type: "message.status"; id: number; status: MessageStatus }
-  | { type: "contact.updated"; contact: Contact }
-  | { type: "contact.removed"; publicKey: string }
-  | { type: "self.updated"; self: SelfInfo }
-  | { type: "telemetry"; batteryMilliVolts: number; ts: number };
+  | { type: "message.new"; radioId: number; message: Message }
+  | { type: "message.status"; radioId: number; id: number; status: MessageStatus }
+  | { type: "contact.updated"; radioId: number; contact: Contact }
+  | { type: "contact.removed"; radioId: number; publicKey: string }
+  | { type: "self.updated"; radioId: number; self: SelfInfo }
+  | { type: "telemetry"; radioId: number; batteryMilliVolts: number; ts: number };
 
 export const CONTACT_TYPE_FROM_ADV: Record<number, ContactType> = {
   0: "none",

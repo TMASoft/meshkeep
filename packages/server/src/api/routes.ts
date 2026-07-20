@@ -3,9 +3,11 @@ import { z } from "zod";
 import type { ConnectionManager } from "../radio/manager.js";
 import {
   ActiveProfileError,
+  ActiveRadioError,
   OutboundNotFoundError,
   OutboundStateError,
   ProfileNotFoundError,
+  RadioNotFoundError,
   RadioUnavailableError,
 } from "../radio/manager.js";
 import { DuplicateProfileNameError } from "../db/store.js";
@@ -49,11 +51,16 @@ function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
         res.status(400).json({ error: "invalid request", details: error.issues });
       } else if (error instanceof RadioUnavailableError) {
         res.status(503).json({ error: error.message });
-      } else if (error instanceof OutboundNotFoundError || error instanceof ProfileNotFoundError) {
+      } else if (
+        error instanceof OutboundNotFoundError ||
+        error instanceof ProfileNotFoundError ||
+        error instanceof RadioNotFoundError
+      ) {
         res.status(404).json({ error: error.message });
       } else if (
         error instanceof OutboundStateError ||
         error instanceof ActiveProfileError ||
+        error instanceof ActiveRadioError ||
         error instanceof DuplicateProfileNameError
       ) {
         res.status(409).json({ error: error.message });
@@ -113,6 +120,20 @@ export function buildApi(
   // everything below requires auth (no-op when no password is configured)
   api.use(auth.guard);
 
+  // Reads target a physical radio (issue #53): an explicit `?radioId=` (which
+  // must exist, else 404) lets a client browse any stored radio, otherwise the
+  // active radio. Returns 0 — which matches no radio, yielding empty results —
+  // when nothing has synced yet, so read endpoints need no null branch.
+  const radioIdQuery = z.coerce.number().int().positive().optional();
+  const readRadioId = (req: Request): number => {
+    const requested = radioIdQuery.parse(req.query.radioId);
+    if (requested != null) {
+      if (!manager.hasRadio(requested)) throw new RadioNotFoundError(`radio ${requested} not found`);
+      return requested;
+    }
+    return manager.defaultRadioId() ?? 0;
+  };
+
   // ---- status ----
   api.get(
     "/status",
@@ -146,8 +167,8 @@ export function buildApi(
   // ---- contacts ----
   api.get(
     "/contacts",
-    handle((_req, res) => {
-      res.json({ contacts: manager.store.getContacts() });
+    handle((req, res) => {
+      res.json({ contacts: manager.store.getContacts(readRadioId(req)) });
     }),
   );
   api.post(
@@ -205,7 +226,7 @@ export function buildApi(
     handle((req, res) => {
       const hours = z.coerce.number().int().min(1).max(24 * 30).default(24 * 7).parse(req.query.hours ?? 24 * 7);
       const since = Math.floor(Date.now() / 1000) - hours * 3600;
-      res.json({ points: manager.store.getContactTelemetry(hexKey(req.params.key), since) });
+      res.json({ points: manager.store.getContactTelemetry(readRadioId(req), hexKey(req.params.key), since) });
     }),
   );
   api.post(
@@ -229,25 +250,25 @@ export function buildApi(
     "/messages/recent",
     handle((req, res) => {
       const limit = z.coerce.number().int().min(1).max(50).default(20).parse(req.query.limit ?? 20);
-      res.json({ messages: manager.store.getRecentMessages(limit) });
+      res.json({ messages: manager.store.getRecentMessages(readRadioId(req), limit) });
     }),
   );
   api.get(
     "/messages/unknown-senders",
-    handle((_req, res) => {
-      res.json({ messages: manager.store.getUnknownDirectMessages() });
+    handle((req, res) => {
+      res.json({ messages: manager.store.getUnknownDirectMessages(readRadioId(req)) });
     }),
   );
   api.get(
     "/messages/unread",
-    handle((_req, res) => {
-      res.json({ conversations: manager.store.getUnreadSummary() });
+    handle((req, res) => {
+      res.json({ conversations: manager.store.getUnreadSummary(readRadioId(req)) });
     }),
   );
   api.get(
     "/messages/outbound",
-    handle((_req, res) => {
-      res.json({ queue: manager.store.listOutbound() });
+    handle((req, res) => {
+      res.json({ queue: manager.store.listOutbound(readRadioId(req)) });
     }),
   );
   api.get(
@@ -264,7 +285,7 @@ export function buildApi(
         .refine(...atMostOneConversationFilter)
         .parse(req.query);
       res.json({
-        results: manager.store.searchMessages({
+        results: manager.store.searchMessages(readRadioId(req), {
           query: query.q,
           contactKey: query.contact?.toLowerCase(),
           contactPrefix: query.sender?.toLowerCase(),
@@ -289,7 +310,7 @@ export function buildApi(
       // Stream matching history row-by-row so a large database neither buffers
       // the whole export in memory nor blocks the event loop: backpressure
       // (awaiting "drain") paces the write loop and yields to other requests.
-      const messages = manager.store.iterateMessagesForExport({
+      const messages = manager.store.iterateMessagesForExport(readRadioId(req), {
         contactKey: query.contact?.toLowerCase(),
         contactPrefix: query.sender?.toLowerCase(),
         channelIdx: query.channel,
@@ -353,7 +374,7 @@ export function buildApi(
         .refine(...atMostOneConversationFilter)
         .parse(req.query);
       res.json({
-        messages: manager.store.getConversation({
+        messages: manager.store.getConversation(readRadioId(req), {
           contactKey: query.contact?.toLowerCase(),
           contactPrefix: query.sender?.toLowerCase(),
           channelIdx: query.channel,
@@ -407,7 +428,9 @@ export function buildApi(
         })
         .refine(...atMostOneConversationFilter)
         .parse(req.body);
-      manager.store.markConversationRead({
+      // `?radioId=` lets the client mark-read the conversation of the radio it is
+      // viewing; defaults to the active radio.
+      manager.store.markConversationRead(readRadioId(req), {
         contactKey: body.contact?.toLowerCase(),
         contactPrefix: body.sender?.toLowerCase(),
         channelIdx: body.channel,
@@ -419,8 +442,8 @@ export function buildApi(
   // ---- channels ----
   api.get(
     "/channels",
-    handle((_req, res) => {
-      res.json({ channels: manager.store.getChannels() });
+    handle((req, res) => {
+      res.json({ channels: manager.store.getChannels(readRadioId(req)) });
     }),
   );
   api.post(
@@ -492,7 +515,7 @@ export function buildApi(
     handle((req, res) => {
       const hours = z.coerce.number().int().min(1).max(24 * 30).default(24).parse(req.query.hours ?? 24);
       const since = Math.floor(Date.now() / 1000) - hours * 3600;
-      res.json({ points: manager.store.getTelemetry(since) });
+      res.json({ points: manager.store.getTelemetry(readRadioId(req), since) });
     }),
   );
 
@@ -617,19 +640,56 @@ export function buildApi(
     }),
   );
 
+  // ---- radios (physical devices with isolated stored data — issue #53) ----
+  // A radio is a distinct MeshCore node the server has synced, identified by its
+  // self public key. Reads elsewhere take `?radioId=` to browse any of them.
+  api.get(
+    "/radios",
+    handle((_req, res) => {
+      res.json({ radios: manager.listRadios(), activeRadioId: manager.getActiveRadioId() });
+    }),
+  );
+  api.patch(
+    "/radios/:id",
+    handle((req, res) => {
+      const id = z.coerce.number().int().positive().parse(req.params.id);
+      const { name } = z.object({ name: z.string().trim().min(1).max(64) }).parse(req.body);
+      res.json(manager.renameRadio(id, name));
+    }),
+  );
+  // Forget a radio and purge its stored data. The active radio is protected (409).
+  api.delete(
+    "/radios/:id",
+    handle((req, res) => {
+      const id = z.coerce.number().int().positive().parse(req.params.id);
+      manager.forgetRadio(id);
+      res.json({ ok: true });
+    }),
+  );
+
   // ---- ingest (browser-direct sessions sync what they saw back to the server) ----
+  // A browser-direct session may own a radio the server never connected to, so
+  // each batch names its radio by self public key; the server resolves (creating
+  // if needed) the matching radios row and scopes the write to it (issue #53).
+  const radioKey = z.string().regex(/^[0-9a-f]{64}$/i);
   api.post(
     "/ingest/messages",
     handle((req, res) => {
-      const { messages } = z.object({ messages: z.array(ingestMessageSchema).max(500) }).parse(req.body);
-      res.json(ingestMessages(manager.store, bus, messages));
+      const { radioKey: key, messages } = z
+        .object({ radioKey, messages: z.array(ingestMessageSchema).max(500) })
+        .parse(req.body);
+      const radioId = manager.store.resolveRadio(key.toLowerCase(), null);
+      res.json(ingestMessages(manager.store, bus, radioId, messages));
     }),
   );
   api.post(
     "/ingest/contacts",
     handle((req, res) => {
-      const { contacts } = z.object({ contacts: z.array(ingestContactSchema).max(500) }).parse(req.body);
-      res.json({ upserted: ingestContacts(manager.store, bus, contacts) });
+      const { radioKey: key, contacts } = z
+        .object({ radioKey, contacts: z.array(ingestContactSchema).max(500) })
+        .parse(req.body);
+      const radioId = manager.store.resolveRadio(key.toLowerCase(), null);
+      res.json({ upserted: ingestContacts(manager.store, bus, radioId, contacts) });
     }),
   );
   api.post(

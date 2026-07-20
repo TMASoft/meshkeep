@@ -84,6 +84,7 @@ export type IngestMessage = z.infer<typeof ingestMessageSchema>;
 export function ingestMessages(
   store: Store,
   bus: Bus,
+  radioId: number,
   items: IngestMessage[],
 ): { inserted: number; duplicates: number; messages: Message[] } {
   let inserted = 0;
@@ -101,7 +102,7 @@ export function ingestMessages(
       authorPrefix: item.authorPrefix?.toLowerCase() ?? null,
       ingestionId: item.ingestionId,
     };
-    const message = store.insertMessage({
+    const message = store.insertMessage(radioId, {
       ...normalized,
       pathLen: item.pathLen ?? null,
       status: item.status ?? "sent",
@@ -109,7 +110,7 @@ export function ingestMessages(
     if (message) {
       inserted += 1;
       messages.push(message);
-      bus.publish({ type: "message.new", message });
+      bus.publish({ type: "message.new", radioId, message });
     } else {
       duplicates += 1;
       // a re-post may carry a later delivery state (browser-side ack arrived)
@@ -117,7 +118,7 @@ export function ingestMessages(
         const updated = store.updateMessageStatusByIngestionId({ ingestionId: item.ingestionId, status: item.status });
         if (updated) {
           messages.push(updated);
-          bus.publish({ type: "message.status", id: updated.id, status: updated.status });
+          bus.publish({ type: "message.status", radioId, id: updated.id, status: updated.status });
         }
       }
     }
@@ -125,17 +126,20 @@ export function ingestMessages(
   return { inserted, duplicates, messages };
 }
 
-export function ingestContacts(store: Store, bus: Bus, contacts: Contact[]): number {
+export function ingestContacts(store: Store, bus: Bus, radioId: number, contacts: Contact[]): number {
   for (const contact of contacts) {
     const normalized = { ...contact, publicKey: contact.publicKey.toLowerCase() };
-    store.upsertContact(normalized);
-    bus.publish({ type: "contact.updated", contact: normalized });
+    store.upsertContact(radioId, normalized);
+    bus.publish({ type: "contact.updated", radioId, contact: normalized });
   }
   return contacts.length;
 }
 
-export function ingestSelf(store: Store, bus: Bus, self: SelfInfo): void {
+/** Persist a browser-direct session's self and return the resolved radio id. */
+export function ingestSelf(store: Store, bus: Bus, self: SelfInfo): number {
   const normalized = { ...self, publicKey: self.publicKey.toLowerCase() };
-  store.saveSelf(normalized);
-  bus.publish({ type: "self.updated", self: normalized });
+  const radioId = store.resolveRadio(normalized.publicKey, normalized.name);
+  store.saveSelf(radioId, normalized);
+  bus.publish({ type: "self.updated", radioId, self: normalized });
+  return radioId;
 }

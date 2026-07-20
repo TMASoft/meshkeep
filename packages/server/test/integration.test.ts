@@ -91,14 +91,14 @@ describe("mock radio end-to-end", () => {
     expect(status.self?.manufacturerModel).toBe("MockKeep,RAK4631 firmware");
     expect(status.batteryMilliVolts).toBe(4111);
 
-    const contacts = manager.store.getContacts();
+    const contacts = manager.store.getContacts(manager.getActiveRadioId()!);
     expect(contacts).toHaveLength(4);
     expect(contacts.map((c) => c.name)).toContain("Mock Alice");
     expect(contacts.find((c) => c.name === "Mock Repeater")?.type).toBe("repeater");
     expect(contacts.find((c) => c.name === "Mock Room")?.type).toBe("room");
     expect(contacts.find((c) => c.name === "Mock Alice")?.lat).toBeCloseTo(44.265);
 
-    const channels = manager.store.getChannels();
+    const channels = manager.store.getChannels(manager.getActiveRadioId()!);
     expect(channels).toHaveLength(1);
     expect(channels[0].name).toBe("Public");
   });
@@ -116,10 +116,13 @@ describe("mock radio end-to-end", () => {
       await waitForState(v3Manager, "connected");
       expect(
         v3Manager.store
-          .getConversation({ contactKey: Buffer.from(v3Mock.contacts[0].publicKey).toString("hex"), limit: 10 })
+          .getConversation(v3Manager.getActiveRadioId()!, {
+            contactKey: Buffer.from(v3Mock.contacts[0].publicKey).toString("hex"),
+            limit: 10,
+          })
           .map((message) => message.text),
       ).toContain("v3 direct message");
-      expect(v3Manager.store.getConversation({ channelIdx: 0, limit: 10 }).map((message) => message.text)).toContain(
+      expect(v3Manager.store.getConversation(v3Manager.getActiveRadioId()!, { channelIdx: 0, limit: 10 }).map((message) => message.text)).toContain(
         "v3 channel message",
       );
     } finally {
@@ -132,7 +135,7 @@ describe("mock radio end-to-end", () => {
   it("drops contacts the radio no longer has on refresh but keeps their history", async () => {
     const phantomKey = "f".repeat(64);
     // a contact that was removed on the radio through another app
-    manager.store.upsertContact({
+    manager.store.upsertContact(manager.getActiveRadioId()!, {
       publicKey: phantomKey,
       name: "Ghost",
       type: "chat",
@@ -143,7 +146,7 @@ describe("mock radio end-to-end", () => {
       lastAdvert: 0,
       lastSeen: null,
     });
-    manager.store.insertMessage({
+    manager.store.insertMessage(manager.getActiveRadioId()!, {
       kind: "dm",
       contactKey: phantomKey,
       direction: "in",
@@ -156,16 +159,16 @@ describe("mock radio end-to-end", () => {
 
     expect((await removedEvent) as Extract<WsEvent, { type: "contact.removed" }>).toMatchObject({ publicKey: phantomKey });
     expect(contacts.map((c) => c.name)).not.toContain("Ghost");
-    expect(manager.store.getContacts().map((c) => c.name)).not.toContain("Ghost");
+    expect(manager.store.getContacts(manager.getActiveRadioId()!).map((c) => c.name)).not.toContain("Ghost");
     // radio contacts survive the reconciliation
-    expect(manager.store.getContacts()).toHaveLength(4);
+    expect(manager.store.getContacts(manager.getActiveRadioId()!)).toHaveLength(4);
     // the removed contact's history keeps its identity
-    const history = manager.store.getConversation({ contactKey: phantomKey, limit: 10 });
+    const history = manager.store.getConversation(manager.getActiveRadioId()!, { contactKey: phantomKey, limit: 10 });
     expect(history.map((m) => m.text)).toEqual(["from beyond"]);
   });
 
   it("sends a DM, sees it delivered, and receives the echo", async () => {
-    const alice = manager.store.getContacts().find((c) => c.name === "Mock Alice")!;
+    const alice = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Alice")!;
 
     const delivered = waitForEvent(bus, (e) => e.type === "message.status" && e.status === "delivered");
     const echoed = waitForEvent(
@@ -291,7 +294,7 @@ describe("mock radio end-to-end", () => {
   });
 
   it("requests remote sensor telemetry and parses the Cayenne LPP payload", async () => {
-    const alice = manager.store.getContacts().find((c) => c.name === "Mock Alice")!;
+    const alice = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Alice")!;
     const readings = await manager.requestTelemetry(alice.publicKey);
     expect(readings).toEqual([
       { channel: 1, type: 116, label: "Voltage", unit: "V", value: 4.03 },
@@ -302,17 +305,17 @@ describe("mock radio end-to-end", () => {
 
   it("creates and deletes a channel slot", async () => {
     await manager.setChannel(3, "test-chan", "00112233445566778899aabbccddeeff");
-    expect(manager.store.getChannels().map((c) => c.idx)).toEqual([0, 3]);
+    expect(manager.store.getChannels(manager.getActiveRadioId()!).map((c) => c.idx)).toEqual([0, 3]);
     expect(await manager.refreshChannels()).toHaveLength(2);
 
     await manager.deleteChannel(3);
-    expect(manager.store.getChannels().map((c) => c.idx)).toEqual([0]);
+    expect(manager.store.getChannels(manager.getActiveRadioId()!).map((c) => c.idx)).toEqual([0]);
     // the mock reports the slot as blank on the next full read
     expect(await manager.refreshChannels()).toHaveLength(1);
   });
 
   it("keeps stored channels when a channel read returns an error", async () => {
-    manager.store.upsertChannel({ idx: 3, name: "Stored", secret: "a".repeat(32) });
+    manager.store.upsertChannel(manager.getActiveRadioId()!, { idx: 3, name: "Stored", secret: "a".repeat(32) });
     const originalConnection = (manager as unknown as { connection: Connection }).connection;
     const connection = channelReader((idx, emitter) => {
       if (idx === 3) emitter.emit(Constants.ResponseCodes.Err);
@@ -322,7 +325,7 @@ describe("mock radio end-to-end", () => {
 
     try {
       await expect(manager.refreshChannels()).rejects.toThrow("radio rejected reading channel 3");
-      expect(manager.store.getChannels()).toEqual([
+      expect(manager.store.getChannels(manager.getActiveRadioId()!)).toEqual([
         { idx: 0, name: "Public", secret: expect.any(String) },
         { idx: 3, name: "Stored", secret: "a".repeat(32) },
       ]);
@@ -332,7 +335,7 @@ describe("mock radio end-to-end", () => {
   });
 
   it("keeps stored channels when a channel read times out", async () => {
-    manager.store.upsertChannel({ idx: 3, name: "Stored", secret: "a".repeat(32) });
+    manager.store.upsertChannel(manager.getActiveRadioId()!, { idx: 3, name: "Stored", secret: "a".repeat(32) });
     const originalConnection = (manager as unknown as { connection: Connection }).connection;
     const connection = channelReader((idx, emitter) => {
       if (idx !== 3) {
@@ -343,7 +346,7 @@ describe("mock radio end-to-end", () => {
 
     try {
       await expect(manager.refreshChannels()).rejects.toThrow("timed out reading channel 3");
-      expect(manager.store.getChannels()).toEqual([
+      expect(manager.store.getChannels(manager.getActiveRadioId()!)).toEqual([
         { idx: 0, name: "Public", secret: expect.any(String) },
         { idx: 3, name: "Stored", secret: "a".repeat(32) },
       ]);
@@ -377,8 +380,8 @@ describe("mock radio end-to-end", () => {
 
       emitter.emit(Constants.ResponseCodes.Err);
       await expect(second).rejects.toThrow("radio rejected channel update");
-      expect(manager.store.getChannels().map((channel) => channel.idx)).toContain(2);
-      expect(manager.store.getChannels().map((channel) => channel.idx)).not.toContain(3);
+      expect(manager.store.getChannels(manager.getActiveRadioId()!).map((channel) => channel.idx)).toContain(2);
+      expect(manager.store.getChannels(manager.getActiveRadioId()!).map((channel) => channel.idx)).not.toContain(3);
     } finally {
       (manager as unknown as { connection: Connection }).connection = originalConnection;
     }
@@ -396,11 +399,11 @@ describe("mock radio end-to-end", () => {
     const first = waitForEvent(bus, (e) => e.type === "message.new");
     mock.injectDirectMessage("Mock Bob", "same message");
     await first;
-    const before = manager.store.counts().messages;
+    const before = manager.store.counts(manager.getActiveRadioId()!).messages;
     // The protocol offers no frame ID, so distinct received frames are kept.
     mock.injectDirectMessage("Mock Bob", "same message");
     await new Promise((resolve) => setTimeout(resolve, 300));
-    expect(manager.store.counts().messages).toBe(before + 1);
+    expect(manager.store.counts(manager.getActiveRadioId()!).messages).toBe(before + 1);
   });
 
   it("updates device settings", async () => {
@@ -425,7 +428,7 @@ describe("mock radio end-to-end", () => {
     await manager.release();
     // a send enqueued while the radio was in another owner's hands (simulated
     // here by seeding the queue directly): it must not attempt until reclaimed
-    const queued = manager.store.insertMessage({
+    const queued = manager.store.insertMessage(manager.getActiveRadioId()!, {
       kind: "channel",
       channelIdx: 0,
       direction: "out",
@@ -433,7 +436,7 @@ describe("mock radio end-to-end", () => {
       senderTimestamp: 1_000,
       status: "pending",
     })!;
-    manager.store.enqueueOutbound({
+    manager.store.enqueueOutbound({ radioId: manager.getActiveRadioId()!,
       messageId: queued.id,
       kind: "channel",
       channelIdx: 0,
@@ -457,19 +460,19 @@ describe("mock radio end-to-end", () => {
   });
 
   it("round-trips a contact through export and import URIs", async () => {
-    const alice = manager.store.getContacts().find((c) => c.name === "Mock Alice")!;
+    const alice = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Alice")!;
 
     const uri = await manager.exportContactUri(alice.publicKey);
     expect(uri).toMatch(/^meshcore:\/\/[0-9a-f]+$/);
 
     await manager.removeContact(alice.publicKey);
-    expect(manager.store.getContacts().some((c) => c.publicKey === alice.publicKey)).toBe(false);
+    expect(manager.store.getContacts(manager.getActiveRadioId()!).some((c) => c.publicKey === alice.publicKey)).toBe(false);
 
     const contacts = await manager.importContactUri(uri);
     const restored = contacts.find((c) => c.publicKey === alice.publicKey);
     expect(restored?.name).toBe("Mock Alice");
     expect(restored?.lat).toBeCloseTo(44.265);
-    expect(manager.store.getContacts().some((c) => c.publicKey === alice.publicKey)).toBe(true);
+    expect(manager.store.getContacts(manager.getActiveRadioId()!).some((c) => c.publicKey === alice.publicKey)).toBe(true);
   });
 
   it("rejects malformed contact import URIs", async () => {
@@ -486,7 +489,7 @@ describe("mock radio end-to-end", () => {
   it("records telemetry, serves history, and trims old rows", () => {
     const nowTs = Math.floor(Date.now() / 1000);
     // battery snapshot from initial sync
-    const points = manager.store.getTelemetry(nowTs - 3600);
+    const points = manager.store.getTelemetry(manager.getActiveRadioId()!, nowTs - 3600);
     expect(points.length).toBeGreaterThanOrEqual(1);
     expect(points.at(-1)?.batteryMv).toBe(4111);
 
@@ -497,7 +500,7 @@ describe("mock radio end-to-end", () => {
     );
     const removed = manager.store.trimTelemetry(30);
     expect(removed).toBe(1);
-    expect(manager.store.getTelemetry(0).every((p) => p.ts > nowTs - 31 * 86_400)).toBe(true);
+    expect(manager.store.getTelemetry(manager.getActiveRadioId()!, 0).every((p) => p.ts > nowTs - 31 * 86_400)).toBe(true);
   });
 
   it("applies and clears connection overrides", async () => {
@@ -553,7 +556,7 @@ describe("mock radio end-to-end", () => {
   });
 
   it("logs in to a repeater, reads status, and runs CLI commands", async () => {
-    const repeater = manager.store.getContacts().find((c) => c.name === "Mock Repeater")!;
+    const repeater = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Repeater")!;
 
     // wrong password: no LoginSuccess push, the request times out → false
     await expect(manager.loginToNode(repeater.publicKey, "wrong")).resolves.toBe(false);
@@ -578,13 +581,13 @@ describe("mock radio end-to-end", () => {
   }, 15_000);
 
   it("posts to a room server after login", async () => {
-    const room = manager.store.getContacts().find((c) => c.name === "Mock Room")!;
+    const room = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Room")!;
 
     // unauthenticated posts are accepted on air but the room stays silent
     await manager.sendDirectMessage(room.publicKey, "anyone here?");
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(
-      manager.store.getConversation({ contactKey: room.publicKey, limit: 10 }).filter((m) => m.direction === "in"),
+      manager.store.getConversation(manager.getActiveRadioId()!, { contactKey: room.publicKey, limit: 10 }).filter((m) => m.direction === "in"),
     ).toHaveLength(0);
 
     await expect(manager.loginToNode(room.publicKey, "letmein")).resolves.toBe(true);
@@ -597,17 +600,17 @@ describe("mock radio end-to-end", () => {
     const event = (await echoed) as Extract<WsEvent, { type: "message.new" }>;
     expect(event.message.text).toBe("room echo: hello room");
     // the mock room reposts as signed-plain attributed to Mock Alice
-    const alice = manager.store.getContacts().find((c) => c.name === "Mock Alice")!;
+    const alice = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Alice")!;
     expect(event.message.authorPrefix).toBe(alice.publicKey.slice(0, 8));
     expect(event.message.authorName).toBe("Mock Alice");
   }, 15_000);
 
   it("persists history across a manager restart", async () => {
-    const alice = manager.store.getContacts().find((c) => c.name === "Mock Alice")!;
+    const alice = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Alice")!;
     const echoed = waitForEvent(bus, (e) => e.type === "message.new");
     await manager.sendDirectMessage(alice.publicKey, "survive me");
     await echoed;
-    const countBefore = manager.store.counts().messages;
+    const countBefore = manager.store.counts(manager.getActiveRadioId()!).messages;
     expect(countBefore).toBeGreaterThanOrEqual(2);
 
     await manager.stop();
@@ -615,8 +618,8 @@ describe("mock radio end-to-end", () => {
     const manager2 = new ConnectionManager(testConfig(mock.port), db, bus, "test");
     await manager2.start();
     await waitForState(manager2, "connected");
-    expect(manager2.store.counts().messages).toBe(countBefore);
-    const history: Message[] = manager2.store.getConversation({ contactKey: alice.publicKey, limit: 10 });
+    expect(manager2.store.counts(manager2.getActiveRadioId()!).messages).toBe(countBefore);
+    const history: Message[] = manager2.store.getConversation(manager2.getActiveRadioId()!, { contactKey: alice.publicKey, limit: 10 });
     expect(history.some((m) => m.text === "survive me")).toBe(true);
     await manager2.stop();
   });
@@ -675,7 +678,7 @@ describe("connection lifecycle races", () => {
 
     expect(delayed.close).toHaveBeenCalledOnce();
     expect(manager.getState()).toBe("standby");
-    expect(manager.store.getContacts()).toHaveLength(0);
+    expect(manager.store.getContacts(manager.getActiveRadioId()!)).toHaveLength(0);
   });
 
   it("does not restore a connection after stop while it is connecting", async () => {
@@ -733,7 +736,11 @@ describe("outbound retry worker", () => {
     const db = openDb(":memory:");
     const bus = new Bus();
     const manager = new ConnectionManager({ ...testConfig(0), ...overrides }, db, bus, "test");
-    const internals = manager as unknown as { connection: Connection | null; state: string };
+    const internals = manager as unknown as {
+      connection: Connection | null;
+      state: string;
+      activeRadioId: number | null;
+    };
     return { db, bus, manager, internals };
   }
 
@@ -759,6 +766,8 @@ describe("outbound retry worker", () => {
     try {
       internals.connection = fakeConnection(() => Promise.reject(new Error("radio rejected")));
       internals.state = "connected";
+      // mirror initialSync: a connected radio has a resolved identity the worker scopes to
+      internals.activeRadioId = manager.store.resolveRadio("f".repeat(64), "R");
 
       const message = await manager.sendDirectMessage("ab".repeat(32), "will fail");
       await until(() => manager.store.getMessage(message.id)?.status === "failed");

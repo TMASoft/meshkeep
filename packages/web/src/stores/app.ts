@@ -8,6 +8,7 @@ import type {
   Message,
   MessageSearchResult,
   NodeStats,
+  RadioSummary,
   SensorReading,
   ServerDiagnostics,
   WsEvent,
@@ -84,6 +85,11 @@ function dmQuery(id: Extract<ConversationId, { kind: "dm" }>): string {
   return id.contactKey ? `contact=${encodeURIComponent(id.contactKey)}` : `sender=${encodeURIComponent(id.contactPrefix ?? "")}`;
 }
 
+/** `?radioId=…`/`&radioId=…` for a per-radio read, or "" when no radio is in view. */
+function radioSuffix(id: number | null, joiner: "?" | "&" = "?"): string {
+  return id == null ? "" : `${joiner}radioId=${id}`;
+}
+
 function finalStatus(current: Message["status"], next: Message["status"]): Message["status"] {
   // Only delivery is truly terminal. `failed` used to be terminal too, but a
   // failed send can now be retried (failed → pending → sent/delivered), so it
@@ -104,6 +110,9 @@ export const useAppStore = defineStore("app", {
     recent: [] as Message[],
     unknownSenders: [] as Message[],
     activeConversation: null as ConversationId | null,
+    // The radio whose stored data is being browsed. null = follow the active
+    // (connected) radio; a pinned id lets the user read another radio's history.
+    viewingRadioId: null as number | null,
     unread: {} as Record<string, number>,
     // room servers / repeaters this session has authenticated with
     nodeLogins: {} as Record<string, boolean>,
@@ -157,6 +166,19 @@ export const useAppStore = defineStore("app", {
     },
     chatContacts: (state) => state.contacts.filter((c) => c.type === "chat"),
     needsLogin: (state) => state.session !== null && state.session.passwordRequired && !state.session.authorized,
+
+    /** Physical radios with stored data (from the latest status snapshot). */
+    radios: (state): RadioSummary[] => state.status?.radios ?? [],
+    /** The connected (or last-connected) radio. */
+    activeRadioId: (state): number | null => state.status?.activeRadioId ?? null,
+    /** The radio whose data is on screen: the pinned one, else active, else the most-recent. */
+    effectiveRadioId(state): number | null {
+      return state.viewingRadioId ?? state.status?.activeRadioId ?? state.status?.radios[0]?.id ?? null;
+    },
+    viewingRadio(): RadioSummary | null {
+      const id = this.effectiveRadioId;
+      return id == null ? null : this.radios.find((radio) => radio.id === id) ?? null;
+    },
   },
 
   actions: {
@@ -244,13 +266,15 @@ export const useAppStore = defineStore("app", {
     },
 
     async refreshContacts() {
-      const { contacts } = await api<{ contacts: Contact[] }>("/contacts");
+      const { contacts } = await api<{ contacts: Contact[] }>(`/contacts${radioSuffix(this.effectiveRadioId)}`);
       this.contacts = contacts;
       this.reconcileUnknownConversations();
     },
 
     async refreshUnknownSenders() {
-      const { messages } = await api<{ messages: Message[] }>("/messages/unknown-senders");
+      const { messages } = await api<{ messages: Message[] }>(
+        `/messages/unknown-senders${radioSuffix(this.effectiveRadioId)}`,
+      );
       this.unknownSenders = messages;
     },
 
@@ -261,7 +285,7 @@ export const useAppStore = defineStore("app", {
         this.channels = await browserSource.getChannels();
         return;
       }
-      const { channels } = await api<{ channels: Channel[] }>("/channels");
+      const { channels } = await api<{ channels: Channel[] }>(`/channels${radioSuffix(this.effectiveRadioId)}`);
       this.channels = channels;
     },
 
@@ -272,7 +296,9 @@ export const useAppStore = defineStore("app", {
 
     /** Initialize per-conversation unread badges from the persisted read state. */
     async refreshUnread() {
-      const { conversations } = await api<{ conversations: ConversationUnread[] }>("/messages/unread");
+      const { conversations } = await api<{ conversations: ConversationUnread[] }>(
+        `/messages/unread${radioSuffix(this.effectiveRadioId)}`,
+      );
       const unread: Record<string, number> = {};
       for (const row of conversations) {
         const id = conversationForUnread(row);
@@ -283,11 +309,55 @@ export const useAppStore = defineStore("app", {
       this.unread = unread;
     },
 
+    /**
+     * Browse a different physical radio's stored data. Pinning the active radio
+     * is treated as "follow active" (null). Stored contacts/messages/channels are
+     * per-radio, so the current view is dropped and the target radio reloaded.
+     */
+    async switchRadio(id: number) {
+      const target = id === this.activeRadioId ? null : id;
+      if (target === this.viewingRadioId) return;
+      this.viewingRadioId = target;
+      await this.reloadRadioSnapshot();
+    },
+
+    /** Rename a stored radio; the status snapshot carries the updated list. */
+    async renameRadio(id: number, name: string) {
+      await api<RadioSummary>(`/radios/${id}`, { method: "PATCH", body: JSON.stringify({ name }) });
+      await this.refreshStatus();
+    },
+
+    /** Forget a stored radio and its data. Falls back to the active radio if it was in view. */
+    async forgetRadio(id: number) {
+      await api(`/radios/${id}`, { method: "DELETE" });
+      const wasViewing = this.effectiveRadioId === id;
+      if (this.viewingRadioId === id) this.viewingRadioId = null;
+      await this.refreshStatus();
+      if (wasViewing) await this.reloadRadioSnapshot();
+    },
+
+    /** Reset per-radio view state and reload it for the radio now in view. */
+    async reloadRadioSnapshot() {
+      this.conversations = {};
+      this.recent = [];
+      this.activeConversation = null;
+      this.unread = {};
+      this.unknownSenders = [];
+      await Promise.all([
+        this.refreshContacts(),
+        this.refreshChannels(),
+        this.refreshUnknownSenders(),
+        this.refreshUnread(),
+      ]).catch(() => {});
+    },
+
     async openConversation(id: ConversationId) {
       this.activeConversation = id;
       const key = conversationKey(id);
       const query = id.kind === "dm" ? dmQuery(id) : `channel=${id.channelIdx}`;
-      const { messages } = await api<{ messages: Message[] }>(`/messages?${query}&limit=100`);
+      const { messages } = await api<{ messages: Message[] }>(
+        `/messages?${query}&limit=100${radioSuffix(this.effectiveRadioId, "&")}`,
+      );
       // Messages can arrive over the WebSocket while history is loading. Preserve
       // those newer objects (including delivery-state updates) when merging.
       const merged = new Map(messages.map((message) => [message.id, message]));
@@ -296,7 +366,7 @@ export const useAppStore = defineStore("app", {
       if (this.activeConversation && conversationKey(this.activeConversation) === key) {
         this.unread[key] = 0;
       }
-      void api("/messages/read", {
+      void api(`/messages/read${radioSuffix(this.effectiveRadioId)}`, {
         method: "POST",
         body: JSON.stringify(id.kind === "dm" ? (id.contactKey ? { contact: id.contactKey } : { sender: id.contactPrefix }) : { channel: id.channelIdx }),
       }).catch(() => {});
@@ -314,7 +384,7 @@ export const useAppStore = defineStore("app", {
       const seq = ++searchSeq;
       try {
         const { results } = await api<{ results: MessageSearchResult[] }>(
-          `/messages/search?q=${encodeURIComponent(query)}&limit=20`,
+          `/messages/search?q=${encodeURIComponent(query)}&limit=20${radioSuffix(this.effectiveRadioId, "&")}`,
           { signal: controller.signal },
         );
         return seq === searchSeq ? results : null;
@@ -339,7 +409,9 @@ export const useAppStore = defineStore("app", {
         if (list.some((message) => message.id === messageId)) return true;
         const oldest = list[0]?.id;
         if (oldest === undefined || oldest <= messageId) return false;
-        const { messages } = await api<{ messages: Message[] }>(`/messages?${query}&before=${oldest}&limit=200`);
+        const { messages } = await api<{ messages: Message[] }>(
+          `/messages?${query}&before=${oldest}&limit=200${radioSuffix(this.effectiveRadioId, "&")}`,
+        );
         if (!messages.length) return false;
         const merged = new Map(messages.map((message) => [message.id, message]));
         for (const message of list) merged.set(message.id, message);
@@ -623,10 +695,31 @@ export const useAppStore = defineStore("app", {
     },
 
     onEvent(event: WsEvent) {
+      // Per-radio events carry a radioId; ignore those for a radio other than the
+      // one in view so a background radio's traffic never leaks into the display.
+      // (status.changed is global and has no radioId, so it always applies.)
+      if ("radioId" in event && this.effectiveRadioId !== null && event.radioId !== this.effectiveRadioId) {
+        return;
+      }
       switch (event.type) {
-        case "status.changed":
+        case "status.changed": {
+          const previousActive = this.status?.activeRadioId ?? null;
           this.status = event.status;
+          // A pinned radio that was forgotten falls back to following the active one.
+          if (this.viewingRadioId !== null && !event.status.radios.some((radio) => radio.id === this.viewingRadioId)) {
+            this.viewingRadioId = null;
+          }
+          // Following the active radio and it changed (e.g. a profile switch
+          // reconnected to a different device): load the new radio's data.
+          if (
+            this.viewingRadioId === null &&
+            event.status.activeRadioId !== previousActive &&
+            event.status.activeRadioId !== null
+          ) {
+            void this.reloadRadioSnapshot();
+          }
           break;
+        }
         case "message.new":
           this.appendMessage(event.message);
           break;

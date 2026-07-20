@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
+import type { RadioSummary } from "@meshkeep/shared";
 import { useAppStore } from "./stores/app";
 import AppIcon from "./components/AppIcon.vue";
 import LoginGate from "./components/LoginGate.vue";
@@ -17,6 +18,15 @@ import {
 const version = __APP_VERSION__;
 const store = useAppStore();
 const route = useRoute();
+
+/** Display name for a stored radio: its name, else a short key, else its id. */
+function radioLabel(radio: RadioSummary): string {
+  return radio.name?.trim() || (radio.publicKey ? radio.publicKey.slice(0, 8) : `Radio ${radio.id}`);
+}
+function onRadioSwitch(event: Event) {
+  const id = Number((event.target as HTMLSelectElement).value);
+  if (Number.isFinite(id)) void store.switchRadio(id);
+}
 const appearanceOpen = ref(false);
 const appearanceButton = ref<HTMLButtonElement | null>(null);
 const appearancePanel = ref<HTMLElement | null>(null);
@@ -209,8 +219,19 @@ const stateColor = computed(() => {
           <span>MeshKeep</span>
         </div>
         <div class="node-identity">
-          <span class="instrument-label">Active node</span>
-          <strong>{{ store.self?.name ?? "Awaiting radio" }}</strong>
+          <span class="instrument-label">{{ store.radios.length > 1 ? "Viewing radio" : "Active node" }}</span>
+          <select
+            v-if="store.radios.length > 1"
+            class="radio-switcher"
+            aria-label="Switch radio"
+            :value="store.effectiveRadioId ?? ''"
+            @change="onRadioSwitch"
+          >
+            <option v-for="radio in store.radios" :key="radio.id" :value="radio.id">
+              {{ radioLabel(radio) }}{{ radio.isActive ? " • live" : "" }}
+            </option>
+          </select>
+          <strong v-else>{{ store.self?.name ?? "Awaiting radio" }}</strong>
         </div>
         <div class="status-metrics">
           <a
@@ -372,6 +393,8 @@ const stateColor = computed(() => {
 .mobile-brand { display: none; align-items: center; gap: 9px; font-weight: 750; }
 .node-identity { display: flex; flex-direction: column; gap: 2px; }
 .node-identity strong { font-size: 14px; font-weight: 650; letter-spacing: .01em; }
+.radio-switcher { max-width: 220px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-1); color: var(--text); font-size: 13px; font-weight: 650; letter-spacing: .01em; padding: 2px 6px; }
+.radio-switcher:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .status-metrics { display: flex; align-items: center; gap: 10px; margin-left: auto; }
 .status-metric { display: flex; height: 34px; align-items: center; gap: 7px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0 11px; color: var(--text-muted); font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px; font-weight: 700; }
 .repo-link { display: grid; width: 34px; height: 34px; place-items: center; border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-muted); transition: border-color 140ms ease, color 140ms ease; }

@@ -12,12 +12,13 @@ describe("per-contact telemetry history", () => {
   it("stores remote responses separately from self battery polls", async () => {
     const { app, manager } = buildHarness();
     const store = manager.store;
-    store.recordTelemetry(4100);
-    store.recordContactTelemetry(KEY, READINGS);
+    const radioId = store.resolveRadio("f".repeat(64), "Radio");
+    store.recordTelemetry(radioId, 4100);
+    store.recordContactTelemetry(radioId, KEY, READINGS);
 
     // self history is unaffected by contact rows
-    expect(store.getTelemetry(0)).toHaveLength(1);
-    expect(store.latestBatteryMv()).toBe(4100);
+    expect(store.getTelemetry(radioId, 0)).toHaveLength(1);
+    expect(store.latestBatteryMv(radioId)).toBe(4100);
 
     const res = await request(app).get(`/api/v1/contacts/${KEY}/telemetry/history`);
     expect(res.status).toBe(200);
@@ -31,10 +32,11 @@ describe("per-contact telemetry history", () => {
   it("trims contact telemetry with the same retention window", () => {
     const { manager } = buildHarness();
     const store = manager.store;
-    store.recordContactTelemetry(KEY, READINGS);
+    const radioId = store.resolveRadio("f".repeat(64), "Radio");
+    store.recordContactTelemetry(radioId, KEY, READINGS);
     const db = store["db"] as import("../src/db/index.js").Db;
     db.prepare("UPDATE telemetry SET ts = ts - 40 * 86400").run();
     expect(store.trimTelemetry(30)).toBe(1);
-    expect(store.getContactTelemetry(KEY, 0)).toHaveLength(0);
+    expect(store.getContactTelemetry(radioId, KEY, 0)).toHaveLength(0);
   });
 });

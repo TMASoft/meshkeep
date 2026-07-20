@@ -5,3 +5,4 @@ data
 *.log
 .git
 TODO.md
+LOCAL_TESTING.md

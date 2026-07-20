@@ -3,27 +3,31 @@ import request from "supertest";
 import { buildHarness } from "./helpers.js";
 
 function seed(store: ReturnType<typeof buildHarness>["manager"]["store"]) {
-  store.insertMessage({
+  // Reads default to the most-recently-seen radio, so a single seeded radio is
+  // what the no-`?radioId` API search queries.
+  const radioId = store.resolveRadio("f".repeat(64), "Radio");
+  store.insertMessage(radioId, {
     kind: "dm",
     contactKey: "a".repeat(64),
     direction: "in",
     text: "meet at the water tower tomorrow",
     senderTimestamp: 1_000,
   });
-  store.insertMessage({
+  store.insertMessage(radioId, {
     kind: "dm",
     contactKey: "b".repeat(64),
     direction: "out",
     text: "tower checkpoint reached",
     senderTimestamp: 1_001,
   });
-  store.insertMessage({
+  store.insertMessage(radioId, {
     kind: "channel",
     channelIdx: 2,
     direction: "in",
     text: "anyone near the water treatment plant?",
     senderTimestamp: 1_002,
   });
+  return radioId;
 }
 
 describe("message search", () => {

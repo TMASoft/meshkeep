@@ -638,3 +638,60 @@ describe("websocket event application", () => {
     expect(store.activeConversation).toBeNull();
   });
 });
+
+describe("radio switching (issue #53)", () => {
+  const radios = [
+    { id: 1, publicKey: null, name: "One", lastSeen: 0, isActive: true },
+    { id: 2, publicKey: null, name: "Two", lastSeen: 0, isActive: false },
+  ];
+
+  it("ignores WS events for a radio other than the one in view", () => {
+    const store = useAppStore();
+    store.status = { activeRadioId: 1, radios } as typeof store.status;
+    // background radio's traffic must not leak into the view
+    store.onEvent({ type: "message.new", radioId: 2, message: message({ id: 10, text: "other radio" }) });
+    expect(store.recent).toHaveLength(0);
+    // the viewed radio's traffic is applied
+    store.onEvent({ type: "message.new", radioId: 1, message: message({ id: 11, text: "this radio" }) });
+    expect(store.recent.map((m) => m.text)).toEqual(["this radio"]);
+  });
+
+  it("switchRadio pins the radio, resets the view, and scopes reads to it", async () => {
+    apiMock.mockResolvedValue({ contacts: [], channels: [], messages: [], conversations: [] });
+    const store = useAppStore();
+    store.status = { activeRadioId: 1, radios } as typeof store.status;
+    store.recent = [message({ id: 1 })];
+
+    await store.switchRadio(2);
+
+    expect(store.viewingRadioId).toBe(2);
+    expect(store.effectiveRadioId).toBe(2);
+    expect(store.recent).toEqual([]); // per-radio view reset on switch
+    // snapshot reads carried the radio id
+    expect(apiMock).toHaveBeenCalledWith(expect.stringContaining("radioId=2"));
+  });
+
+  it("switching back to the active radio follows it (no pin)", async () => {
+    apiMock.mockResolvedValue({ contacts: [], channels: [], messages: [], conversations: [] });
+    const store = useAppStore();
+    store.status = { activeRadioId: 1, radios } as typeof store.status;
+    store.viewingRadioId = 2;
+
+    await store.switchRadio(1);
+
+    expect(store.viewingRadioId).toBeNull();
+    expect(store.effectiveRadioId).toBe(1);
+  });
+
+  it("a forgotten pinned radio falls back to following the active one", () => {
+    const store = useAppStore();
+    store.status = { activeRadioId: 1, radios } as typeof store.status;
+    store.viewingRadioId = 2;
+    // radio 2 disappears from a fresh status snapshot
+    store.onEvent({
+      type: "status.changed",
+      status: { activeRadioId: 1, radios: [radios[0]] } as typeof store.status,
+    } as WsEvent);
+    expect(store.viewingRadioId).toBeNull();
+  });
+});

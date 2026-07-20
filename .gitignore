@@ -8,3 +8,4 @@ compose.override.yml
 .env
 docker/.env
 TODO.md
+LOCAL_TESTING.md

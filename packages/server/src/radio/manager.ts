@@ -9,6 +9,7 @@ import {
   type Message,
   type NodeStats,
   type RadioProfile,
+  type RadioSummary,
   type SelfInfo,
   type SensorReading,
 } from "@meshkeep/shared";
@@ -27,6 +28,10 @@ const BATTERY_POLL_MS = 5 * 60_000;
 const MAX_CHANNELS = 8;
 const CONNECTION_OVERRIDE_KEY = "connection.override";
 const ACTIVE_PROFILE_KEY = "connection.activeProfileId";
+// The physical radio (radios.id) the server is connected to, or was last
+// connected to. Persisted so the last radio's stored data is shown immediately
+// on boot, before the first reconnect re-confirms identity.
+const ACTIVE_RADIO_KEY = "connection.activeRadioId";
 
 // Outbound retry backoff: hand-off failures (radio rejected the frame) back off
 // exponentially between these bounds; a radio that is simply offline is left
@@ -47,6 +52,7 @@ class LifecycleCancelledError extends Error {}
 
 interface PendingDirectDelivery {
   messageId: number;
+  radioId: number;
   expectedAckCrc: number | null;
   earlyAckCode: number | null;
   timeout: NodeJS.Timeout | null;
@@ -115,6 +121,10 @@ export class ConnectionManager {
   private batteryTimer: NodeJS.Timeout | null = null;
   private lifecycleGeneration = 0;
   private lifecycleAbort = new AbortController();
+  // The physical radio (radios.id) whose data the manager reads/writes. Resolved
+  // from the self public key on connect; seeded from the last-active setting so
+  // stored data is visible before the first reconnect.
+  private activeRadioId: number | null = null;
   private stopped = false;
   private draining = false;
   private drainAgain = false;
@@ -140,10 +150,71 @@ export class ConnectionManager {
     private readonly connectionFactory: typeof createConnection = createConnection,
   ) {
     this.store = new Store(db);
+    // Seed the active radio so stored data is visible before the first reconnect.
+    // Prefer the persisted last-active id (validated — it may have been forgotten),
+    // else the most-recently-seen radio (covers a pre-isolation upgrade where the
+    // setting was never written but radio 1 holds all migrated data).
+    const persisted = getSetting<number>(this.db, ACTIVE_RADIO_KEY);
+    const radios = this.store.listRadios(null);
+    this.activeRadioId =
+      (persisted != null && radios.some((radio) => radio.id === persisted) ? persisted : null) ??
+      radios[0]?.id ??
+      null;
   }
 
   getState(): ConnectionState {
     return this.state;
+  }
+
+  /** The radio the server is connected to (or last connected to), or null before any sync. */
+  getActiveRadioId(): number | null {
+    return this.activeRadioId;
+  }
+
+  /**
+   * The radio a no-argument read defaults to: the active (connected) radio if
+   * known, otherwise the most-recently-seen stored radio. Distinct from
+   * `getActiveRadioId` — status must report connection state honestly, but a
+   * read with no `?radioId=` should still surface a sensible radio's data (an
+   * upgraded single-radio DB, or a browser-direct-only session's synced radio).
+   */
+  defaultRadioId(): number | null {
+    return this.activeRadioId ?? this.store.listRadios(null)[0]?.id ?? null;
+  }
+
+  /** Whether a physical radio (radios.id) has stored data. */
+  hasRadio(id: number): boolean {
+    return this.store.getRadio(id) !== null;
+  }
+
+  /** The active radio id, or throw — for write/radio-op paths that require a synced identity. */
+  private requireActiveRadio(): number {
+    if (this.activeRadioId === null) {
+      throw new RadioUnavailableError("radio identity not resolved yet");
+    }
+    return this.activeRadioId;
+  }
+
+  /** Every radio with stored data, newest-seen first, marking the active one. */
+  listRadios(): RadioSummary[] {
+    return this.store.listRadios(this.activeRadioId);
+  }
+
+  /** Rename a stored radio. */
+  renameRadio(id: number, name: string): RadioSummary {
+    const updated = this.store.renameRadio(id, name);
+    if (!updated) throw new RadioNotFoundError(`radio ${id} not found`);
+    this.bus.publish({ type: "status.changed", status: this.status() });
+    return updated;
+  }
+
+  /** Forget a stored radio and all its data. The active radio cannot be forgotten. */
+  forgetRadio(id: number): void {
+    if (id === this.activeRadioId) {
+      throw new ActiveRadioError("cannot forget the active radio — switch or disconnect first");
+    }
+    if (!this.store.deleteRadio(id)) throw new RadioNotFoundError(`radio ${id} not found`);
+    this.bus.publish({ type: "status.changed", status: this.status() });
   }
 
   isStandby(): boolean {
@@ -250,6 +321,10 @@ export class ConnectionManager {
   status(): AppStatus {
     const { effective } = this.connectionSettings();
     const target = effective.connection !== "none" ? describeTargetSafe(effective) : null;
+    // Displayed self/battery/counts follow the default radio (active, else most
+    // recently seen) so a browser-direct-synced or last-connected radio still
+    // shows when the server itself is not connected; activeRadioId stays honest.
+    const displayRadioId = this.defaultRadioId();
     return {
       connection: {
         state: this.state,
@@ -258,9 +333,11 @@ export class ConnectionManager {
         lastError: this.lastError,
         connectedAt: this.connectedAt,
       },
-      self: this.store.getSelf(),
-      batteryMilliVolts: this.store.latestBatteryMv(),
-      counts: this.store.counts(),
+      self: displayRadioId === null ? null : this.store.getSelf(displayRadioId),
+      batteryMilliVolts: displayRadioId === null ? null : this.store.latestBatteryMv(displayRadioId),
+      counts: displayRadioId === null ? { contacts: 0, messages: 0, unread: 0 } : this.store.counts(displayRadioId),
+      activeRadioId: this.activeRadioId,
+      radios: this.store.listRadios(this.activeRadioId),
       version: this.appVersion,
     };
   }
@@ -440,7 +517,7 @@ export class ConnectionManager {
     });
 
     connection.on(Constants.PushCodes.Advert, (push: { publicKey: Uint8Array }) => {
-      if (!this.isCurrent(connection, generation)) return;
+      if (!this.isCurrent(connection, generation) || this.activeRadioId === null) return;
       // firmware auto-added/updated a contact; re-pull the contact list first
       // so the last-seen touch lands on an existing row instead of being lost
       // for a newly discovered contact
@@ -448,17 +525,17 @@ export class ConnectionManager {
       void this.refreshContacts()
         .catch(() => {}) // transient failure — the touch may still hit an already-stored contact
         .then(() => {
-          if (!this.isCurrent(connection, generation)) return;
-          const contact = this.store.touchContactSeen(key);
-          if (contact) this.bus.publish({ type: "contact.updated", contact });
+          if (!this.isCurrent(connection, generation) || this.activeRadioId === null) return;
+          const contact = this.store.touchContactSeen(this.activeRadioId, key);
+          if (contact) this.bus.publish({ type: "contact.updated", radioId: this.activeRadioId, contact });
         });
     });
 
     connection.on(Constants.PushCodes.NewAdvert, (advert: RawContact) => {
-      if (!this.isCurrent(connection, generation)) return;
+      if (!this.isCurrent(connection, generation) || this.activeRadioId === null) return;
       const contact = rawContactToContact(advert);
-      this.store.upsertContact(contact);
-      this.bus.publish({ type: "contact.updated", contact });
+      this.store.upsertContact(this.activeRadioId, contact);
+      this.bus.publish({ type: "contact.updated", radioId: this.activeRadioId, contact });
     });
 
     connection.on(Constants.PushCodes.PathUpdated, (_push: { publicKey: Uint8Array }) => {
@@ -499,8 +576,14 @@ export class ConnectionManager {
       firmwareBuildDate: device?.firmware_build_date ?? null,
       manufacturerModel: device?.manufacturerModel ? normalizeDeviceText(device.manufacturerModel) : null,
     };
-    this.store.saveSelf(self);
-    this.bus.publish({ type: "self.updated", self });
+    // Resolve (or create) the physical radio identity before persisting anything
+    // else: every subsequent write in this sync is scoped to it. Persist the id
+    // so a restart shows this radio's data before it reconnects.
+    const radioId = this.store.resolveRadio(self.publicKey, self.name);
+    this.activeRadioId = radioId;
+    setSetting(this.db, ACTIVE_RADIO_KEY, radioId);
+    this.store.saveSelf(radioId, self);
+    this.bus.publish({ type: "self.updated", radioId, self });
 
     // 2. fix clock drift (messages are timestamped by the device)
     try {
@@ -544,9 +627,10 @@ export class ConnectionManager {
    * message history keeps its own identity columns and is never orphaned.
    */
   private applyContactScan(contacts: Contact[]): void {
-    const { removed } = this.store.syncContacts(contacts);
-    for (const contact of contacts) this.bus.publish({ type: "contact.updated", contact });
-    for (const publicKey of removed) this.bus.publish({ type: "contact.removed", publicKey });
+    const radioId = this.requireActiveRadio();
+    const { removed } = this.store.syncContacts(radioId, contacts);
+    for (const contact of contacts) this.bus.publish({ type: "contact.updated", radioId, contact });
+    for (const publicKey of removed) this.bus.publish({ type: "contact.removed", radioId, publicKey });
   }
 
   async refreshChannels(): Promise<Channel[]> {
@@ -571,10 +655,11 @@ export class ConnectionManager {
         if (channel) channels.push(channel);
       }
       this.ensureCurrent(connection, generation);
+      const radioId = this.requireActiveRadio();
       this.db.transaction(() => {
-        for (const channel of channels) this.store.upsertChannel(channel);
-        for (const known of this.store.getChannels()) {
-          if (!channels.some((channel) => channel.idx === known.idx)) this.store.deleteChannel(known.idx);
+        for (const channel of channels) this.store.upsertChannel(radioId, channel);
+        for (const known of this.store.getChannels(radioId)) {
+          if (!channels.some((channel) => channel.idx === known.idx)) this.store.deleteChannel(radioId, known.idx);
         }
       })();
       return channels;
@@ -622,13 +707,14 @@ export class ConnectionManager {
   private handleIncoming(
     next: NonNullable<Awaited<ReturnType<Connection["syncNextMessage"]>>>,
   ): void {
+    const radioId = this.requireActiveRadio();
     let message: Message | null = null;
     if (next.contactMessage) {
       const m = next.contactMessage;
       const prefixHex = BufferUtils.bytesToHex(m.pubKeyPrefix);
-      const contact = this.store.findUniqueContactByPrefix(prefixHex);
-      if (contact) this.store.touchContactSeen(contact.publicKey);
-      message = this.store.insertMessage({
+      const contact = this.store.findUniqueContactByPrefix(radioId, prefixHex);
+      if (contact) this.store.touchContactSeen(radioId, contact.publicKey);
+      message = this.store.insertMessage(radioId, {
         kind: "dm",
         contactKey: contact?.publicKey ?? null,
         contactPrefix: prefixHex,
@@ -641,7 +727,7 @@ export class ConnectionManager {
       });
     } else if (next.channelMessage) {
       const m = next.channelMessage;
-      message = this.store.insertMessage({
+      message = this.store.insertMessage(radioId, {
         kind: "channel",
         channelIdx: m.channelIdx,
         direction: "in",
@@ -652,7 +738,7 @@ export class ConnectionManager {
       });
     }
     if (message) {
-      this.bus.publish({ type: "message.new", message });
+      this.bus.publish({ type: "message.new", radioId, message });
     }
   }
 
@@ -681,10 +767,14 @@ export class ConnectionManager {
     if (this.isStandby()) {
       throw new RadioUnavailableError("radio is in standby (released to a browser session)");
     }
+    // A send may be queued before any radio has connected. Attribute it to the
+    // default (active, else most-recent) radio, or a placeholder the first
+    // connect will claim — so the queued send reattaches to the real radio.
+    const radioId = this.defaultRadioId() ?? this.store.ensurePlaceholderRadio();
     const senderTimestamp = nowSecs();
     const stored =
       input.kind === "dm"
-        ? this.store.insertMessage({
+        ? this.store.insertMessage(radioId, {
             kind: "dm",
             contactKey: input.contactKey,
             direction: "out",
@@ -692,7 +782,7 @@ export class ConnectionManager {
             senderTimestamp,
             status: "pending",
           })
-        : this.store.insertMessage({
+        : this.store.insertMessage(radioId, {
             kind: "channel",
             channelIdx: input.channelIdx,
             direction: "out",
@@ -702,6 +792,7 @@ export class ConnectionManager {
           });
     if (!stored) throw new Error("duplicate message");
     this.store.enqueueOutbound({
+      radioId,
       messageId: stored.id,
       kind: input.kind,
       contactKey: input.kind === "dm" ? input.contactKey : null,
@@ -723,7 +814,9 @@ export class ConnectionManager {
     this.store.resetOutboundForRetry(messageId, nowSecs());
     this.store.setMessageStatus(messageId, "pending");
     const message = this.store.getMessage(messageId);
-    if (message) this.bus.publish({ type: "message.status", id: messageId, status: message.status });
+    if (message) {
+      this.bus.publish({ type: "message.status", radioId: entry.radioId, id: messageId, status: message.status });
+    }
     void this.processOutboundQueue();
     if (!message) throw new Error("message not found");
     return message;
@@ -735,7 +828,7 @@ export class ConnectionManager {
     if (!entry) throw new OutboundNotFoundError("message is not in the outbound queue");
     this.store.removeOutbound(messageId);
     this.store.setMessageStatus(messageId, "failed");
-    this.bus.publish({ type: "message.status", id: messageId, status: "failed" });
+    this.bus.publish({ type: "message.status", radioId: entry.radioId, id: messageId, status: "failed" });
     const message = this.store.getMessage(messageId);
     if (!message) throw new Error("message not found");
     return message;
@@ -756,8 +849,8 @@ export class ConnectionManager {
     try {
       while (!this.stopped && !this.isStandby() && (this.state === "connected" || this.state === "syncing")) {
         const connection = this.connection;
-        if (!connection) break;
-        const due = this.store.takeDueOutbound(nowSecs());
+        if (!connection || this.activeRadioId === null) break;
+        const due = this.store.takeDueOutbound(this.activeRadioId, nowSecs());
         if (!due.length) break;
         const entry = due[0]!;
         try {
@@ -787,7 +880,7 @@ export class ConnectionManager {
   private async deliverDirect(entry: OutboundEntry, connection: Connection): Promise<void> {
     if (!entry.contactKey) throw new Error("queued direct message is missing a contact key");
     const pubKey = BufferUtils.hexToBytes(entry.contactKey);
-    await this.runDirectSend(entry.messageId, async (pending) => {
+    await this.runDirectSend(entry.messageId, entry.radioId, async (pending) => {
       const txtType = entry.cli ? Constants.TxtTypes.CliData : Constants.TxtTypes.Plain;
       const sent = await connection.sendTextMessage(pubKey, entry.text, txtType);
       // Handed to the radio: the retry queue's job is done; ack/timeout now
@@ -800,7 +893,7 @@ export class ConnectionManager {
         return;
       }
       this.store.setMessageStatus(entry.messageId, "sent");
-      this.bus.publish({ type: "message.status", id: entry.messageId, status: "sent" });
+      this.bus.publish({ type: "message.status", radioId: pending.radioId, id: entry.messageId, status: "sent" });
       pending.timeout = setTimeout(() => this.finishDirectDelivery(pending, false), sent.estTimeout);
     });
   }
@@ -810,21 +903,22 @@ export class ConnectionManager {
     await connection.sendChannelTextMessage(entry.channelIdx, entry.text);
     this.store.removeOutbound(entry.messageId);
     this.store.setMessageStatus(entry.messageId, "sent");
-    this.bus.publish({ type: "message.status", id: entry.messageId, status: "sent" });
+    this.bus.publish({ type: "message.status", radioId: entry.radioId, id: entry.messageId, status: "sent" });
   }
 
   private recordOutboundFailure(entry: OutboundEntry, error: unknown): void {
+    const radioId = entry.radioId;
     const attempts = entry.attempts + 1;
     const lastError = error instanceof Error ? error.message : String(error ?? "send failed");
     if (attempts >= entry.maxAttempts) {
       this.store.markOutboundAttempt(entry.messageId, { state: "failed", attempts, nextAttemptAt: nowSecs(), lastError });
       this.store.setMessageStatus(entry.messageId, "failed");
-      this.bus.publish({ type: "message.status", id: entry.messageId, status: "failed" });
+      this.bus.publish({ type: "message.status", radioId, id: entry.messageId, status: "failed" });
     } else {
       const nextAttemptAt = nowSecs() + Math.ceil(outboundBackoffMs(attempts) / 1000);
       // The message row stays `pending`; the queue's `retrying` state overlays it.
       this.store.markOutboundAttempt(entry.messageId, { state: "retrying", attempts, nextAttemptAt, lastError });
-      this.bus.publish({ type: "message.status", id: entry.messageId, status: "retrying" });
+      this.bus.publish({ type: "message.status", radioId, id: entry.messageId, status: "retrying" });
     }
   }
 
@@ -838,7 +932,8 @@ export class ConnectionManager {
     // the queue just waits; connect() kicks the worker on reconnect. (Scheduling
     // regardless would busy-loop on a due entry that can never be attempted.)
     if (this.state !== "connected" && this.state !== "syncing") return;
-    const next = this.store.nextOutboundAttemptAt();
+    if (this.activeRadioId === null) return;
+    const next = this.store.nextOutboundAttemptAt(this.activeRadioId);
     if (next === null) return;
     const delayMs = Math.min(Math.max(next * 1000 - Date.now(), 0), OUTBOUND_TIMER_CAP_MS);
     this.outboundTimer = setTimeout(() => {
@@ -863,7 +958,7 @@ export class ConnectionManager {
     if (secret.length !== 16) throw new Error("channel secret must be 16 bytes of hex");
     await this.runUncorrelatedCommand(() => sendSetChannel(connection, idx, name, secret));
     const channel = { idx, name, secret: secretHex };
-    this.store.upsertChannel(channel);
+    this.store.upsertChannel(this.requireActiveRadio(), channel);
     return channel;
   }
 
@@ -871,7 +966,7 @@ export class ConnectionManager {
   async deleteChannel(idx: number): Promise<void> {
     const connection = this.requireConnection();
     await this.runUncorrelatedCommand(() => sendSetChannel(connection, idx, "", new Uint8Array(16)));
-    this.store.deleteChannel(idx);
+    this.store.deleteChannel(this.requireActiveRadio(), idx);
   }
 
   async setDeviceSettings(patch: {
@@ -885,7 +980,8 @@ export class ConnectionManager {
     radioCr?: number;
   }): Promise<SelfInfo> {
     const connection = this.requireConnection();
-    const self = this.store.getSelf();
+    const radioId = this.requireActiveRadio();
+    const self = this.store.getSelf(radioId);
     if (!self) throw new Error("self info not synced yet");
     if (patch.name !== undefined) {
       await connection.setAdvertName(patch.name);
@@ -920,16 +1016,17 @@ export class ConnectionManager {
       radioSf: patch.radioSf ?? self.radioSf,
       radioCr: patch.radioCr ?? self.radioCr,
     };
-    this.store.saveSelf(updated);
-    this.bus.publish({ type: "self.updated", self: updated });
+    this.store.saveSelf(radioId, updated);
+    this.bus.publish({ type: "self.updated", radioId, self: updated });
     return updated;
   }
 
   async removeContact(contactKey: string): Promise<void> {
     const connection = this.requireConnection();
+    const radioId = this.requireActiveRadio();
     await connection.removeContact(BufferUtils.hexToBytes(contactKey));
-    this.store.removeContact(contactKey);
-    this.bus.publish({ type: "contact.removed", publicKey: contactKey });
+    this.store.removeContact(radioId, contactKey);
+    this.bus.publish({ type: "contact.removed", radioId, publicKey: contactKey });
   }
 
   /** Export a contact (or our own identity when key is null) as a meshcore:// URI. */
@@ -1011,7 +1108,7 @@ export class ConnectionManager {
       value: item.value,
     }));
     if (readings.length) {
-      this.store.recordContactTelemetry(contactKey, readings);
+      this.store.recordContactTelemetry(this.requireActiveRadio(), contactKey, readings);
       this.store.trimTelemetry(this.config.telemetryRetentionDays);
     }
     return readings;
@@ -1022,13 +1119,15 @@ export class ConnectionManager {
     generation = this.lifecycleGeneration,
     signal = this.lifecycleAbort.signal,
   ): Promise<void> {
-    if (!connection) return;
+    if (!connection || this.activeRadioId === null) return;
+    const radioId = this.activeRadioId;
     try {
       const battery = await this.awaitCurrent(connection.getBatteryVoltage(), connection, generation, signal);
-      this.store.recordTelemetry(battery.batteryMilliVolts);
+      this.store.recordTelemetry(radioId, battery.batteryMilliVolts);
       this.store.trimTelemetry(this.config.telemetryRetentionDays);
       this.bus.publish({
         type: "telemetry",
+        radioId,
         batteryMilliVolts: battery.batteryMilliVolts,
         ts: Math.floor(Date.now() / 1000),
       });
@@ -1053,7 +1152,11 @@ export class ConnectionManager {
     if (pending.expectedAckCrc === ackCode) this.finishDirectDelivery(pending, true);
   }
 
-  private runDirectSend<T>(messageId: number, operation: (pending: PendingDirectDelivery) => Promise<T>): Promise<T> {
+  private runDirectSend<T>(
+    messageId: number,
+    radioId: number,
+    operation: (pending: PendingDirectDelivery) => Promise<T>,
+  ): Promise<T> {
     let resolveResult!: (value: T) => void;
     let rejectResult!: (reason: unknown) => void;
     const result = new Promise<T>((resolve, reject) => {
@@ -1061,7 +1164,7 @@ export class ConnectionManager {
       rejectResult = reject;
     });
     const queued = this.directSendQueue.then(async () => {
-      const pending = this.createPendingDirectDelivery(messageId);
+      const pending = this.createPendingDirectDelivery(messageId, radioId);
       this.pendingDirectDelivery = pending;
       try {
         resolveResult(await operation(pending));
@@ -1078,12 +1181,12 @@ export class ConnectionManager {
     return result;
   }
 
-  private createPendingDirectDelivery(messageId: number): PendingDirectDelivery {
+  private createPendingDirectDelivery(messageId: number, radioId: number): PendingDirectDelivery {
     let finish!: () => void;
     const finished = new Promise<void>((resolve) => {
       finish = resolve;
     });
-    return { messageId, expectedAckCrc: null, earlyAckCode: null, timeout: null, finished, finish };
+    return { messageId, radioId, expectedAckCrc: null, earlyAckCode: null, timeout: null, finished, finish };
   }
 
   private finishDirectDelivery(pending: PendingDirectDelivery, delivered: boolean): void {
@@ -1092,7 +1195,7 @@ export class ConnectionManager {
     if (pending.timeout !== null) clearTimeout(pending.timeout);
     if (delivered) {
       this.store.setMessageStatus(pending.messageId, "delivered");
-      this.bus.publish({ type: "message.status", id: pending.messageId, status: "delivered" });
+      this.bus.publish({ type: "message.status", radioId: pending.radioId, id: pending.messageId, status: "delivered" });
     }
     pending.finish();
   }
@@ -1148,6 +1251,10 @@ export class RadioUnavailableError extends Error {}
 export class ProfileNotFoundError extends Error {}
 /** The operation is not allowed on the currently active radio profile. */
 export class ActiveProfileError extends Error {}
+/** The referenced physical radio (radios.id) does not exist. */
+export class RadioNotFoundError extends Error {}
+/** The operation is not allowed on the currently active radio (e.g. forgetting it). */
+export class ActiveRadioError extends Error {}
 /** The referenced message has no outbound-queue entry (never queued or already delivered). */
 export class OutboundNotFoundError extends Error {}
 /** The outbound entry is not in a state that permits the requested action (e.g. retrying a non-failed send). */
