@@ -395,15 +395,42 @@ describe("mock radio end-to-end", () => {
     expect(event.message.contactName).toBe("Mock Bob");
   });
 
-  it("preserves repeated incoming messages", async () => {
+  it("dedupes an inbound frame re-delivered with the same sender_timestamp and text", async () => {
     const first = waitForEvent(bus, (e) => e.type === "message.new");
-    mock.injectDirectMessage("Mock Bob", "same message");
+    mock.injectDirectMessage("Mock Bob", "same message", 1_700_000_000);
     await first;
     const before = manager.store.counts(manager.getActiveRadioId()!).messages;
-    // The protocol offers no frame ID, so distinct received frames are kept.
-    mock.injectDirectMessage("Mock Bob", "same message");
+    // A retransmission/multi-path delivery of the same frame (identical sender
+    // timestamp + text) must not be stored or counted again.
+    mock.injectDirectMessage("Mock Bob", "same message", 1_700_000_000);
     await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(manager.store.counts(manager.getActiveRadioId()!).messages).toBe(before);
+  });
+
+  it("preserves two genuine sends with the same text but distinct sender_timestamp", async () => {
+    const first = waitForEvent(bus, (e) => e.type === "message.new");
+    mock.injectDirectMessage("Mock Bob", "same message", 1_700_000_100);
+    await first;
+    const before = manager.store.counts(manager.getActiveRadioId()!).messages;
+    const second = waitForEvent(bus, (e) => e.type === "message.new");
+    mock.injectDirectMessage("Mock Bob", "same message", 1_700_000_200);
+    await second;
     expect(manager.store.counts(manager.getActiveRadioId()!).messages).toBe(before + 1);
+  });
+
+  it("dedupes a re-delivered channel frame but not the same text on a different channel", async () => {
+    const first = waitForEvent(bus, (e) => e.type === "message.new");
+    mock.injectChannelMessage(0, "channel hello", 1_700_000_300);
+    await first;
+    const afterFirst = manager.store.counts(manager.getActiveRadioId()!).messages;
+    mock.injectChannelMessage(0, "channel hello", 1_700_000_300);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(manager.store.counts(manager.getActiveRadioId()!).messages).toBe(afterFirst);
+
+    const onOtherChannel = waitForEvent(bus, (e) => e.type === "message.new");
+    mock.injectChannelMessage(1, "channel hello", 1_700_000_300);
+    await onOtherChannel;
+    expect(manager.store.counts(manager.getActiveRadioId()!).messages).toBe(afterFirst + 1);
   });
 
   it("updates device settings", async () => {

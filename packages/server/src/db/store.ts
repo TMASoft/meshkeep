@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   Channel,
   Contact,
@@ -505,6 +505,27 @@ export class Store {
     return this.db.prepare("DELETE FROM radio_profiles WHERE id = ?").run(id).changes > 0;
   }
 
+  /**
+   * Deterministic identity for a radio-inbound frame: MeshCore exposes no
+   * frame/packet ID, so this stands in for one. Scoped narrowly enough to
+   * preserve legitimate repeats — the sender's own `senderTimestamp` is the
+   * discriminator, so a later, genuinely re-sent identical text still gets a
+   * distinct id. This is only used when the caller has no ingestion ID of its
+   * own (radio-inbound path); browser ingests always supply one.
+   */
+  private inboundFrameId(
+    radioId: number,
+    kind: MessageKind,
+    conversationKey: string | number,
+    senderTimestamp: number,
+    authorPrefix: string | null,
+    text: string,
+  ): string {
+    return createHash("sha256")
+      .update(JSON.stringify([radioId, kind, conversationKey, senderTimestamp, authorPrefix, text]))
+      .digest("hex");
+  }
+
   /** Insert a message once per stable ingestion ID, scoped to a radio. */
   insertMessage(
     radioId: number,
@@ -538,7 +559,18 @@ export class Store {
       input.kind === "dm" && !input.contactKey && input.contactPrefix
         ? this.findUniqueContactByPrefix(radioId, input.contactPrefix)?.publicKey ?? null
         : input.contactKey ?? null;
-    const ingestionId = input.ingestionId ?? randomUUID();
+    const ingestionId =
+      input.ingestionId ??
+      (input.direction === "in"
+        ? this.inboundFrameId(
+            radioId,
+            input.kind,
+            input.kind === "dm" ? (input.contactPrefix ?? contactKey ?? "") : input.channelIdx!,
+            input.senderTimestamp,
+            input.authorPrefix ?? null,
+            input.text,
+          )
+        : randomUUID());
     const result = this.db
       .prepare(
         `INSERT OR IGNORE INTO messages

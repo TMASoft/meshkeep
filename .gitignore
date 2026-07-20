@@ -9,3 +9,4 @@ compose.override.yml
 docker/.env
 TODO.md
 LOCAL_TESTING.md
+CLAUDE.md

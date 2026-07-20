@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { databaseDiagnostics, MIGRATIONS, openDb } from "../src/db/index.js";
+import { Store } from "../src/db/store.js";
 
 /** Build a database at a historical schema version by applying the real migrations. */
 function openAtVersion(path: string, version: number): Database.Database {
@@ -135,6 +136,123 @@ describe("database migrations", () => {
     expect(databaseDiagnostics(db).foreignKeyViolations).toBe(0);
     db.close();
     rmSync(directory, { recursive: true, force: true });
+  });
+});
+
+describe("insertMessage inbound frame dedup", () => {
+  it("dedupes an inbound DM re-delivered with the same conversation, timestamp, and text", () => {
+    const store = new Store(openDb(":memory:"));
+    const radioId = store.resolveRadio("11".repeat(32), "Radio One");
+    const first = store.insertMessage(radioId, {
+      kind: "dm",
+      contactPrefix: "abcdef12",
+      direction: "in",
+      text: "Hola",
+      senderTimestamp: 1784282914,
+    });
+    expect(first).not.toBeNull();
+    const second = store.insertMessage(radioId, {
+      kind: "dm",
+      contactPrefix: "abcdef12",
+      direction: "in",
+      text: "Hola",
+      senderTimestamp: 1784282914,
+    });
+    expect(second).toBeNull();
+    expect(store.counts(radioId).messages).toBe(1);
+  });
+
+  it("preserves a genuine repeat send with a distinct sender_timestamp", () => {
+    const store = new Store(openDb(":memory:"));
+    const radioId = store.resolveRadio("11".repeat(32), "Radio One");
+    store.insertMessage(radioId, {
+      kind: "dm",
+      contactPrefix: "abcdef12",
+      direction: "in",
+      text: "Hola",
+      senderTimestamp: 1784282914,
+    });
+    const second = store.insertMessage(radioId, {
+      kind: "dm",
+      contactPrefix: "abcdef12",
+      direction: "in",
+      text: "Hola",
+      senderTimestamp: 1784282999,
+    });
+    expect(second).not.toBeNull();
+    expect(store.counts(radioId).messages).toBe(2);
+  });
+
+  it("does not conflate identical channel text/timestamp across different channels", () => {
+    const store = new Store(openDb(":memory:"));
+    const radioId = store.resolveRadio("11".repeat(32), "Radio One");
+    store.insertMessage(radioId, {
+      kind: "channel",
+      channelIdx: 0,
+      direction: "in",
+      text: "channel hello",
+      senderTimestamp: 1784282914,
+    });
+    const onOtherChannel = store.insertMessage(radioId, {
+      kind: "channel",
+      channelIdx: 1,
+      direction: "in",
+      text: "channel hello",
+      senderTimestamp: 1784282914,
+    });
+    expect(onOtherChannel).not.toBeNull();
+    expect(store.counts(radioId).messages).toBe(2);
+
+    const redelivered = store.insertMessage(radioId, {
+      kind: "channel",
+      channelIdx: 0,
+      direction: "in",
+      text: "channel hello",
+      senderTimestamp: 1784282914,
+    });
+    expect(redelivered).toBeNull();
+    expect(store.counts(radioId).messages).toBe(2);
+  });
+
+  it("simulates a reconnect re-drain: re-processing the same frame after reconnect does not duplicate it", () => {
+    const store = new Store(openDb(":memory:"));
+    const radioId = store.resolveRadio("11".repeat(32), "Radio One");
+    const frame = {
+      kind: "dm" as const,
+      contactPrefix: "abcdef12",
+      direction: "in" as const,
+      text: "Hola",
+      senderTimestamp: 1784282914,
+    };
+    store.insertMessage(radioId, frame);
+    // the radio queue re-drains the same unacknowledged frame after reconnect
+    store.insertMessage(radioId, frame);
+    store.insertMessage(radioId, frame);
+    expect(store.counts(radioId).messages).toBe(1);
+  });
+
+  it("leaves outbound sends unaffected: identical text/timestamp with no ingestionId are both stored", () => {
+    const store = new Store(openDb(":memory:"));
+    const radioId = store.resolveRadio("11".repeat(32), "Radio One");
+    const contactKey = "ab".repeat(32);
+    store.insertMessage(radioId, {
+      kind: "dm",
+      contactKey,
+      direction: "out",
+      text: "hi",
+      senderTimestamp: 1784282914,
+      status: "pending",
+    });
+    const second = store.insertMessage(radioId, {
+      kind: "dm",
+      contactKey,
+      direction: "out",
+      text: "hi",
+      senderTimestamp: 1784282914,
+      status: "pending",
+    });
+    expect(second).not.toBeNull();
+    expect(store.counts(radioId).messages).toBe(2);
   });
 });
 

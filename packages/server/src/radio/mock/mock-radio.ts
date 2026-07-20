@@ -283,15 +283,15 @@ export class MockRadio {
   }
 
   /** Queue an incoming message and notify connected clients, as real firmware would. */
-  injectDirectMessage(fromName: string, text: string): void {
+  injectDirectMessage(fromName: string, text: string, senderTimestamp = nowSecs()): void {
     const from = this.contacts.find((c) => c.name === fromName);
     if (!from) throw new Error(`no mock contact named ${fromName}`);
-    this.queue.push({ kind: "dm", from, text, senderTimestamp: nowSecs(), pathLen: 0xff });
+    this.queue.push({ kind: "dm", from, text, senderTimestamp, pathLen: 0xff });
     this.pushToAll(new FrameWriter().byte(PUSH.MsgWaiting));
   }
 
-  injectChannelMessage(channelIdx: number, text: string): void {
-    this.queue.push({ kind: "channel", channelIdx, text, senderTimestamp: nowSecs(), pathLen: 1 });
+  injectChannelMessage(channelIdx: number, text: string, senderTimestamp = nowSecs()): void {
+    this.queue.push({ kind: "channel", channelIdx, text, senderTimestamp, pathLen: 1 });
     this.pushToAll(new FrameWriter().byte(PUSH.MsgWaiting));
   }
 
