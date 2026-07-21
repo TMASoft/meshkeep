@@ -637,6 +637,31 @@ describe("websocket event application", () => {
     expect(store.unread[`dm:${KEY_A}`]).toBeUndefined();
     expect(store.activeConversation).toBeNull();
   });
+
+  // #61: a removed contact can still have unread DM history server-side (the
+  // getUnreadSummary/getUnknownDirectMessages exclusion is by contact_key, not
+  // by the removal event) — refetch so it resurfaces as a "Removed contact"
+  // sidebar row instead of vanishing until the next full reload.
+  it("contact.removed refetches unknown senders and unread so a stranded DM resurfaces", () => {
+    const store = useAppStore();
+    apiMock.mockResolvedValue({ messages: [], conversations: [] });
+    store.onEvent({ type: "contact.removed", publicKey: KEY_A } as WsEvent);
+    expect(apiMock).toHaveBeenCalledWith("/messages/unknown-senders");
+    expect(apiMock).toHaveBeenCalledWith("/messages/unread");
+  });
+
+  // #61: the server excludes a self-addressed DM from the unread summary
+  // entirely; the live WS path must agree, or a self-echo could leave a badge
+  // this session can never clear (no sidebar row is ever rendered for it).
+  it("does not count or notify for a DM addressed to the radio's own self key", () => {
+    const store = useAppStore();
+    store.status = { self: { publicKey: KEY_A } } as typeof store.status;
+    store.appendMessage(message({ id: 1, contactKey: KEY_A }));
+    expect(store.unread[conversationKey({ kind: "dm", contactKey: KEY_A })]).toBeUndefined();
+    expect(notifyIncomingMock).not.toHaveBeenCalled();
+    // still recorded in history — only the unread/notification noise is suppressed
+    expect(store.conversations[conversationKey({ kind: "dm", contactKey: KEY_A })]).toHaveLength(1);
+  });
 });
 
 describe("radio switching (issue #53)", () => {

@@ -78,6 +78,21 @@ function contactIcon(contact: Contact): "repeater" | "room" | "user" {
   return "user";
 }
 
+/**
+ * `store.unknownSenders` holds DMs with no other sidebar row: a sender never
+ * resolved to a full key, or resolved to a contact_key that isn't in the
+ * current contact list anymore (removed after messages arrived — see #61).
+ * Prefer the resolved key as the conversation identity when there is one, so
+ * opening/marking-read lines up with the badge in `store.unread`.
+ */
+function unknownConversation(message: Message): ConversationId {
+  return message.contactKey ? { kind: "dm", contactKey: message.contactKey } : { kind: "dm", contactPrefix: message.contactPrefix ?? "" };
+}
+
+function unknownLabel(message: Message): string {
+  return message.contactKey ? "Removed contact" : "Unknown sender";
+}
+
 function statusLabel(message: Message): string {
   if (message.direction === "in") return "";
   switch (message.status) {
@@ -812,21 +827,21 @@ function fmtLastAdvert(epoch: number): string {
           </div>
           <button
             v-for="message in store.unknownSenders"
-            :key="message.contactPrefix ?? message.id"
+            :key="message.contactKey ?? message.contactPrefix ?? message.id"
             class="conversation-row"
-            :class="{ active: active?.kind === 'dm' && active.contactPrefix === message.contactPrefix }"
+            :class="{ active: activeKey === conversationKey(unknownConversation(message)) }"
             type="button"
             :disabled="opening"
-            :aria-current="active?.kind === 'dm' && active.contactPrefix === message.contactPrefix ? 'true' : undefined"
-            @click="open({ kind: 'dm', contactPrefix: message.contactPrefix ?? '' }, $event)"
+            :aria-current="activeKey === conversationKey(unknownConversation(message)) ? 'true' : undefined"
+            @click="open(unknownConversation(message), $event)"
           >
             <span class="conversation-avatar"><AppIcon name="user" :size="18" /></span>
             <span class="conversation-copy">
-              <strong>Unknown sender</strong>
-              <small>{{ shortKey(message.contactPrefix ?? "") }}</small>
+              <strong>{{ unknownLabel(message) }}</strong>
+              <small>{{ shortKey(message.contactKey ?? message.contactPrefix ?? "") }}</small>
             </span>
-            <span v-if="store.unread[`dm:unknown:${message.contactPrefix}`]" class="unread-badge">
-              {{ store.unread[`dm:unknown:${message.contactPrefix}`] }}
+            <span v-if="store.unread[conversationKey(unknownConversation(message))]" class="unread-badge">
+              {{ store.unread[conversationKey(unknownConversation(message))] }}
             </span>
           </button>
         </section>

@@ -850,15 +850,35 @@ export class Store {
     }
   }
 
+  /**
+   * DMs with no sidebar entry to render them: either the sender was never
+   * resolved to a full contact key, or it was resolved but that contact is no
+   * longer in the radio's current contact list (removed after messages
+   * arrived — see #61). A DM addressed to the radio's own self key is excluded
+   * rather than surfaced here; it is a loopback/self-echo, not a conversation.
+   * Grouped by the highest-fidelity identity available (contact_key when
+   * resolved, else contact_prefix) so each unlisted sender appears once, most
+   * recent message first.
+   */
   getUnknownDirectMessages(radioId: number): Message[] {
+    const unlisted = (prefix: string) => `
+      ${prefix}kind = 'dm' AND ${prefix}contact_prefix IS NOT NULL
+      AND (
+        ${prefix}contact_key IS NULL
+        OR (
+          ${prefix}contact_key NOT IN (SELECT public_key FROM contacts WHERE radio_id = @radioId)
+          AND ${prefix}contact_key != COALESCE((SELECT public_key FROM radios WHERE id = @radioId), '')
+        )
+      )
+    `;
     const rows = this.db
       .prepare(
         `${MESSAGE_SELECT}
-         WHERE m.radio_id = @radioId AND m.kind = 'dm' AND m.contact_key IS NULL AND m.contact_prefix IS NOT NULL
+         WHERE m.radio_id = @radioId AND ${unlisted("m.")}
            AND m.id IN (
              SELECT MAX(id) FROM messages
-             WHERE radio_id = @radioId AND kind = 'dm' AND contact_key IS NULL AND contact_prefix IS NOT NULL
-             GROUP BY contact_prefix
+             WHERE radio_id = @radioId AND ${unlisted("")}
+             GROUP BY COALESCE(contact_key, contact_prefix)
            )
          ORDER BY m.id DESC`,
       )
@@ -894,7 +914,12 @@ export class Store {
   /**
    * Unread incoming messages grouped per conversation for one radio, using the
    * same addressing as getConversation: resolved DMs by contact key, unresolved
-   * DMs by sender prefix, channel messages by channel index.
+   * DMs by sender prefix, channel messages by channel index. A DM addressed to
+   * the radio's own self key is excluded: it is a loopback/self-echo, not an
+   * incoming conversation, and would otherwise produce an unclearable badge
+   * (see #61 — the sidebar has nowhere to render "a conversation with yourself").
+   * A resolved DM whose contact was since removed still counts here; it is
+   * surfaced (and can be marked read) via getUnknownDirectMessages.
    */
   getUnreadSummary(radioId: number): ConversationUnread[] {
     const rows = this.db
@@ -905,11 +930,16 @@ export class Store {
                 CASE WHEN kind = 'channel' THEN channel_idx END AS channel_idx,
                 COUNT(*) AS unread
          FROM messages
-         WHERE radio_id = ? AND direction = 'in' AND read = 0
+         WHERE radio_id = @radioId AND direction = 'in' AND read = 0
+           AND (
+             kind != 'dm'
+             OR contact_key IS NULL
+             OR contact_key != COALESCE((SELECT public_key FROM radios WHERE id = @radioId), '')
+           )
          GROUP BY 1, 2, 3, 4
          ORDER BY unread DESC`,
       )
-      .all(radioId) as Array<{
+      .all({ radioId }) as Array<{
       kind: MessageKind;
       contact_key: string | null;
       contact_prefix: string | null;

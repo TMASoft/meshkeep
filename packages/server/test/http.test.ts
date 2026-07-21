@@ -397,6 +397,74 @@ describe("http: per-conversation unread summary", () => {
   });
 });
 
+// #61: an unread DM whose contact_key has no matching row in `contacts` — the
+// radio's own self key (never a real contact) or a contact removed after
+// messages arrived — used to count in the total badge with nowhere in the
+// sidebar to open or clear it.
+describe("http: orphaned and self-key DM unread (#61)", () => {
+  const { app, manager } = buildHarness();
+  const store = manager.store;
+  const selfKey = "aa".repeat(32);
+  const radioId = store.resolveRadio(selfKey, "Self Radio");
+  const removedKey = "bb".repeat(32);
+  const base = 1_784_100_000;
+
+  const insert = (contactKey: string) =>
+    store.insertMessage(radioId, {
+      kind: "dm",
+      contactKey,
+      contactPrefix: contactKey.slice(0, 12),
+      direction: "in",
+      text: "hi",
+      senderTimestamp: base,
+      status: "sent",
+    });
+
+  // A contact present when its message arrived, then removed by a later sync.
+  store.upsertContact(radioId, {
+    publicKey: removedKey,
+    name: "Gone",
+    type: "chat",
+    flags: 0,
+    outPathLen: -1,
+    lat: null,
+    lon: null,
+    lastAdvert: 0,
+    lastSeen: null,
+  });
+  insert(removedKey);
+  store.removeContact(radioId, removedKey);
+
+  // The radio's own public key, resolved as if it had briefly appeared as a
+  // contact (the root cause traced in #61).
+  insert(selfKey);
+
+  const summary = async () => {
+    const res = await request(app).get("/api/v1/messages/unread").expect(200);
+    return res.body.conversations as Array<Record<string, unknown>>;
+  };
+  const unknownSenders = async () => {
+    const res = await request(app).get("/api/v1/messages/unknown-senders").expect(200);
+    return res.body.messages as Array<Record<string, unknown>>;
+  };
+
+  it("excludes the self-key DM from the unread total entirely", async () => {
+    expect(await summary()).toEqual([{ kind: "dm", contactKey: removedKey, contactPrefix: null, channelIdx: null, unread: 1 }]);
+  });
+
+  it("never lists the self-key DM as an openable sender", async () => {
+    expect((await unknownSenders()).some((m) => m.contactKey === selfKey)).toBe(false);
+  });
+
+  it("surfaces the removed contact's DM so it can be opened and marked read", async () => {
+    const messages = await unknownSenders();
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ contactKey: removedKey });
+    await request(app).post("/api/v1/messages/read").send({ contact: removedKey }).expect(200);
+    expect(await summary()).toEqual([]);
+  });
+});
+
 describe("http: ingest", () => {
   const { app } = buildHarness();
 

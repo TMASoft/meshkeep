@@ -634,10 +634,15 @@ export const useAppStore = defineStore("app", {
         this.unknownSenders = [message, ...this.unknownSenders.filter((m) => m.contactPrefix !== message.contactPrefix)];
       }
       const isActive = this.activeConversation && conversationKey(this.activeConversation) === key;
-      if (message.direction === "in" && !isActive) {
+      // A DM addressed to the radio's own self key is a loopback/self-echo, not
+      // a real incoming conversation (see #61) — the server already excludes it
+      // from getUnreadSummary, so counting it here would leave a badge that a
+      // reload silently clears but that this live session can never open.
+      const isSelfEcho = message.kind === "dm" && message.contactKey != null && message.contactKey === this.self?.publicKey;
+      if (message.direction === "in" && !isActive && !isSelfEcho) {
         this.unread[key] = (this.unread[key] ?? 0) + 1;
       }
-      if (message.direction === "in") {
+      if (message.direction === "in" && !isSelfEcho) {
         notifyIncoming(message, { conversationActive: Boolean(isActive) });
       }
     },
@@ -744,6 +749,10 @@ export const useAppStore = defineStore("app", {
           if (this.activeConversation?.kind === "dm" && this.activeConversation.contactKey === event.publicKey) {
             this.activeConversation = null;
           }
+          // Any unread DM history for this contact just lost its sidebar row.
+          // Refetch so it reappears as a "Removed contact" entry (with its
+          // badge) instead of a stuck, unrenderable count (see #61).
+          void Promise.all([this.refreshUnknownSenders(), this.refreshUnread()]).catch(() => {});
           break;
         }
         case "self.updated":
