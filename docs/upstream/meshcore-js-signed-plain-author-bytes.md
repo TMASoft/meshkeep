@@ -1,6 +1,7 @@
-# DRAFT upstream issue for liamcottle/meshcore.js — do not file without review
+# Upstream report for liamcottle/meshcore.js
 
-Tracking: MeshKeep issue #21. We carry a local workaround
+Filed as [meshcore-dev/meshcore.js#34](https://github.com/meshcore-dev/meshcore.js/issues/34),
+tracked by MeshKeep issue #21. We carry a local workaround
 (`patchSignedPlain` in `packages/server/src/radio/transports.ts` and the
 equivalent in the web browser-direct path); once fixed upstream we can drop it
 and pin the minimum version.

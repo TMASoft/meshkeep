@@ -139,7 +139,28 @@ export interface RadioSummary {
   isActive: boolean;
 }
 
+/**
+ * One connection the server is currently maintaining (issue #53, Stage 3):
+ * either a named radio profile, or the implicit env/override "default" link
+ * (profileId null). Several may run concurrently.
+ */
+export interface LinkStatus {
+  profileId: number | null;
+  /** The saved profile's name, or "Default" for the env/override link. */
+  label: string;
+  radioId: number | null;
+  standby: boolean;
+  connection: ConnectionStatus;
+}
+
 export interface AppStatus {
+  /**
+   * Compatibility view of a single connection, populated from the default
+   * link if running, else the first active link, else idle/disconnected
+   * placeholders. Kept for existing single-radio consumers (including
+   * external API-token integrations) — prefer `links` for anything
+   * concurrency-aware.
+   */
   connection: ConnectionStatus;
   self: SelfInfo | null;
   batteryMilliVolts: number | null;
@@ -152,6 +173,8 @@ export interface AppStatus {
   activeRadioId: number | null;
   /** Every radio with stored data, for the browse/switcher UI. */
   radios: RadioSummary[];
+  /** Every connection the server currently maintains — usually one, possibly several. */
+  links: LinkStatus[];
   version: string;
 }
 

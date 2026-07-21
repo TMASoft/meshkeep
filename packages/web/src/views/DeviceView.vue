@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import type { BleCandidate, ConnectionSettings, DetectedSerialPort, RadioProfile, TelemetryPoint } from "@meshkeep/shared";
 import { api } from "../api/client";
-import { useAppStore } from "../stores/app";
+import { useAppStore, radioSuffix } from "../stores/app";
 import { browserRadioSupport, type BrowserRadioKind } from "../sources/browser-radio";
 import AppIcon from "../components/AppIcon.vue";
 
@@ -86,7 +86,7 @@ const saveDevice = async () => {
   }
 
   await run("Settings update", async () => {
-    await api("/device", { method: "PATCH", body: JSON.stringify(patch) });
+    await api(`/device${radioSuffix(store.effectiveRadioId)}`, { method: "PATCH", body: JSON.stringify(patch) });
     await store.refreshStatus();
   });
 };
@@ -232,7 +232,7 @@ const saveRfParams = async () => {
     return;
   }
   await run("RF update", async () => {
-    await api("/device", { method: "PATCH", body: JSON.stringify(patch) });
+    await api(`/device${radioSuffix(store.effectiveRadioId)}`, { method: "PATCH", body: JSON.stringify(patch) });
     await store.refreshStatus();
   });
 };
@@ -397,22 +397,36 @@ function profileTarget(profile: RadioProfile): string {
   }
 }
 
+// Activation is additive (issue #53, Stage 3b): connecting a profile leaves
+// any other active profile (or the default link) running, so several radios
+// can be connected at once. Each row's own state comes from store.links, not
+// a single "the active profile" flag.
 const activateProfile = (profile: RadioProfile) =>
   run(`Profile "${profile.name}"`, async () => {
     const result = await api<ConnConfig>(`/radio/profiles/${profile.id}/activate`, { method: "POST" });
     connConfig.value = result;
     seedConnForm(result.effective);
-    activeProfileId.value = profile.id;
     editingProfileId.value = null;
+    await loadProfiles();
     await store.refreshStatus();
   });
 
+/** Disconnect just this one profile — other active links are untouched. */
+const deactivateOneProfile = (profile: RadioProfile) =>
+  run(`Disconnect "${profile.name}"`, async () => {
+    await api(`/radio/profiles/${profile.id}/deactivate`, { method: "POST" });
+    await loadProfiles();
+    await loadConnConfig();
+    await store.refreshStatus();
+  });
+
+/** Disconnect every active profile and fall back to the environment/override link. */
 const deactivateProfile = () =>
   run("Profile deactivation", async () => {
     const result = await api<ConnConfig>("/radio/profiles/deactivate", { method: "POST" });
     connConfig.value = result;
     seedConnForm(result.effective);
-    activeProfileId.value = null;
+    await loadProfiles();
     await store.refreshStatus();
   });
 
@@ -550,7 +564,7 @@ watch(
 
 async function copyShareUri() {
   await run("Share link", async () => {
-    const { uri } = await api<{ uri: string }>("/device/share");
+    const { uri } = await api<{ uri: string }>(`/device/share${radioSuffix(store.effectiveRadioId)}`);
     await navigator.clipboard.writeText(uri);
   });
   if (!errorText.value) notice.value = "meshcore:// link copied to clipboard";
@@ -575,7 +589,9 @@ onMounted(() => {
         <i />
         <span>
           <small>Link state</small>
-          <strong>{{ store.connectionState }}</strong>
+          <strong>
+            {{ store.connectionState }}<template v-if="store.connectedLinkCount > 1"> · {{ store.connectedLinkCount }} radios</template>
+          </strong>
         </span>
       </div>
     </header>
@@ -897,7 +913,7 @@ onMounted(() => {
               v-for="profile in profiles"
               :key="profile.id"
               class="profile-row"
-              :class="{ active: profile.id === activeProfileId, editing: profile.id === editingProfileId }"
+              :class="{ active: !!store.linkForProfile(profile.id), editing: profile.id === editingProfileId }"
             >
               <span class="profile-icon"><AppIcon name="radio" :size="16" /></span>
               <div class="profile-identity">
@@ -905,13 +921,24 @@ onMounted(() => {
                 <span>{{ profile.connection }} · {{ profileTarget(profile) }}</span>
               </div>
               <div class="profile-actions">
-                <span v-if="profile.id === activeProfileId" class="profile-active-badge">Active</span>
-                <button v-else type="button" class="profile-connect" :disabled="busy !== null" @click="activateProfile(profile)">
-                  Connect
+                <span
+                  v-if="store.linkForProfile(profile.id)"
+                  class="profile-active-badge"
+                  :class="store.linkForProfile(profile.id)!.connection.state"
+                >
+                  {{ store.linkForProfile(profile.id)!.connection.state }}
+                </span>
+                <button
+                  type="button"
+                  :class="store.linkForProfile(profile.id) ? 'profile-disconnect' : 'profile-connect'"
+                  :disabled="busy !== null"
+                  @click="store.linkForProfile(profile.id) ? deactivateOneProfile(profile) : activateProfile(profile)"
+                >
+                  {{ store.linkForProfile(profile.id) ? "Disconnect" : "Connect" }}
                 </button>
                 <button type="button" :disabled="busy !== null" @click="editProfile(profile)">Edit</button>
                 <button
-                  v-if="profile.id !== activeProfileId"
+                  v-if="!store.linkForProfile(profile.id)"
                   type="button"
                   class="profile-delete"
                   :disabled="busy !== null"
@@ -921,6 +948,9 @@ onMounted(() => {
                 </button>
               </div>
             </article>
+            <p v-if="store.links.length > 1" class="profile-summary">
+              {{ store.connectedLinkCount }} of {{ store.links.length }} link{{ store.links.length === 1 ? "" : "s" }} connected
+            </p>
           </div>
 
           <div v-if="connError" class="token-error" role="alert">Unable to load connection settings.</div>
@@ -1265,8 +1295,13 @@ onMounted(() => {
 .profile-actions button { min-width: 44px; min-height: 44px; border: 0; background: transparent; color: var(--text-muted); font-size: 10px; font-weight: 700; cursor: pointer; }
 .profile-actions button:hover:not(:disabled) { color: var(--text); }
 .profile-actions button.profile-connect { color: var(--accent); }
+.profile-actions button.profile-disconnect { color: var(--amber); }
 .profile-actions button.profile-delete { color: var(--danger); }
-.profile-active-badge { padding: 0 8px; color: var(--accent); font-family: monospace; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.profile-active-badge { padding: 0 8px; color: var(--text-faint); font-family: monospace; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.profile-active-badge.connected { color: var(--accent); }
+.profile-active-badge.connecting, .profile-active-badge.syncing { color: var(--amber); }
+.profile-active-badge.error { color: var(--danger); }
+.profile-summary { margin: 0; border-top: 1px solid var(--border); padding: 8px 12px; color: var(--text-faint); font-family: monospace; font-size: 9px; letter-spacing: .04em; text-transform: uppercase; }
 .profile-save-row { display: flex; gap: 8px; }
 .profile-save-row input { min-width: 0; flex: 1; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); padding: 10px 12px; color: var(--text); font-size: 12px; }
 .detect-row { display: flex; gap: 6px; }

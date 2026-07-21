@@ -4,6 +4,8 @@ import type { ConnectionManager } from "../radio/manager.js";
 import {
   ActiveProfileError,
   ActiveRadioError,
+  AmbiguousLinkError,
+  BleExclusivityError,
   OutboundNotFoundError,
   OutboundStateError,
   ProfileNotFoundError,
@@ -49,6 +51,8 @@ function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
       }
       if (error instanceof z.ZodError) {
         res.status(400).json({ error: "invalid request", details: error.issues });
+      } else if (error instanceof AmbiguousLinkError) {
+        res.status(400).json({ error: error.message });
       } else if (error instanceof RadioUnavailableError) {
         res.status(503).json({ error: error.message });
       } else if (
@@ -61,7 +65,8 @@ function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
         error instanceof OutboundStateError ||
         error instanceof ActiveProfileError ||
         error instanceof ActiveRadioError ||
-        error instanceof DuplicateProfileNameError
+        error instanceof DuplicateProfileNameError ||
+        error instanceof BleExclusivityError
       ) {
         res.status(409).json({ error: error.message });
       } else if (error instanceof Error && error.constructor === Error && !("code" in error)) {
@@ -133,6 +138,11 @@ export function buildApi(
     }
     return manager.defaultRadioId() ?? 0;
   };
+  // Writes need a *live* link, so unlike reads there is no store-backed
+  // fallback: an omitted `radioId` is left undefined and the manager resolves
+  // it against the running links (single link → that one; none or several
+  // with no id given → RadioUnavailableError/AmbiguousLinkError, 503/400).
+  const writeRadioId = (req: Request): number | undefined => radioIdQuery.parse(req.query.radioId);
 
   // ---- status ----
   api.get(
@@ -173,35 +183,35 @@ export function buildApi(
   );
   api.post(
     "/contacts/refresh",
-    handle(async (_req, res) => {
-      res.json({ contacts: await manager.refreshContacts() });
+    handle(async (req, res) => {
+      res.json({ contacts: await manager.refreshContacts(writeRadioId(req)) });
     }),
   );
   api.delete(
     "/contacts/:key",
     handle(async (req, res) => {
-      await manager.removeContact(hexKey(req.params.key));
+      await manager.removeContact(hexKey(req.params.key), writeRadioId(req));
       res.json({ ok: true });
     }),
   );
   api.post(
     "/contacts/:key/path-reset",
     handle(async (req, res) => {
-      await manager.resetContactPath(hexKey(req.params.key));
+      await manager.resetContactPath(hexKey(req.params.key), writeRadioId(req));
       res.json({ ok: true });
     }),
   );
   api.get(
     "/contacts/:key/export",
     handle(async (req, res) => {
-      res.json({ uri: await manager.exportContactUri(hexKey(req.params.key)) });
+      res.json({ uri: await manager.exportContactUri(hexKey(req.params.key), writeRadioId(req)) });
     }),
   );
   api.post(
     "/contacts/:key/login",
     handle(async (req, res) => {
       const { password } = z.object({ password: z.string().min(1).max(15) }).parse(req.body);
-      const ok = await manager.loginToNode(hexKey(req.params.key), password);
+      const ok = await manager.loginToNode(hexKey(req.params.key), password, writeRadioId(req));
       if (ok) {
         res.json({ ok: true });
       } else {
@@ -212,28 +222,36 @@ export function buildApi(
   api.get(
     "/contacts/:key/status",
     handle(async (req, res) => {
-      res.json({ status: await manager.getNodeStatus(hexKey(req.params.key)) });
+      res.json({ status: await manager.getNodeStatus(hexKey(req.params.key), writeRadioId(req)) });
     }),
   );
   api.get(
     "/contacts/:key/telemetry",
     handle(async (req, res) => {
-      res.json({ telemetry: await manager.requestTelemetry(hexKey(req.params.key)) });
+      res.json({ telemetry: await manager.requestTelemetry(hexKey(req.params.key), writeRadioId(req)) });
     }),
   );
   api.get(
     "/contacts/:key/telemetry/history",
     handle((req, res) => {
-      const hours = z.coerce.number().int().min(1).max(24 * 30).default(24 * 7).parse(req.query.hours ?? 24 * 7);
+      const hours = z.coerce
+        .number()
+        .int()
+        .min(1)
+        .max(24 * 30)
+        .default(24 * 7)
+        .parse(req.query.hours ?? 24 * 7);
       const since = Math.floor(Date.now() / 1000) - hours * 3600;
-      res.json({ points: manager.store.getContactTelemetry(readRadioId(req), hexKey(req.params.key), since) });
+      res.json({
+        points: manager.store.getContactTelemetry(readRadioId(req), hexKey(req.params.key), since),
+      });
     }),
   );
   api.post(
     "/contacts/:key/cli",
     handle(async (req, res) => {
       const { command } = z.object({ command: z.string().min(1).max(2000) }).parse(req.body);
-      const message = await manager.sendDirectMessage(hexKey(req.params.key), command, true);
+      const message = await manager.sendDirectMessage(hexKey(req.params.key), command, true, writeRadioId(req));
       res.status(201).json({ message });
     }),
   );
@@ -241,7 +259,7 @@ export function buildApi(
     "/contacts/import",
     handle(async (req, res) => {
       const { uri } = z.object({ uri: z.string().min(8).max(2048) }).parse(req.body);
-      res.json({ contacts: await manager.importContactUri(uri) });
+      res.json({ contacts: await manager.importContactUri(uri, writeRadioId(req)) });
     }),
   );
 
@@ -249,7 +267,13 @@ export function buildApi(
   api.get(
     "/messages/recent",
     handle((req, res) => {
-      const limit = z.coerce.number().int().min(1).max(50).default(20).parse(req.query.limit ?? 20);
+      const limit = z.coerce
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .default(20)
+        .parse(req.query.limit ?? 20);
       res.json({ messages: manager.store.getRecentMessages(readRadioId(req), limit) });
     }),
   );
@@ -277,8 +301,14 @@ export function buildApi(
       const query = z
         .object({
           q: z.string().min(1).max(200),
-          contact: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
-          sender: z.string().regex(/^[0-9a-f]{2,64}$/i).optional(),
+          contact: z
+            .string()
+            .regex(/^[0-9a-f]{64}$/i)
+            .optional(),
+          sender: z
+            .string()
+            .regex(/^[0-9a-f]{2,64}$/i)
+            .optional(),
           channel: z.coerce.number().int().min(0).max(255).optional(),
           limit: z.coerce.number().int().min(1).max(100).default(25),
         })
@@ -301,8 +331,14 @@ export function buildApi(
       const query = z
         .object({
           format: z.enum(["csv", "json"]).default("csv"),
-          contact: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
-          sender: z.string().regex(/^[0-9a-f]{2,64}$/i).optional(),
+          contact: z
+            .string()
+            .regex(/^[0-9a-f]{64}$/i)
+            .optional(),
+          sender: z
+            .string()
+            .regex(/^[0-9a-f]{2,64}$/i)
+            .optional(),
           channel: z.coerce.number().int().min(0).max(255).optional(),
         })
         .refine(...atMostOneConversationFilter)
@@ -365,8 +401,14 @@ export function buildApi(
     handle((req, res) => {
       const query = z
         .object({
-          contact: z.string().regex(/^[0-9a-f]{2,64}$/i).optional(),
-          sender: z.string().regex(/^[0-9a-f]{2,64}$/i).optional(),
+          contact: z
+            .string()
+            .regex(/^[0-9a-f]{2,64}$/i)
+            .optional(),
+          sender: z
+            .string()
+            .regex(/^[0-9a-f]{2,64}$/i)
+            .optional(),
           channel: z.coerce.number().int().min(0).max(255).optional(),
           before: z.coerce.number().int().positive().optional(),
           limit: z.coerce.number().int().min(1).max(200).default(50),
@@ -389,14 +431,22 @@ export function buildApi(
     handle(async (req, res) => {
       const body = z
         .discriminatedUnion("kind", [
-          z.object({ kind: z.literal("dm"), to: z.string().regex(/^[0-9a-f]{64}$/i), text: z.string().min(1).max(2000) }),
-          z.object({ kind: z.literal("channel"), channelIdx: z.number().int().min(0).max(255), text: z.string().min(1).max(2000) }),
+          z.object({
+            kind: z.literal("dm"),
+            to: z.string().regex(/^[0-9a-f]{64}$/i),
+            text: z.string().min(1).max(2000),
+          }),
+          z.object({
+            kind: z.literal("channel"),
+            channelIdx: z.number().int().min(0).max(255),
+            text: z.string().min(1).max(2000),
+          }),
         ])
         .parse(req.body);
       const message =
         body.kind === "dm"
-          ? await manager.sendDirectMessage(body.to.toLowerCase(), body.text)
-          : await manager.sendChannelMessage(body.channelIdx, body.text);
+          ? await manager.sendDirectMessage(body.to.toLowerCase(), body.text, false, writeRadioId(req))
+          : await manager.sendChannelMessage(body.channelIdx, body.text, writeRadioId(req));
       res.status(201).json({ message });
     }),
   );
@@ -419,13 +469,22 @@ export function buildApi(
     handle((req, res) => {
       const body = z
         .object({
-          contact: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
-          sender: z.string().regex(/^[0-9a-f]{2,64}$/i).optional(),
+          contact: z
+            .string()
+            .regex(/^[0-9a-f]{64}$/i)
+            .optional(),
+          sender: z
+            .string()
+            .regex(/^[0-9a-f]{2,64}$/i)
+            .optional(),
           channel: z.number().int().min(0).max(255).optional(),
         })
-        .refine((value) => value.contact !== undefined || value.sender !== undefined || value.channel !== undefined, {
-          message: "contact, sender, or channel is required",
-        })
+        .refine(
+          (value) => value.contact !== undefined || value.sender !== undefined || value.channel !== undefined,
+          {
+            message: "contact, sender, or channel is required",
+          },
+        )
         .refine(...atMostOneConversationFilter)
         .parse(req.body);
       // `?radioId=` lets the client mark-read the conversation of the radio it is
@@ -448,8 +507,8 @@ export function buildApi(
   );
   api.post(
     "/channels/refresh",
-    handle(async (_req, res) => {
-      res.json({ channels: await manager.refreshChannels() });
+    handle(async (req, res) => {
+      res.json({ channels: await manager.refreshChannels(writeRadioId(req)) });
     }),
   );
   api.put(
@@ -459,14 +518,14 @@ export function buildApi(
       const body = z
         .object({ name: z.string().min(1).max(31), secret: z.string().regex(/^[0-9a-f]{32}$/i) })
         .parse(req.body);
-      res.json({ channel: await manager.setChannel(idx, body.name, body.secret.toLowerCase()) });
+      res.json({ channel: await manager.setChannel(idx, body.name, body.secret.toLowerCase(), writeRadioId(req)) });
     }),
   );
   api.delete(
     "/channels/:idx",
     handle(async (req, res) => {
       const idx = z.coerce.number().int().min(0).max(7).parse(req.params.idx);
-      await manager.deleteChannel(idx);
+      await manager.deleteChannel(idx, writeRadioId(req));
       res.json({ ok: true });
     }),
   );
@@ -476,7 +535,7 @@ export function buildApi(
     "/advert",
     handle(async (req, res) => {
       const { flood } = z.object({ flood: z.boolean().default(false) }).parse(req.body ?? {});
-      await manager.sendAdvert(flood);
+      await manager.sendAdvert(flood, writeRadioId(req));
       res.json({ ok: true });
     }),
   );
@@ -498,14 +557,14 @@ export function buildApi(
           message: "lat and lon must be set together",
         })
         .parse(req.body);
-      res.json({ self: await manager.setDeviceSettings(patch) });
+      res.json({ self: await manager.setDeviceSettings(patch, writeRadioId(req)) });
     }),
   );
 
   api.get(
     "/device/share",
-    handle(async (_req, res) => {
-      res.json({ uri: await manager.exportContactUri(null) });
+    handle(async (req, res) => {
+      res.json({ uri: await manager.exportContactUri(null, writeRadioId(req)) });
     }),
   );
 
@@ -513,7 +572,13 @@ export function buildApi(
   api.get(
     "/telemetry",
     handle((req, res) => {
-      const hours = z.coerce.number().int().min(1).max(24 * 30).default(24).parse(req.query.hours ?? 24);
+      const hours = z.coerce
+        .number()
+        .int()
+        .min(1)
+        .max(24 * 30)
+        .default(24)
+        .parse(req.query.hours ?? 24);
       const since = Math.floor(Date.now() / 1000) - hours * 3600;
       res.json({ points: manager.store.getTelemetry(readRadioId(req), since) });
     }),
@@ -529,7 +594,12 @@ export function buildApi(
   api.get(
     "/system/ble-scan",
     handle(async (req, res) => {
-      const seconds = z.coerce.number().min(2).max(15).default(6).parse(req.query.seconds ?? 6);
+      const seconds = z.coerce
+        .number()
+        .min(2)
+        .max(15)
+        .default(6)
+        .parse(req.query.seconds ?? 6);
       try {
         res.json({ devices: await scanBleRadios(seconds * 1000) });
       } catch (error) {
@@ -569,7 +639,10 @@ export function buildApi(
           serialPort: z.string().min(1).max(256).nullish(),
           tcpHost: z.string().min(1).max(256).nullish(),
           tcpPort: z.number().int().min(1).max(65535).optional(),
-          bleAddress: z.string().regex(/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i).nullish(),
+          bleAddress: z
+            .string()
+            .regex(/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i)
+            .nullish(),
         })
         .nullable()
         .parse(req.body?.override ?? null);
@@ -585,7 +658,10 @@ export function buildApi(
     serialBaud: z.number().int().min(1).max(10_000_000).optional(),
     tcpHost: z.string().min(1).max(256).nullish(),
     tcpPort: z.number().int().min(1).max(65535).optional(),
-    bleAddress: z.string().regex(/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i).nullish(),
+    bleAddress: z
+      .string()
+      .regex(/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i)
+      .nullish(),
   };
   const profileName = z.string().trim().min(1).max(64);
   api.get(
@@ -623,6 +699,9 @@ export function buildApi(
       res.json({ ok: true });
     }),
   );
+  // Additive: activating a profile leaves any other active profiles (or the
+  // default link) running, so several radios can be connected at once. BLE
+  // is the exception — a second concurrent BLE profile 409s immediately.
   api.post(
     "/radio/profiles/:id/activate",
     handle(async (req, res) => {
@@ -631,11 +710,20 @@ export function buildApi(
       res.json({ ...manager.connectionSettings(), state: manager.getState() });
     }),
   );
-  // fall back to env + override settings without touching any saved profile
+  // Deactivate just this profile's link — other active links are untouched.
+  api.post(
+    "/radio/profiles/:id/deactivate",
+    handle(async (req, res) => {
+      const id = z.coerce.number().int().positive().parse(req.params.id);
+      await manager.deactivateProfile(id);
+      res.json({ ...manager.connectionSettings(), state: manager.getState() });
+    }),
+  );
+  // Deactivate every active profile and fall back to env + override settings.
   api.post(
     "/radio/profiles/deactivate",
     handle(async (_req, res) => {
-      await manager.activateProfile(null);
+      await manager.deactivateProfile(null);
       res.json({ ...manager.connectionSettings(), state: manager.getState() });
     }),
   );
@@ -702,6 +790,17 @@ export function buildApi(
   );
 
   // ---- map ----
+  // Tile URLs are public client configuration: the browser must receive the
+  // template to request tiles, while the global node index stays server-cached.
+  api.get(
+    "/map/config",
+    handle((_req, res) => {
+      res.json({
+        tiles: { url: deps.config.mapTilesUrl, attribution: deps.config.mapTilesAttribution },
+        nodeIndex: { enabled: mapCache.enabled },
+      });
+    }),
+  );
   api.get(
     "/map/nodes",
     handle(async (_req, res) => {
@@ -736,7 +835,11 @@ export function buildApi(
           expiresInDays: z.number().int().min(1).max(3650).nullish(),
         })
         .parse(req.body);
-      const created = auth.createToken(body.label, body.scope, body.expiresInDays ? body.expiresInDays * 86_400 : null);
+      const created = auth.createToken(
+        body.label,
+        body.scope,
+        body.expiresInDays ? body.expiresInDays * 86_400 : null,
+      );
       // the raw token is only ever returned once
       res.status(201).json({ token: created.token, ...created.row });
     }),
@@ -771,6 +874,9 @@ export function buildApi(
 }
 
 function hexKey(value: string): string {
-  const parsed = z.string().regex(/^[0-9a-f]{64}$/i).parse(value);
+  const parsed = z
+    .string()
+    .regex(/^[0-9a-f]{64}$/i)
+    .parse(value);
   return parsed.toLowerCase();
 }

@@ -5,6 +5,7 @@ import type {
   ConnectionState,
   Contact,
   ConversationUnread,
+  LinkStatus,
   Message,
   MessageSearchResult,
   NodeStats,
@@ -85,8 +86,8 @@ function dmQuery(id: Extract<ConversationId, { kind: "dm" }>): string {
   return id.contactKey ? `contact=${encodeURIComponent(id.contactKey)}` : `sender=${encodeURIComponent(id.contactPrefix ?? "")}`;
 }
 
-/** `?radioId=…`/`&radioId=…` for a per-radio read, or "" when no radio is in view. */
-function radioSuffix(id: number | null, joiner: "?" | "&" = "?"): string {
+/** `?radioId=…`/`&radioId=…` for a per-radio read or write, or "" when no radio is in view. */
+export function radioSuffix(id: number | null, joiner: "?" | "&" = "?"): string {
   return id == null ? "" : `${joiner}radioId=${id}`;
 }
 
@@ -178,6 +179,20 @@ export const useAppStore = defineStore("app", {
     viewingRadio(): RadioSummary | null {
       const id = this.effectiveRadioId;
       return id == null ? null : this.radios.find((radio) => radio.id === id) ?? null;
+    },
+    /**
+     * Every connection the server currently maintains (issue #53, Stage 3) —
+     * usually one, possibly several when more than one radio profile is active.
+     */
+    links: (state): LinkStatus[] => state.status?.links ?? [],
+    /** How many links are actually connected right now, for a header summary. */
+    connectedLinkCount(): number {
+      return this.links.filter((link: LinkStatus) => link.connection.state === "connected").length;
+    },
+    /** The link (if any) backing a given saved profile. */
+    linkForProfile() {
+      return (profileId: number): LinkStatus | null =>
+        this.links.find((link: LinkStatus) => link.profileId === profileId) ?? null;
     },
   },
 
@@ -435,7 +450,7 @@ export const useAppStore = defineStore("app", {
         return;
       }
       if (cli && id.kind === "dm") {
-        const { message } = await api<{ message: Message }>(`/contacts/${id.contactKey}/cli`, {
+        const { message } = await api<{ message: Message }>(`/contacts/${id.contactKey}/cli${radioSuffix(this.effectiveRadioId)}`, {
           method: "POST",
           body: JSON.stringify({ command: text }),
         });
@@ -446,7 +461,7 @@ export const useAppStore = defineStore("app", {
         id.kind === "dm"
           ? { kind: "dm" as const, to: id.contactKey, text }
           : { kind: "channel" as const, channelIdx: id.channelIdx, text };
-      const { message } = await api<{ message: Message }>("/messages", {
+      const { message } = await api<{ message: Message }>(`/messages${radioSuffix(this.effectiveRadioId)}`, {
         method: "POST",
         body: JSON.stringify(body),
       });
@@ -468,7 +483,7 @@ export const useAppStore = defineStore("app", {
     /** Authenticate with a room server or repeater over the server radio. */
     async loginToNode(contactKey: string, password: string) {
       this.requireServerRadio(this.capabilities.nodeTools);
-      await api(`/contacts/${contactKey}/login`, {
+      await api(`/contacts/${contactKey}/login${radioSuffix(this.effectiveRadioId)}`, {
         method: "POST",
         body: JSON.stringify({ password }),
       });
@@ -477,7 +492,7 @@ export const useAppStore = defineStore("app", {
 
     async fetchNodeStatus(contactKey: string): Promise<NodeStats> {
       this.requireServerRadio(this.capabilities.nodeTools);
-      const { status } = await api<{ status: NodeStats }>(`/contacts/${contactKey}/status`);
+      const { status } = await api<{ status: NodeStats }>(`/contacts/${contactKey}/status${radioSuffix(this.effectiveRadioId)}`);
       return status;
     },
 
@@ -488,19 +503,19 @@ export const useAppStore = defineStore("app", {
 
     async fetchTelemetry(contactKey: string): Promise<SensorReading[]> {
       this.requireServerRadio(this.capabilities.nodeTools);
-      const { telemetry } = await api<{ telemetry: SensorReading[] }>(`/contacts/${contactKey}/telemetry`);
+      const { telemetry } = await api<{ telemetry: SensorReading[] }>(`/contacts/${contactKey}/telemetry${radioSuffix(this.effectiveRadioId)}`);
       return telemetry;
     },
 
     async saveChannel(idx: number, name: string, secret: string) {
       this.requireServerRadio(this.capabilities.manageChannels);
-      await api(`/channels/${idx}`, { method: "PUT", body: JSON.stringify({ name, secret }) });
+      await api(`/channels/${idx}${radioSuffix(this.effectiveRadioId)}`, { method: "PUT", body: JSON.stringify({ name, secret }) });
       await this.refreshChannels();
     },
 
     async deleteChannel(idx: number) {
       this.requireServerRadio(this.capabilities.manageChannels);
-      await api(`/channels/${idx}`, { method: "DELETE" });
+      await api(`/channels/${idx}${radioSuffix(this.effectiveRadioId)}`, { method: "DELETE" });
       if (this.activeConversation?.kind === "channel" && this.activeConversation.channelIdx === idx) {
         this.activeConversation = null;
       }
@@ -512,7 +527,7 @@ export const useAppStore = defineStore("app", {
         await browserSource.sendAdvert(flood);
         return;
       }
-      await api("/advert", { method: "POST", body: JSON.stringify({ flood }) });
+      await api(`/advert${radioSuffix(this.effectiveRadioId)}`, { method: "POST", body: JSON.stringify({ flood }) });
     },
 
     /**

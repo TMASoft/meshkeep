@@ -43,6 +43,50 @@ describe("radio profile store", () => {
   });
 });
 
+describe("radio link store (issue #53, Stage 3)", () => {
+  // A freshly-migrated database always seeds the implicit default link
+  // (profile_id NULL) — that is what keeps a no-profile deployment behaving
+  // identically before and after Stage 3 (see migration 12). Tests that want
+  // a clean slate for profile-only link CRUD disable it explicitly, exactly
+  // as ConnectionManager.selectExclusive does when a profile becomes active.
+  it("activates and deactivates a profile link idempotently", () => {
+    const store = new Store(openDb(":memory:"));
+    const profile = store.createRadioProfile({ name: "Bench", connection: "none" });
+    store.setDefaultLinkEnabled(false);
+
+    expect(store.listLinks()).toEqual([]);
+    store.activateLink(profile.id);
+    store.activateLink(profile.id); // idempotent — no duplicate row, no error
+    expect(store.listLinks()).toMatchObject([{ profileId: profile.id, standby: false, lastRadioId: null }]);
+
+    store.deactivateLink(profile.id);
+    store.deactivateLink(profile.id); // idempotent — deactivating twice is a no-op
+    expect(store.listLinks()).toEqual([]);
+  });
+
+  it("enables/disables the default link without disturbing an unrelated profile link", () => {
+    const store = new Store(openDb(":memory:"));
+    const profile = store.createRadioProfile({ name: "Bench", connection: "none" });
+    store.activateLink(profile.id);
+    // the default link is already enabled on a fresh database; this is a no-op
+    store.setDefaultLinkEnabled(true);
+    expect(new Set(store.listLinks().map((l) => l.profileId))).toEqual(new Set([null, profile.id]));
+
+    store.setDefaultLinkEnabled(false);
+    expect(store.listLinks().map((l) => l.profileId)).toEqual([profile.id]);
+  });
+
+  it("re-enabling an already-enabled default link preserves its standby/last radio", () => {
+    const store = new Store(openDb(":memory:"));
+    store.setDefaultLinkEnabled(true);
+    store.setLinkStandby(null, true);
+    store.setLinkLastRadio(null, 42);
+
+    store.setDefaultLinkEnabled(true); // redundant enable must not reset state
+    expect(store.listLinks()).toMatchObject([{ profileId: null, standby: true, lastRadioId: 42 }]);
+  });
+});
+
 describe("http: radio profiles", () => {
   it("runs the create → activate → guard → deactivate → delete lifecycle", async () => {
     const { app } = buildHarness();
@@ -120,7 +164,7 @@ describe("http: radio profiles", () => {
     await request(app).put("/api/v1/radio/profiles/abc").send({ name: "X" }).expect(400);
   });
 
-  it("clears the profile selection when an explicit override is saved", async () => {
+  it("saving an explicit override only affects the default link — an active profile stays active (issue #53, Stage 3b)", async () => {
     const { app } = buildHarness();
     const created = await request(app)
       .post("/api/v1/radio/profiles")
@@ -128,11 +172,48 @@ describe("http: radio profiles", () => {
       .expect(201);
     await request(app).post(`/api/v1/radio/profiles/${created.body.id}/activate`).expect(200);
 
+    // activation is additive (Stage 3b): saving a default-link override no
+    // longer tears down an already-active profile the way the pre-3b
+    // exclusive-selection model did.
     const overridden = await request(app)
       .put("/api/v1/connection/config")
       .send({ override: { connection: "none" } })
       .expect(200);
-    expect(overridden.body.activeProfile).toBeNull();
-    expect((await request(app).get("/api/v1/radio/profiles").expect(200)).body.activeProfileId).toBeNull();
+    expect(overridden.body.activeProfile?.id).toBe(created.body.id);
+    expect((await request(app).get("/api/v1/radio/profiles").expect(200)).body.activeProfileId).toBe(
+      created.body.id,
+    );
+
+    // deactivating the profile by id leaves the default link's override untouched
+    await request(app).post(`/api/v1/radio/profiles/${created.body.id}/deactivate`).expect(200);
+    const after = await request(app).get("/api/v1/radio/profiles").expect(200);
+    expect(after.body.activeProfileId).toBeNull();
+  });
+
+  it("activates two profiles concurrently and lists both as links (issue #53, Stage 3b)", async () => {
+    const { app } = buildHarness();
+    const a = await request(app).post("/api/v1/radio/profiles").send({ name: "A", connection: "none" }).expect(201);
+    const b = await request(app).post("/api/v1/radio/profiles").send({ name: "B", connection: "none" }).expect(201);
+
+    await request(app).post(`/api/v1/radio/profiles/${a.body.id}/activate`).expect(200);
+    // activating a second profile does not disturb the first (additive, unlike pre-Stage-3b)
+    await request(app).post(`/api/v1/radio/profiles/${b.body.id}/activate`).expect(200);
+
+    const status = await request(app).get("/api/v1/status").expect(200);
+    const profileIds: number[] = status.body.links
+      .map((l: { profileId: number | null }) => l.profileId)
+      .filter((id: number | null): id is number => id !== null);
+    const numeric = (x: number, y: number) => x - y;
+    expect(profileIds.sort(numeric)).toEqual([a.body.id, b.body.id].sort(numeric));
+
+    // an ambiguous write (no radioId, >1 live link) is rejected rather than guessing
+    await request(app).post("/api/v1/contacts/refresh").expect(400);
+
+    // deactivating one leaves the other running
+    await request(app).post(`/api/v1/radio/profiles/${a.body.id}/deactivate`).expect(200);
+    const afterOne = await request(app).get("/api/v1/status").expect(200);
+    expect(afterOne.body.links.map((l: { profileId: number | null }) => l.profileId)).toContain(b.body.id);
+    // no longer ambiguous with just one live link (still 503: "none" never actually connects)
+    await request(app).post("/api/v1/contacts/refresh").expect(503);
   });
 });

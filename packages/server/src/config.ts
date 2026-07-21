@@ -15,6 +15,8 @@ export interface ServerConfig {
   mapRefreshMinutes: number;
   mapUpstream: string;
   mapEnabled: boolean;
+  mapTilesUrl: string | null;
+  mapTilesAttribution: string | null;
 }
 
 function env(name: string): string | null {
@@ -31,6 +33,26 @@ function envInt(name: string, fallback: number, min: number, max: number): numbe
     throw new Error(`${name} must be between ${min} and ${max}, got ${parsed}`);
   }
   return parsed;
+}
+
+function tileUrl(): string | null {
+  if (env("MESHKEEP_MAP_TILES_ENABLED") === "false") return null;
+  const value = env("MESHKEEP_MAP_TILES_URL") ?? "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+  if (!value.includes("{z}") || !value.includes("{x}") || !value.includes("{y}")) {
+    throw new Error("MESHKEEP_MAP_TILES_URL must include {z}, {x}, and {y}");
+  }
+  // A root-relative template is served by this MeshKeep origin, which makes a
+  // reverse-proxied or bundled local tile server possible without browser CORS.
+  if (value.startsWith("/") && !value.startsWith("//")) return value;
+  try {
+    const url = new URL(value);
+    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) {
+      throw new Error();
+    }
+  } catch {
+    throw new Error("MESHKEEP_MAP_TILES_URL must be an http(s) URL or root-relative tile template");
+  }
+  return value;
 }
 
 const TRANSPORTS: ConnectionTransport[] = ["serial", "tcp", "ble", "none"];
@@ -55,5 +77,10 @@ export function loadConfig(): ServerConfig {
     mapRefreshMinutes: envInt("MESHKEEP_MAP_REFRESH_MINUTES", 10, 1, 1440),
     mapUpstream: env("MESHKEEP_MAP_UPSTREAM") ?? "https://map.meshcore.io/api/v1/nodes",
     mapEnabled: env("MESHKEEP_MAP_ENABLED") !== "false",
+    mapTilesUrl: tileUrl(),
+    mapTilesAttribution:
+      env("MESHKEEP_MAP_TILES_ENABLED") === "false"
+        ? null
+        : (env("MESHKEEP_MAP_TILES_ATTRIBUTION") ?? "© OpenStreetMap contributors"),
   };
 }

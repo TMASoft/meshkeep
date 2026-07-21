@@ -301,6 +301,48 @@ export const MIGRATIONS: string[] = [
   DROP INDEX idx_outbound_queue_due;
   CREATE INDEX idx_outbound_queue_due ON outbound_queue (radio_id, state, next_attempt_at);
   `,
+  // 12: concurrent radio links (issue #53, Stage 3). Which connections the
+  // server should currently maintain is now row existence in radio_links
+  // (profile_id NULL = the implicit env/override "default" link) instead of
+  // the single connection.activeProfileId/activeRadioId/connection.standby
+  // settings keys — folded into this table and dropped below. SQLite treats
+  // every NULL as distinct for UNIQUE, so this does not by itself stop two
+  // profile_id IS NULL rows; Store.setDefaultLinkEnabled is the only code
+  // path allowed to write that row and enforces it there.
+  `
+  CREATE TABLE radio_links (
+    profile_id    INTEGER UNIQUE REFERENCES radio_profiles(id) ON DELETE CASCADE,
+    standby       INTEGER NOT NULL DEFAULT 0,
+    last_radio_id INTEGER,
+    activated_at  INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+  );
+
+  -- no profile was exclusively active: seed the implicit default link so an
+  -- upgrading single-radio deployment keeps its one connection unchanged.
+  INSERT INTO radio_links (profile_id, standby, last_radio_id, activated_at, updated_at)
+  SELECT NULL,
+    COALESCE((SELECT CASE WHEN value_json = 'true' THEN 1 ELSE 0 END FROM settings WHERE key = 'connection.standby'), 0),
+    (SELECT CASE WHEN value_json IS NULL OR value_json = 'null' THEN NULL ELSE CAST(value_json AS INTEGER) END
+       FROM settings WHERE key = 'connection.activeRadioId'),
+    strftime('%s','now'), strftime('%s','now')
+  WHERE NOT EXISTS (
+    SELECT 1 FROM settings WHERE key = 'connection.activeProfileId' AND value_json IS NOT NULL AND value_json != 'null'
+  );
+
+  -- a profile was exclusively active: carry it forward as that profile's link.
+  INSERT INTO radio_links (profile_id, standby, last_radio_id, activated_at, updated_at)
+  SELECT CAST(s.value_json AS INTEGER),
+    COALESCE((SELECT CASE WHEN value_json = 'true' THEN 1 ELSE 0 END FROM settings WHERE key = 'connection.standby'), 0),
+    (SELECT CASE WHEN value_json IS NULL OR value_json = 'null' THEN NULL ELSE CAST(value_json AS INTEGER) END
+       FROM settings WHERE key = 'connection.activeRadioId'),
+    strftime('%s','now'), strftime('%s','now')
+  FROM settings s
+  WHERE s.key = 'connection.activeProfileId' AND s.value_json IS NOT NULL AND s.value_json != 'null'
+    AND EXISTS (SELECT 1 FROM radio_profiles WHERE id = CAST(s.value_json AS INTEGER));
+
+  DELETE FROM settings WHERE key IN ('connection.activeProfileId', 'connection.activeRadioId', 'connection.standby');
+  `,
 ];
 
 export type Db = Database.Database;

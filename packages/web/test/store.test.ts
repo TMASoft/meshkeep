@@ -508,6 +508,28 @@ describe("message handling", () => {
     expect(apiMock).toHaveBeenCalledWith(`/contacts/${KEY_A}/cli`, expect.objectContaining({ method: "POST" }));
   });
 
+  it("threads the radio in view through sendMessage once several radios can be connected (issue #53, Stage 3c)", async () => {
+    const store = useAppStore();
+    store.viewingRadioId = 5;
+    apiMock.mockResolvedValueOnce({ message: message({ id: 20, direction: "out", text: "hi", status: "pending" }) });
+    await store.sendMessage({ kind: "channel", channelIdx: 0 }, "hi");
+    expect(apiMock).toHaveBeenCalledWith(
+      "/messages?radioId=5",
+      expect.objectContaining({ body: JSON.stringify({ kind: "channel", channelIdx: 0, text: "hi" }) }),
+    );
+  });
+
+  it("threads the radio in view through the repeater CLI endpoint too", async () => {
+    const store = useAppStore();
+    store.viewingRadioId = 5;
+    store.contacts = [
+      { publicKey: KEY_A, name: "Rpt", type: "repeater", flags: 0, outPathLen: -1, lat: null, lon: null, lastAdvert: 0, lastSeen: null },
+    ];
+    apiMock.mockResolvedValueOnce({ message: message({ id: 21, direction: "out", text: "status" }) });
+    await store.sendMessage({ kind: "dm", contactKey: KEY_A }, "status");
+    expect(apiMock).toHaveBeenCalledWith(`/contacts/${KEY_A}/cli?radioId=5`, expect.objectContaining({ method: "POST" }));
+  });
+
   it("moves a retrying send forward and lets a failed send be retried", () => {
     const store = useAppStore();
     const key = conversationKey({ kind: "dm", contactKey: KEY_A });
@@ -549,6 +571,32 @@ describe("message handling", () => {
     await store.cancelMessage(12);
     expect(apiMock).toHaveBeenCalledWith("/messages/12/cancel", expect.objectContaining({ method: "POST" }));
     expect(store.conversations[key][0].status).toBe("failed");
+  });
+});
+
+describe("concurrent radio links (issue #53, Stage 3c)", () => {
+  it("exposes every active link, a connected count, and a per-profile lookup", () => {
+    const store = useAppStore();
+    store.status = {
+      connection: { state: "connected", transport: "tcp", target: null, lastError: null, connectedAt: 1 },
+      self: null,
+      batteryMilliVolts: null,
+      counts: { contacts: 0, messages: 0, unread: 0 },
+      activeRadioId: 1,
+      radios: [],
+      links: [
+        { profileId: null, label: "Default", radioId: 1, standby: false, connection: { state: "connected", transport: "tcp", target: null, lastError: null, connectedAt: 1 } },
+        { profileId: 7, label: "Bench", radioId: 2, standby: false, connection: { state: "connecting", transport: "tcp", target: null, lastError: null, connectedAt: null } },
+        { profileId: 8, label: "Attic", radioId: null, standby: false, connection: { state: "error", transport: "ble", target: null, lastError: "offline", connectedAt: null } },
+      ],
+      version: "test",
+    };
+
+    expect(store.links).toHaveLength(3);
+    expect(store.connectedLinkCount).toBe(1);
+    expect(store.linkForProfile(7)?.label).toBe("Bench");
+    expect(store.linkForProfile(8)?.connection.state).toBe("error");
+    expect(store.linkForProfile(999)).toBeNull();
   });
 });
 

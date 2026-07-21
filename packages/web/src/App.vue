@@ -23,6 +23,15 @@ const route = useRoute();
 function radioLabel(radio: RadioSummary): string {
   return radio.name?.trim() || (radio.publicKey ? radio.publicKey.slice(0, 8) : `Radio ${radio.id}`);
 }
+/**
+ * Whether this stored radio has a live link right now — several can be true
+ * at once (issue #53, Stage 3). `radio.isActive` only ever marks one (the
+ * server's single-value compat pick), so the switcher checks `store.links`
+ * directly to mark every radio that's actually connected.
+ */
+function radioIsLive(radio: RadioSummary): boolean {
+  return store.links.some((link) => link.radioId === radio.id && link.connection.state === "connected");
+}
 function onRadioSwitch(event: Event) {
   const id = Number((event.target as HTMLSelectElement).value);
   if (Number.isFinite(id)) void store.switchRadio(id);
@@ -228,7 +237,7 @@ const stateColor = computed(() => {
             @change="onRadioSwitch"
           >
             <option v-for="radio in store.radios" :key="radio.id" :value="radio.id">
-              {{ radioLabel(radio) }}{{ radio.isActive ? " • live" : "" }}
+              {{ radioLabel(radio) }}{{ radioIsLive(radio) ? " • live" : "" }}
             </option>
           </select>
           <strong v-else>{{ store.self?.name ?? "Awaiting radio" }}</strong>

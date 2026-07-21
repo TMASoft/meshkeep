@@ -72,17 +72,32 @@ describe("http: zod validation (400s)", () => {
     ["recent limit 51", () => request(app).get("/api/v1/messages/recent?limit=51")],
     ["messages bad contact", () => request(app).get("/api/v1/messages?contact=xyz")],
     ["send bad kind", () => request(app).post("/api/v1/messages").send({ kind: "smoke", text: "hi" })],
-    ["send short hex", () => request(app).post("/api/v1/messages").send({ kind: "dm", to: "abcd", text: "hi" })],
+    [
+      "send short hex",
+      () => request(app).post("/api/v1/messages").send({ kind: "dm", to: "abcd", text: "hi" }),
+    ],
     [
       "send oversized text",
-      () => request(app).post("/api/v1/messages").send({ kind: "dm", to: KEY_A, text: "x".repeat(2001) }),
+      () =>
+        request(app)
+          .post("/api/v1/messages")
+          .send({ kind: "dm", to: KEY_A, text: "x".repeat(2001) }),
     ],
     ["read without target", () => request(app).post("/api/v1/messages/read").send({})],
-    ["read with two targets", () => request(app).post("/api/v1/messages/read").send({ contact: KEY_A, channel: 1 })],
+    [
+      "read with two targets",
+      () => request(app).post("/api/v1/messages/read").send({ contact: KEY_A, channel: 1 }),
+    ],
     ["messages contact and channel", () => request(app).get(`/api/v1/messages?contact=${KEY_A}&channel=1`)],
     ["messages contact and sender", () => request(app).get(`/api/v1/messages?contact=${KEY_A}&sender=abcd`)],
-    ["search contact and channel", () => request(app).get(`/api/v1/messages/search?q=x&contact=${KEY_A}&channel=1`)],
-    ["export contact and channel", () => request(app).get(`/api/v1/messages/export?contact=${KEY_A}&channel=1`)],
+    [
+      "search contact and channel",
+      () => request(app).get(`/api/v1/messages/search?q=x&contact=${KEY_A}&channel=1`),
+    ],
+    [
+      "export contact and channel",
+      () => request(app).get(`/api/v1/messages/export?contact=${KEY_A}&channel=1`),
+    ],
     [
       "ingest dm carrying channelIdx",
       () =>
@@ -90,7 +105,15 @@ describe("http: zod validation (400s)", () => {
           .post("/api/v1/ingest/messages")
           .send({
             messages: [
-              { kind: "dm", contactKey: KEY_A, channelIdx: 1, direction: "in", text: "x", senderTimestamp: 1, ingestionId: "00000000-0000-4000-8000-00000000aa01" },
+              {
+                kind: "dm",
+                contactKey: KEY_A,
+                channelIdx: 1,
+                direction: "in",
+                text: "x",
+                senderTimestamp: 1,
+                ingestionId: "00000000-0000-4000-8000-00000000aa01",
+              },
             ],
           }),
     ],
@@ -101,7 +124,15 @@ describe("http: zod validation (400s)", () => {
           .post("/api/v1/ingest/messages")
           .send({
             messages: [
-              { kind: "channel", channelIdx: 1, contactKey: KEY_A, direction: "in", text: "x", senderTimestamp: 1, ingestionId: "00000000-0000-4000-8000-00000000aa02" },
+              {
+                kind: "channel",
+                channelIdx: 1,
+                contactKey: KEY_A,
+                direction: "in",
+                text: "x",
+                senderTimestamp: 1,
+                ingestionId: "00000000-0000-4000-8000-00000000aa02",
+              },
             ],
           }),
     ],
@@ -112,7 +143,13 @@ describe("http: zod validation (400s)", () => {
           .post("/api/v1/ingest/messages")
           .send({
             messages: [
-              { kind: "dm", direction: "in", text: "x", senderTimestamp: 1, ingestionId: "00000000-0000-4000-8000-00000000aa03" },
+              {
+                kind: "dm",
+                direction: "in",
+                text: "x",
+                senderTimestamp: 1,
+                ingestionId: "00000000-0000-4000-8000-00000000aa03",
+              },
             ],
           }),
     ],
@@ -123,11 +160,23 @@ describe("http: zod validation (400s)", () => {
           .post("/api/v1/ingest/messages")
           .send({
             messages: [
-              { kind: "channel", direction: "in", text: "x", senderTimestamp: 1, ingestionId: "00000000-0000-4000-8000-00000000aa04" },
+              {
+                kind: "channel",
+                direction: "in",
+                text: "x",
+                senderTimestamp: 1,
+                ingestionId: "00000000-0000-4000-8000-00000000aa04",
+              },
             ],
           }),
     ],
-    ["channel idx out of range", () => request(app).put("/api/v1/channels/8").send({ name: "x", secret: "0".repeat(32) })],
+    [
+      "channel idx out of range",
+      () =>
+        request(app)
+          .put("/api/v1/channels/8")
+          .send({ name: "x", secret: "0".repeat(32) }),
+    ],
     ["channel bad secret", () => request(app).put("/api/v1/channels/0").send({ name: "x", secret: "zz" })],
     ["device lat without lon", () => request(app).patch("/api/v1/device").send({ lat: 44.2 })],
     ["device sf 13", () => request(app).patch("/api/v1/device").send({ radioSf: 13 })],
@@ -186,7 +235,11 @@ describe("http: radio-touching routes while disconnected", () => {
 
     const queue = await request(app).get("/api/v1/messages/outbound").expect(200);
     expect(queue.body.queue).toHaveLength(1);
-    expect(queue.body.queue[0]).toMatchObject({ messageId: res.body.message.id, kind: "dm", state: "pending" });
+    expect(queue.body.queue[0]).toMatchObject({
+      messageId: res.body.message.id,
+      kind: "dm",
+      state: "pending",
+    });
   });
 
   it("contacts refresh", async () => {
@@ -279,7 +332,9 @@ describe("http: store-backed reads", () => {
   });
 
   it("filters a conversation by contact (case-insensitive) with pagination", async () => {
-    const first = await request(app).get(`/api/v1/messages?contact=${KEY_A.toUpperCase()}&limit=10`).expect(200);
+    const first = await request(app)
+      .get(`/api/v1/messages?contact=${KEY_A.toUpperCase()}&limit=10`)
+      .expect(200);
     expect(first.body.messages).toHaveLength(10);
     for (const message of first.body.messages) expect(message.contactKey).toBe(KEY_A);
 
@@ -449,7 +504,9 @@ describe("http: orphaned and self-key DM unread (#61)", () => {
   };
 
   it("excludes the self-key DM from the unread total entirely", async () => {
-    expect(await summary()).toEqual([{ kind: "dm", contactKey: removedKey, contactPrefix: null, channelIdx: null, unread: 1 }]);
+    expect(await summary()).toEqual([
+      { kind: "dm", contactKey: removedKey, contactPrefix: null, channelIdx: null, unread: 1 },
+    ]);
   });
 
   it("never lists the self-key DM as an openable sender", async () => {
@@ -478,9 +535,15 @@ describe("http: ingest", () => {
       status: "sent",
       ingestionId: "00000000-0000-4000-8000-000000000004",
     };
-    const first = await request(app).post("/api/v1/ingest/messages").send({ radioKey: RADIO_KEY, messages: [message] }).expect(200);
+    const first = await request(app)
+      .post("/api/v1/ingest/messages")
+      .send({ radioKey: RADIO_KEY, messages: [message] })
+      .expect(200);
     expect(first.body.inserted).toBe(1);
-    const again = await request(app).post("/api/v1/ingest/messages").send({ radioKey: RADIO_KEY, messages: [message] }).expect(200);
+    const again = await request(app)
+      .post("/api/v1/ingest/messages")
+      .send({ radioKey: RADIO_KEY, messages: [message] })
+      .expect(200);
     expect(again.body.inserted).toBe(0);
   });
 
@@ -516,7 +579,7 @@ describe("http: ingest", () => {
       senderTimestamp: i + 1,
       status: "sent",
     }));
-      await request(app).post("/api/v1/ingest/messages").send({ radioKey: RADIO_KEY, messages }).expect(400);
+    await request(app).post("/api/v1/ingest/messages").send({ radioKey: RADIO_KEY, messages }).expect(400);
   });
 
   it("keeps ambiguous sender prefixes unresolved", async () => {
@@ -538,19 +601,19 @@ describe("http: ingest", () => {
     }
     const inserted = await request(app)
       .post("/api/v1/ingest/messages")
-       .send({
-         radioKey: RADIO_KEY,
-         messages: [
-           {
-             kind: "dm",
-             contactPrefix: prefix,
-             direction: "in",
-             text: "ambiguous",
-             senderTimestamp: 1,
-             ingestionId: "00000000-0000-4000-8000-000000000005",
-           },
-         ],
-       })
+      .send({
+        radioKey: RADIO_KEY,
+        messages: [
+          {
+            kind: "dm",
+            contactPrefix: prefix,
+            direction: "in",
+            text: "ambiguous",
+            senderTimestamp: 1,
+            ingestionId: "00000000-0000-4000-8000-000000000005",
+          },
+        ],
+      })
       .expect(200);
     expect(inserted.body.messages[0]).toMatchObject({ contactKey: null, contactPrefix: prefix });
     const unknown = await request(app).get("/api/v1/messages/unknown-senders").expect(200);
@@ -563,19 +626,19 @@ describe("http: ingest", () => {
     const fullKey = `${prefix}${"a".repeat(52)}`;
     await request(app)
       .post("/api/v1/ingest/messages")
-       .send({
-         radioKey: RADIO_KEY,
-         messages: [
-           {
-             kind: "dm",
-             contactPrefix: prefix,
-             direction: "in",
-             text: "identify me",
-             senderTimestamp: 1,
-             ingestionId: "00000000-0000-4000-8000-000000000006",
-           },
-         ],
-       })
+      .send({
+        radioKey: RADIO_KEY,
+        messages: [
+          {
+            kind: "dm",
+            contactPrefix: prefix,
+            direction: "in",
+            text: "identify me",
+            senderTimestamp: 1,
+            ingestionId: "00000000-0000-4000-8000-000000000006",
+          },
+        ],
+      })
       .expect(200);
     manager.store.upsertContact(manager.store.resolveRadio(RADIO_KEY, null), {
       publicKey: fullKey,
@@ -597,6 +660,20 @@ describe("http: ingest", () => {
 });
 
 describe("http: map and connection config", () => {
+  it("exposes the public tile configuration without exposing the node-index upstream", async () => {
+    const { app } = buildHarness({
+      mapUpstream: "https://private-map.example.test/nodes",
+      mapTilesUrl: "/tiles/{z}/{x}/{y}.png",
+      mapTilesAttribution: "Local tiles",
+    });
+    const res = await request(app).get("/api/v1/map/config").expect(200);
+    expect(res.body).toEqual({
+      tiles: { url: "/tiles/{z}/{x}/{y}.png", attribution: "Local tiles" },
+      nodeIndex: { enabled: true },
+    });
+    expect(JSON.stringify(res.body)).not.toContain("private-map.example.test");
+  });
+
   it("404s when the global map is disabled", async () => {
     const { app } = buildHarness({ mapEnabled: false });
     const res = await request(app).get("/api/v1/map/nodes").expect(404);

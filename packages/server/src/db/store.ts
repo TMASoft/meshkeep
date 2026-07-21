@@ -113,6 +113,35 @@ interface RadioRow {
   updated_at: number;
 }
 
+/** A row's existence means the server should currently maintain that connection (issue #53, Stage 3). */
+export interface RadioLinkRecord {
+  /** null selects the implicit env/override "default" link (no profile). */
+  profileId: number | null;
+  standby: boolean;
+  /** The last radio identity this link resolved to, for display before it reconnects. */
+  lastRadioId: number | null;
+  activatedAt: number;
+  updatedAt: number;
+}
+
+interface RadioLinkRow {
+  profile_id: number | null;
+  standby: number;
+  last_radio_id: number | null;
+  activated_at: number;
+  updated_at: number;
+}
+
+function rowToRadioLinkRecord(row: RadioLinkRow): RadioLinkRecord {
+  return {
+    profileId: row.profile_id,
+    standby: row.standby === 1,
+    lastRadioId: row.last_radio_id,
+    activatedAt: row.activated_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 interface MessageRow {
   id: number;
   ingestion_id: string | null;
@@ -503,6 +532,65 @@ export class Store {
 
   deleteRadioProfile(id: number): boolean {
     return this.db.prepare("DELETE FROM radio_profiles WHERE id = ?").run(id).changes > 0;
+  }
+
+  // ---- radio links (issue #53, Stage 3): which connections the server currently maintains ----
+
+  listLinks(): RadioLinkRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM radio_links ORDER BY profile_id IS NOT NULL, profile_id")
+      .all() as RadioLinkRow[];
+    return rows.map(rowToRadioLinkRecord);
+  }
+
+  /** Add a profile to the active-link set. Idempotent — activating an already-active profile is a no-op. */
+  activateLink(profileId: number): void {
+    const ts = now();
+    this.db
+      .prepare(
+        `INSERT INTO radio_links (profile_id, standby, last_radio_id, activated_at, updated_at)
+         VALUES (?, 0, NULL, ?, ?)
+         ON CONFLICT(profile_id) DO NOTHING`,
+      )
+      .run(profileId, ts, ts);
+  }
+
+  /** Idempotent — deactivating a profile that has no link is a no-op. */
+  deactivateLink(profileId: number): void {
+    this.db.prepare("DELETE FROM radio_links WHERE profile_id = ?").run(profileId);
+  }
+
+  /**
+   * Enable or disable the implicit env/override "default" link (profile_id IS
+   * NULL). The only code path allowed to write that row — SQLite's UNIQUE
+   * treats every NULL as distinct, so "at most one default link" is enforced
+   * here in application code rather than by the schema. Idempotent: enabling
+   * an already-enabled default link leaves its standby/last_radio_id intact.
+   */
+  setDefaultLinkEnabled(enabled: boolean): void {
+    const exists = this.db.prepare("SELECT 1 FROM radio_links WHERE profile_id IS NULL").get();
+    if (enabled && !exists) {
+      const ts = now();
+      this.db
+        .prepare(
+          "INSERT INTO radio_links (profile_id, standby, last_radio_id, activated_at, updated_at) VALUES (NULL, 0, NULL, ?, ?)",
+        )
+        .run(ts, ts);
+    } else if (!enabled && exists) {
+      this.db.prepare("DELETE FROM radio_links WHERE profile_id IS NULL").run();
+    }
+  }
+
+  setLinkStandby(profileId: number | null, standby: boolean): void {
+    this.db
+      .prepare("UPDATE radio_links SET standby = ?, updated_at = ? WHERE profile_id IS ?")
+      .run(standby ? 1 : 0, now(), profileId);
+  }
+
+  setLinkLastRadio(profileId: number | null, radioId: number): void {
+    this.db
+      .prepare("UPDATE radio_links SET last_radio_id = ?, updated_at = ? WHERE profile_id IS ?")
+      .run(radioId, now(), profileId);
   }
 
   /**

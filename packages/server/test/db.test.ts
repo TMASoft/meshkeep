@@ -137,6 +137,77 @@ describe("database migrations", () => {
     db.close();
     rmSync(directory, { recursive: true, force: true });
   });
+
+  it("seeds the implicit default link when no profile was active (migration 12)", () => {
+    const directory = mkdtempSync(join(tmpdir(), "meshkeep-db-"));
+    const path = join(directory, "meshkeep.db");
+    // A database from before concurrent links (migration 11), never having
+    // selected a profile — the ordinary single-radio upgrade path.
+    const legacy = openAtVersion(path, 11);
+    legacy
+      .prepare("INSERT INTO settings (key, value_json) VALUES ('connection.activeRadioId', '3')")
+      .run();
+    legacy.close();
+
+    const db = openDb(path);
+    const links = db.prepare("SELECT profile_id, standby, last_radio_id FROM radio_links").all() as Array<{
+      profile_id: number | null;
+      standby: number;
+      last_radio_id: number | null;
+    }>;
+    expect(links).toEqual([{ profile_id: null, standby: 0, last_radio_id: 3 }]);
+    // the legacy settings keys are folded into the table and removed
+    const remaining = db
+      .prepare(
+        "SELECT key FROM settings WHERE key IN ('connection.activeProfileId', 'connection.activeRadioId', 'connection.standby')",
+      )
+      .all();
+    expect(remaining).toEqual([]);
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("carries an exclusively-active profile forward as its link (migration 12)", () => {
+    const directory = mkdtempSync(join(tmpdir(), "meshkeep-db-"));
+    const path = join(directory, "meshkeep.db");
+    const legacy = openAtVersion(path, 11);
+    const ts = Math.floor(Date.now() / 1000);
+    legacy
+      .prepare(
+        `INSERT INTO radio_profiles (id, name, transport, serial_baud, tcp_port, created_at, updated_at)
+         VALUES (5, 'Bench', 'tcp', 115200, 5000, ?, ?)`,
+      )
+      .run(ts, ts);
+    legacy.prepare("INSERT INTO settings (key, value_json) VALUES ('connection.activeProfileId', '5')").run();
+    legacy.prepare("INSERT INTO settings (key, value_json) VALUES ('connection.activeRadioId', '7')").run();
+    legacy.prepare("INSERT INTO settings (key, value_json) VALUES ('connection.standby', 'true')").run();
+    legacy.close();
+
+    const db = openDb(path);
+    const links = db.prepare("SELECT profile_id, standby, last_radio_id FROM radio_links").all() as Array<{
+      profile_id: number | null;
+      standby: number;
+      last_radio_id: number | null;
+    }>;
+    expect(links).toEqual([{ profile_id: 5, standby: 1, last_radio_id: 7 }]);
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  it("enforces at most one default link even if a stray duplicate row existed (migration 12 store guard)", () => {
+    const db = openDb(":memory:");
+    const store = new Store(db);
+    // setDefaultLinkEnabled is the only code path allowed to touch the
+    // profile_id IS NULL row; calling it repeatedly must stay idempotent
+    // rather than accumulating rows (SQLite's UNIQUE does not block this).
+    store.setDefaultLinkEnabled(true);
+    store.setDefaultLinkEnabled(true);
+    store.setDefaultLinkEnabled(true);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM radio_links WHERE profile_id IS NULL").get()).toEqual({ n: 1 });
+    store.setDefaultLinkEnabled(false);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM radio_links WHERE profile_id IS NULL").get()).toEqual({ n: 0 });
+    db.close();
+  });
 });
 
 describe("insertMessage inbound frame dedup", () => {

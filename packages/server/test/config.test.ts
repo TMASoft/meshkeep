@@ -39,4 +39,20 @@ describe("configuration bounds", () => {
     vi.stubEnv("MESHKEEP_CONNECTION", "carrier-pigeon");
     expect(() => loadConfig()).toThrow(/MESHKEEP_CONNECTION must be one of/);
   });
+
+  it("accepts a same-origin self-hosted tile template", () => {
+    vi.stubEnv("MESHKEEP_MAP_TILES_URL", "/tiles/{z}/{x}/{y}.png");
+    expect(loadConfig().mapTilesUrl).toBe("/tiles/{z}/{x}/{y}.png");
+  });
+
+  it("disables browser tile requests for an offline map", () => {
+    vi.stubEnv("MESHKEEP_MAP_TILES_ENABLED", "false");
+    expect(loadConfig().mapTilesUrl).toBeNull();
+    expect(loadConfig().mapTilesAttribution).toBeNull();
+  });
+
+  it("rejects tile URLs without a complete Leaflet template", () => {
+    vi.stubEnv("MESHKEEP_MAP_TILES_URL", "https://tiles.example.com/map.png");
+    expect(() => loadConfig()).toThrow(/MESHKEEP_MAP_TILES_URL must include/);
+  });
 });

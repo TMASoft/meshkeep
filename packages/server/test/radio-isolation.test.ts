@@ -3,7 +3,8 @@ import request from "supertest";
 import type { Contact } from "@meshkeep/shared";
 import { openDb } from "../src/db/index.js";
 import { Store } from "../src/db/store.js";
-import { buildHarness } from "./helpers.js";
+import { RadioLink } from "../src/radio/link.js";
+import { buildHarness, testConfig } from "./helpers.js";
 
 const contact = (publicKey: string, name: string): Contact => ({
   publicKey,
@@ -124,8 +125,28 @@ describe("radios API (issue #53)", () => {
   });
 
   it("refuses to forget the active radio", async () => {
-    const { app, manager, r1 } = seededHarness();
-    (manager as unknown as { activeRadioId: number | null }).activeRadioId = r1;
+    const { app, db, bus, manager, r1 } = seededHarness();
+    // Simulate "radio r1 is the currently connected one" by registering a
+    // link resolved to it, the same way a real connect's initialSync would.
+    const link = new RadioLink({
+      key: null,
+      label: "test",
+      db,
+      store: manager.store,
+      bus,
+      config: testConfig(),
+      getEffectiveSettings: () => ({
+        connection: "none",
+        serialPort: null,
+        serialBaud: 115200,
+        tcpHost: null,
+        tcpPort: 5000,
+        bleAddress: null,
+      }),
+      initialStandby: false,
+      initialRadioId: r1,
+    });
+    (manager as unknown as { links: Map<number | null, RadioLink> }).links.set(null, link);
     await request(app).delete(`/api/v1/radios/${r1}`).expect(409);
   });
 });

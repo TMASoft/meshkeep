@@ -26,6 +26,8 @@ export function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     mapRefreshMinutes: 10,
     mapUpstream: "https://map.meshcore.io/api/v1/nodes",
     mapEnabled: true,
+    mapTilesUrl: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    mapTilesAttribution: "© OpenStreetMap contributors",
     ...overrides,
   };
 }

@@ -17,7 +17,7 @@ import {
   parseChannelShareUri,
 } from "@meshkeep/shared";
 import { api } from "../api/client";
-import { useAppStore, conversationKey, type ConversationId } from "../stores/app";
+import { useAppStore, conversationKey, radioSuffix, type ConversationId } from "../stores/app";
 import { displayMessage } from "../message-display";
 import AppIcon from "../components/AppIcon.vue";
 
@@ -318,7 +318,7 @@ const copyContactUri = () =>
   detailsAction("share", async () => {
     const contact = activeContact.value;
     if (!contact) return;
-    const { uri } = await api<{ uri: string }>(`/contacts/${contact.publicKey}/export`);
+    const { uri } = await api<{ uri: string }>(`/contacts/${contact.publicKey}/export${radioSuffix(store.effectiveRadioId)}`);
     await navigator.clipboard.writeText(uri);
     detailsNotice.value = "meshcore:// link copied";
   });
@@ -327,7 +327,7 @@ const resetContactPath = () =>
   detailsAction("path", async () => {
     const contact = activeContact.value;
     if (!contact) return;
-    await api(`/contacts/${contact.publicKey}/path-reset`, { method: "POST" });
+    await api(`/contacts/${contact.publicKey}/path-reset${radioSuffix(store.effectiveRadioId)}`, { method: "POST" });
     detailsNotice.value = "Route reset — next message will flood";
   });
 
@@ -338,7 +338,7 @@ const removeActiveContact = () =>
     if (!window.confirm(`Remove ${contact.name || "this node"} from the radio's contacts? Message history is kept.`)) {
       return;
     }
-    await api(`/contacts/${contact.publicKey}`, { method: "DELETE" });
+    await api(`/contacts/${contact.publicKey}${radioSuffix(store.effectiveRadioId)}`, { method: "DELETE" });
     // the contact.removed event also arrives over the WebSocket; update eagerly
     store.contacts = store.contacts.filter((c) => c.publicKey !== contact.publicKey);
     store.activeConversation = null;
@@ -357,7 +357,7 @@ async function submitImport() {
   importBusy.value = true;
   importError.value = null;
   try {
-    await api("/contacts/import", { method: "POST", body: JSON.stringify({ uri }) });
+    await api(`/contacts/import${radioSuffix(store.effectiveRadioId)}`, { method: "POST", body: JSON.stringify({ uri }) });
     await store.refreshContacts();
     importUri.value = "";
     importOpen.value = false;

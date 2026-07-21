@@ -4,9 +4,27 @@ import { Constants, type Connection } from "@liamcottle/meshcore.js";
 import type { Message, WsEvent } from "@meshkeep/shared";
 import { MockRadio } from "../src/radio/mock/mock-radio.js";
 import { ConnectionManager } from "../src/radio/manager.js";
+import { RadioLink } from "../src/radio/link.js";
+import { Store } from "../src/db/store.js";
 import { openDb, type Db } from "../src/db/index.js";
 import { Bus } from "../src/bus.js";
 import type { ServerConfig } from "../src/config.js";
+
+/** White-box access to the one link Stage 3a ever runs, keyed by profile id (null = default). */
+interface LinkInternals {
+  connection: Connection | null;
+  state: string;
+  radioId: number | null;
+  standby: boolean;
+  attachListeners(connection: Connection): void;
+}
+
+function soleLinkInternals(manager: ConnectionManager, key: number | null = null): LinkInternals {
+  const links = (manager as unknown as { links: Map<number | null, LinkInternals> }).links;
+  const link = links.get(key);
+  if (!link) throw new Error("no link registered at that key");
+  return link;
+}
 
 function testConfig(port: number): ServerConfig {
   return {
@@ -24,10 +42,16 @@ function testConfig(port: number): ServerConfig {
     mapRefreshMinutes: 10,
     mapUpstream: "https://map.meshcore.io/api/v1/nodes",
     mapEnabled: true,
+    mapTilesUrl: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    mapTilesAttribution: "© OpenStreetMap contributors",
   };
 }
 
-function waitForEvent(bus: Bus, predicate: (event: WsEvent) => boolean, timeoutMs = 10_000): Promise<WsEvent> {
+function waitForEvent(
+  bus: Bus,
+  predicate: (event: WsEvent) => boolean,
+  timeoutMs = 10_000,
+): Promise<WsEvent> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       unsubscribe();
@@ -122,9 +146,11 @@ describe("mock radio end-to-end", () => {
           })
           .map((message) => message.text),
       ).toContain("v3 direct message");
-      expect(v3Manager.store.getConversation(v3Manager.getActiveRadioId()!, { channelIdx: 0, limit: 10 }).map((message) => message.text)).toContain(
-        "v3 channel message",
-      );
+      expect(
+        v3Manager.store
+          .getConversation(v3Manager.getActiveRadioId()!, { channelIdx: 0, limit: 10 })
+          .map((message) => message.text),
+      ).toContain("v3 channel message");
     } finally {
       await v3Manager.stop();
       await v3Mock.stop();
@@ -157,18 +183,25 @@ describe("mock radio end-to-end", () => {
     const removedEvent = waitForEvent(bus, (e) => e.type === "contact.removed");
     const contacts = await manager.refreshContacts();
 
-    expect((await removedEvent) as Extract<WsEvent, { type: "contact.removed" }>).toMatchObject({ publicKey: phantomKey });
+    expect((await removedEvent) as Extract<WsEvent, { type: "contact.removed" }>).toMatchObject({
+      publicKey: phantomKey,
+    });
     expect(contacts.map((c) => c.name)).not.toContain("Ghost");
     expect(manager.store.getContacts(manager.getActiveRadioId()!).map((c) => c.name)).not.toContain("Ghost");
     // radio contacts survive the reconciliation
     expect(manager.store.getContacts(manager.getActiveRadioId()!)).toHaveLength(4);
     // the removed contact's history keeps its identity
-    const history = manager.store.getConversation(manager.getActiveRadioId()!, { contactKey: phantomKey, limit: 10 });
+    const history = manager.store.getConversation(manager.getActiveRadioId()!, {
+      contactKey: phantomKey,
+      limit: 10,
+    });
     expect(history.map((m) => m.text)).toEqual(["from beyond"]);
   });
 
   it("sends a DM, sees it delivered, and receives the echo", async () => {
-    const alice = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Alice")!;
+    const alice = manager.store
+      .getContacts(manager.getActiveRadioId()!)
+      .find((c) => c.name === "Mock Alice")!;
 
     const delivered = waitForEvent(bus, (e) => e.type === "message.status" && e.status === "delivered");
     const echoed = waitForEvent(
@@ -191,7 +224,7 @@ describe("mock radio end-to-end", () => {
   });
 
   it("retains an acknowledgement that arrives before the send response", async () => {
-    const originalConnection = (manager as unknown as { connection: Connection }).connection;
+    const originalConnection = soleLinkInternals(manager).connection;
     const emitter = new EventEmitter();
     const connection = Object.assign(emitter, {
       async sendTextMessage() {
@@ -199,8 +232,8 @@ describe("mock radio end-to-end", () => {
         return { result: 0, expectedAckCrc: 4321, estTimeout: 50 };
       },
     }) as unknown as Connection;
-    (manager as unknown as { connection: Connection }).connection = connection;
-    (manager as unknown as { attachListeners(connection: Connection): void }).attachListeners(connection);
+    soleLinkInternals(manager).connection = connection;
+    soleLinkInternals(manager).attachListeners(connection);
 
     try {
       const delivered = waitForEvent(bus, (e) => e.type === "message.status" && e.status === "delivered");
@@ -209,12 +242,12 @@ describe("mock radio end-to-end", () => {
       await delivered;
       expect(manager.store.getMessage(message.id)?.status).toBe("delivered");
     } finally {
-      (manager as unknown as { connection: Connection }).connection = originalConnection;
+      soleLinkInternals(manager).connection = originalConnection;
     }
   });
 
   it("serializes same-CRC sends so each acknowledgement updates its own message", async () => {
-    const originalConnection = (manager as unknown as { connection: Connection }).connection;
+    const originalConnection = soleLinkInternals(manager).connection;
     const emitter = new EventEmitter();
     const sent: string[] = [];
     const connection = Object.assign(emitter, {
@@ -223,8 +256,8 @@ describe("mock radio end-to-end", () => {
         return { result: 0, expectedAckCrc: 4321, estTimeout: 50 };
       },
     }) as unknown as Connection;
-    (manager as unknown as { connection: Connection }).connection = connection;
-    (manager as unknown as { attachListeners(connection: Connection): void }).attachListeners(connection);
+    soleLinkInternals(manager).connection = connection;
+    soleLinkInternals(manager).attachListeners(connection);
 
     try {
       const firstMessage = await manager.sendDirectMessage("ab".repeat(32), "first");
@@ -244,12 +277,12 @@ describe("mock radio end-to-end", () => {
           manager.store.getMessage(secondMessage.id)?.status === "delivered",
       );
     } finally {
-      (manager as unknown as { connection: Connection }).connection = originalConnection;
+      soleLinkInternals(manager).connection = originalConnection;
     }
   });
 
   it("expires an unacknowledged send before dispatching the next one", async () => {
-    const originalConnection = (manager as unknown as { connection: Connection }).connection;
+    const originalConnection = soleLinkInternals(manager).connection;
     const emitter = new EventEmitter();
     const sent: string[] = [];
     const connection = Object.assign(emitter, {
@@ -258,8 +291,8 @@ describe("mock radio end-to-end", () => {
         return { result: 0, expectedAckCrc: 4321, estTimeout: sent.length === 1 ? 10 : 500 };
       },
     }) as unknown as Connection;
-    (manager as unknown as { connection: Connection }).connection = connection;
-    (manager as unknown as { attachListeners(connection: Connection): void }).attachListeners(connection);
+    soleLinkInternals(manager).connection = connection;
+    soleLinkInternals(manager).attachListeners(connection);
 
     try {
       const first = await manager.sendDirectMessage("ab".repeat(32), "first");
@@ -277,7 +310,7 @@ describe("mock radio end-to-end", () => {
       expect(manager.store.getMessage(first.id)?.status).toBe("sent");
       expect(manager.store.getMessage(secondMessage.id)?.status).toBe("delivered");
     } finally {
-      (manager as unknown as { connection: Connection }).connection = originalConnection;
+      soleLinkInternals(manager).connection = originalConnection;
     }
   });
 
@@ -294,7 +327,9 @@ describe("mock radio end-to-end", () => {
   });
 
   it("requests remote sensor telemetry and parses the Cayenne LPP payload", async () => {
-    const alice = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Alice")!;
+    const alice = manager.store
+      .getContacts(manager.getActiveRadioId()!)
+      .find((c) => c.name === "Mock Alice")!;
     const readings = await manager.requestTelemetry(alice.publicKey);
     expect(readings).toEqual([
       { channel: 1, type: 116, label: "Voltage", unit: "V", value: 4.03 },
@@ -315,13 +350,22 @@ describe("mock radio end-to-end", () => {
   });
 
   it("keeps stored channels when a channel read returns an error", async () => {
-    manager.store.upsertChannel(manager.getActiveRadioId()!, { idx: 3, name: "Stored", secret: "a".repeat(32) });
-    const originalConnection = (manager as unknown as { connection: Connection }).connection;
+    manager.store.upsertChannel(manager.getActiveRadioId()!, {
+      idx: 3,
+      name: "Stored",
+      secret: "a".repeat(32),
+    });
+    const originalConnection = soleLinkInternals(manager).connection;
     const connection = channelReader((idx, emitter) => {
       if (idx === 3) emitter.emit(Constants.ResponseCodes.Err);
-      else emitter.emit(Constants.ResponseCodes.ChannelInfo, { channelIdx: idx, name: "", secret: new Uint8Array(16) });
+      else
+        emitter.emit(Constants.ResponseCodes.ChannelInfo, {
+          channelIdx: idx,
+          name: "",
+          secret: new Uint8Array(16),
+        });
     });
-    (manager as unknown as { connection: Connection }).connection = connection;
+    soleLinkInternals(manager).connection = connection;
 
     try {
       await expect(manager.refreshChannels()).rejects.toThrow("radio rejected reading channel 3");
@@ -330,19 +374,27 @@ describe("mock radio end-to-end", () => {
         { idx: 3, name: "Stored", secret: "a".repeat(32) },
       ]);
     } finally {
-      (manager as unknown as { connection: Connection }).connection = originalConnection;
+      soleLinkInternals(manager).connection = originalConnection;
     }
   });
 
   it("keeps stored channels when a channel read times out", async () => {
-    manager.store.upsertChannel(manager.getActiveRadioId()!, { idx: 3, name: "Stored", secret: "a".repeat(32) });
-    const originalConnection = (manager as unknown as { connection: Connection }).connection;
+    manager.store.upsertChannel(manager.getActiveRadioId()!, {
+      idx: 3,
+      name: "Stored",
+      secret: "a".repeat(32),
+    });
+    const originalConnection = soleLinkInternals(manager).connection;
     const connection = channelReader((idx, emitter) => {
       if (idx !== 3) {
-        emitter.emit(Constants.ResponseCodes.ChannelInfo, { channelIdx: idx, name: "", secret: new Uint8Array(16) });
+        emitter.emit(Constants.ResponseCodes.ChannelInfo, {
+          channelIdx: idx,
+          name: "",
+          secret: new Uint8Array(16),
+        });
       }
     });
-    (manager as unknown as { connection: Connection }).connection = connection;
+    soleLinkInternals(manager).connection = connection;
 
     try {
       await expect(manager.refreshChannels()).rejects.toThrow("timed out reading channel 3");
@@ -351,12 +403,12 @@ describe("mock radio end-to-end", () => {
         { idx: 3, name: "Stored", secret: "a".repeat(32) },
       ]);
     } finally {
-      (manager as unknown as { connection: Connection }).connection = originalConnection;
+      soleLinkInternals(manager).connection = originalConnection;
     }
   });
 
   it("serializes concurrent channel writes so each receives its own response", async () => {
-    const originalConnection = (manager as unknown as { connection: Connection }).connection;
+    const originalConnection = soleLinkInternals(manager).connection;
     const emitter = new EventEmitter();
     const sent: string[] = [];
     const connection = Object.assign(emitter, {
@@ -365,7 +417,7 @@ describe("mock radio end-to-end", () => {
         return Promise.resolve();
       },
     }) as unknown as Connection;
-    (manager as unknown as { connection: Connection }).connection = connection;
+    soleLinkInternals(manager).connection = connection;
 
     try {
       const first = manager.setChannel(2, "first", "a".repeat(32));
@@ -380,10 +432,14 @@ describe("mock radio end-to-end", () => {
 
       emitter.emit(Constants.ResponseCodes.Err);
       await expect(second).rejects.toThrow("radio rejected channel update");
-      expect(manager.store.getChannels(manager.getActiveRadioId()!).map((channel) => channel.idx)).toContain(2);
-      expect(manager.store.getChannels(manager.getActiveRadioId()!).map((channel) => channel.idx)).not.toContain(3);
+      expect(manager.store.getChannels(manager.getActiveRadioId()!).map((channel) => channel.idx)).toContain(
+        2,
+      );
+      expect(
+        manager.store.getChannels(manager.getActiveRadioId()!).map((channel) => channel.idx),
+      ).not.toContain(3);
     } finally {
-      (manager as unknown as { connection: Connection }).connection = originalConnection;
+      soleLinkInternals(manager).connection = originalConnection;
     }
   });
 
@@ -463,7 +519,8 @@ describe("mock radio end-to-end", () => {
       senderTimestamp: 1_000,
       status: "pending",
     })!;
-    manager.store.enqueueOutbound({ radioId: manager.getActiveRadioId()!,
+    manager.store.enqueueOutbound({
+      radioId: manager.getActiveRadioId()!,
       messageId: queued.id,
       kind: "channel",
       channelIdx: 0,
@@ -475,7 +532,10 @@ describe("mock radio end-to-end", () => {
 
     const echoed = waitForEvent(
       bus,
-      (e) => e.type === "message.new" && e.message.direction === "in" && e.message.text.includes("queued while away"),
+      (e) =>
+        e.type === "message.new" &&
+        e.message.direction === "in" &&
+        e.message.text.includes("queued while away"),
     );
     await manager.claim();
     await waitForState(manager, "connected");
@@ -487,19 +547,25 @@ describe("mock radio end-to-end", () => {
   });
 
   it("round-trips a contact through export and import URIs", async () => {
-    const alice = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Alice")!;
+    const alice = manager.store
+      .getContacts(manager.getActiveRadioId()!)
+      .find((c) => c.name === "Mock Alice")!;
 
     const uri = await manager.exportContactUri(alice.publicKey);
     expect(uri).toMatch(/^meshcore:\/\/[0-9a-f]+$/);
 
     await manager.removeContact(alice.publicKey);
-    expect(manager.store.getContacts(manager.getActiveRadioId()!).some((c) => c.publicKey === alice.publicKey)).toBe(false);
+    expect(
+      manager.store.getContacts(manager.getActiveRadioId()!).some((c) => c.publicKey === alice.publicKey),
+    ).toBe(false);
 
     const contacts = await manager.importContactUri(uri);
     const restored = contacts.find((c) => c.publicKey === alice.publicKey);
     expect(restored?.name).toBe("Mock Alice");
     expect(restored?.lat).toBeCloseTo(44.265);
-    expect(manager.store.getContacts(manager.getActiveRadioId()!).some((c) => c.publicKey === alice.publicKey)).toBe(true);
+    expect(
+      manager.store.getContacts(manager.getActiveRadioId()!).some((c) => c.publicKey === alice.publicKey),
+    ).toBe(true);
   });
 
   it("rejects malformed contact import URIs", async () => {
@@ -527,7 +593,9 @@ describe("mock radio end-to-end", () => {
     );
     const removed = manager.store.trimTelemetry(30);
     expect(removed).toBe(1);
-    expect(manager.store.getTelemetry(manager.getActiveRadioId()!, 0).every((p) => p.ts > nowTs - 31 * 86_400)).toBe(true);
+    expect(
+      manager.store.getTelemetry(manager.getActiveRadioId()!, 0).every((p) => p.ts > nowTs - 31 * 86_400),
+    ).toBe(true);
   });
 
   it("applies and clears connection overrides", async () => {
@@ -547,8 +615,14 @@ describe("mock radio end-to-end", () => {
     expect(manager.connectionSettings().override).toBeNull();
   });
 
-  it("activates, edits, and deactivates radio profiles", async () => {
-    // a profile pointing at the mock radio becomes the effective connection
+  it("activates, edits, and deactivates radio profiles concurrently with the default link (issue #53, Stage 3b)", async () => {
+    // the mock radio serves one client connection at a time, so disable the
+    // beforeEach's default link first — activation is additive (Stage 3b),
+    // and this test wants the profile link in isolation to assert on it cleanly.
+    await manager.setDefaultLinkEnabled(false);
+    await waitForState(manager, "disconnected");
+
+    // a profile pointing at the (now free) mock radio becomes its own link
     const profile = manager.store.createRadioProfile({
       name: "Bench",
       connection: "tcp",
@@ -556,7 +630,7 @@ describe("mock radio end-to-end", () => {
       tcpPort: mock.port,
     });
     await manager.activateProfile(profile.id);
-    await waitForState(manager, "connected");
+    await until(() => manager.status().links.find((l) => l.profileId === profile.id)?.connection.state === "connected");
     const settings = manager.connectionSettings();
     expect(settings.activeProfile?.name).toBe("Bench");
     expect(settings.effective).toMatchObject({ connection: "tcp", tcpHost: "127.0.0.1", tcpPort: mock.port });
@@ -564,26 +638,26 @@ describe("mock radio end-to-end", () => {
     // the active profile is protected from deletion
     expect(() => manager.deleteProfile(profile.id)).toThrow(/active/);
 
-    // editing the active profile applies the new settings immediately
+    // editing the active profile applies the new settings immediately, to just that link
     await manager.updateProfile(profile.id, { connection: "none" });
-    await waitForState(manager, "disconnected");
+    await until(() => manager.status().links.find((l) => l.profileId === profile.id)?.connection.state === "disconnected");
     expect(manager.connectionSettings().effective.connection).toBe("none");
 
-    // an explicit override replaces the profile selection
+    // an explicit override only ever touches the default link — it leaves an active profile alone
     await manager.setConnectionOverride({ connection: "tcp", tcpHost: "127.0.0.1", tcpPort: mock.port });
-    await waitForState(manager, "connected");
-    expect(manager.connectionSettings().activeProfile).toBeNull();
+    expect(manager.connectionSettings().activeProfile?.name).toBe("Bench");
 
-    // back to env settings; the now-inactive profile can be deleted
-    await manager.setConnectionOverride(null);
-    await waitForState(manager, "connected");
+    // deactivating (by id) the profile lets it be deleted
+    await manager.deactivateProfile(profile.id);
     manager.deleteProfile(profile.id);
     expect(manager.store.listRadioProfiles()).toHaveLength(0);
     await expect(manager.activateProfile(9999)).rejects.toThrow(/not found/);
   });
 
   it("logs in to a repeater, reads status, and runs CLI commands", async () => {
-    const repeater = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Repeater")!;
+    const repeater = manager.store
+      .getContacts(manager.getActiveRadioId()!)
+      .find((c) => c.name === "Mock Repeater")!;
 
     // wrong password: no LoginSuccess push, the request times out → false
     await expect(manager.loginToNode(repeater.publicKey, "wrong")).resolves.toBe(false);
@@ -600,7 +674,8 @@ describe("mock radio end-to-end", () => {
 
     const reply = waitForEvent(
       bus,
-      (e) => e.type === "message.new" && e.message.direction === "in" && e.message.contactName === "Mock Repeater",
+      (e) =>
+        e.type === "message.new" && e.message.direction === "in" && e.message.contactName === "Mock Repeater",
     );
     await manager.sendDirectMessage(repeater.publicKey, "ver", true);
     const event = (await reply) as Extract<WsEvent, { type: "message.new" }>;
@@ -614,26 +689,33 @@ describe("mock radio end-to-end", () => {
     await manager.sendDirectMessage(room.publicKey, "anyone here?");
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(
-      manager.store.getConversation(manager.getActiveRadioId()!, { contactKey: room.publicKey, limit: 10 }).filter((m) => m.direction === "in"),
+      manager.store
+        .getConversation(manager.getActiveRadioId()!, { contactKey: room.publicKey, limit: 10 })
+        .filter((m) => m.direction === "in"),
     ).toHaveLength(0);
 
     await expect(manager.loginToNode(room.publicKey, "letmein")).resolves.toBe(true);
 
     const echoed = waitForEvent(
       bus,
-      (e) => e.type === "message.new" && e.message.direction === "in" && e.message.contactName === "Mock Room",
+      (e) =>
+        e.type === "message.new" && e.message.direction === "in" && e.message.contactName === "Mock Room",
     );
     await manager.sendDirectMessage(room.publicKey, "hello room");
     const event = (await echoed) as Extract<WsEvent, { type: "message.new" }>;
     expect(event.message.text).toBe("room echo: hello room");
     // the mock room reposts as signed-plain attributed to Mock Alice
-    const alice = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Alice")!;
+    const alice = manager.store
+      .getContacts(manager.getActiveRadioId()!)
+      .find((c) => c.name === "Mock Alice")!;
     expect(event.message.authorPrefix).toBe(alice.publicKey.slice(0, 8));
     expect(event.message.authorName).toBe("Mock Alice");
   }, 15_000);
 
   it("persists history across a manager restart", async () => {
-    const alice = manager.store.getContacts(manager.getActiveRadioId()!).find((c) => c.name === "Mock Alice")!;
+    const alice = manager.store
+      .getContacts(manager.getActiveRadioId()!)
+      .find((c) => c.name === "Mock Alice")!;
     const echoed = waitForEvent(bus, (e) => e.type === "message.new");
     await manager.sendDirectMessage(alice.publicKey, "survive me");
     await echoed;
@@ -646,7 +728,10 @@ describe("mock radio end-to-end", () => {
     await manager2.start();
     await waitForState(manager2, "connected");
     expect(manager2.store.counts(manager2.getActiveRadioId()!).messages).toBe(countBefore);
-    const history: Message[] = manager2.store.getConversation(manager2.getActiveRadioId()!, { contactKey: alice.publicKey, limit: 10 });
+    const history: Message[] = manager2.store.getConversation(manager2.getActiveRadioId()!, {
+      contactKey: alice.publicKey,
+      limit: 10,
+    });
     expect(history.some((m) => m.text === "survive me")).toBe(true);
     await manager2.stop();
   });
@@ -754,24 +839,77 @@ describe("connection lifecycle races", () => {
     expect(connect).toHaveBeenCalledOnce();
     expect(manager.getState()).toBe("standby");
   });
+
+  it("tears down a dropped link before creating a fresh transport for reconnect", async () => {
+    vi.useFakeTimers();
+    const first = Object.assign(new EventEmitter(), {
+      connect: vi.fn(() => new Promise<void>(() => {})),
+      close: vi.fn().mockResolvedValue(undefined),
+    }) as unknown as Connection;
+    const second = Object.assign(new EventEmitter(), {
+      connect: vi.fn(() => new Promise<void>(() => {})),
+      close: vi.fn().mockResolvedValue(undefined),
+    }) as unknown as Connection;
+    const factory = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second);
+    db = openDb(":memory:");
+    manager = new ConnectionManager(testConfig(1), db, new Bus(), "test", 50, factory as never);
+
+    const starting = manager.start();
+    const link = soleLinkInternals(manager);
+    expect(factory).toHaveBeenCalledOnce();
+    // This is the state after a completed BLE initial sync. A real radio
+    // power-cycle then emits this event through the transport.
+    link.state = "connected";
+    (first as unknown as EventEmitter).emit("disconnected");
+
+    await starting;
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(first.close).toHaveBeenCalledOnce();
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(second.connect).toHaveBeenCalledOnce();
+  });
 });
 
 describe("outbound retry worker", () => {
-  // A bare manager with an injected connection and a forced "connected" state,
-  // so we can exercise hand-off failures without real hardware or slow backoff.
+  // A bare manager with a manually-registered link whose connection/state can
+  // be forced directly, so we can exercise hand-off failures without real
+  // hardware or slow backoff. manager.start() is never called.
   function bareManager(overrides: Partial<ServerConfig> = {}) {
     const db = openDb(":memory:");
     const bus = new Bus();
-    const manager = new ConnectionManager({ ...testConfig(0), ...overrides }, db, bus, "test");
-    const internals = manager as unknown as {
+    const config = { ...testConfig(0), ...overrides };
+    const manager = new ConnectionManager(config, db, bus, "test");
+    const link = new RadioLink({
+      key: null,
+      label: "default",
+      db,
+      store: manager.store,
+      bus,
+      config,
+      getEffectiveSettings: () => ({
+        connection: "tcp",
+        serialPort: null,
+        serialBaud: 115200,
+        tcpHost: "127.0.0.1",
+        tcpPort: 0,
+        bleAddress: null,
+      }),
+      initialStandby: false,
+      initialRadioId: null,
+    });
+    (manager as unknown as { links: Map<number | null, RadioLink> }).links.set(null, link);
+    const internals = link as unknown as {
       connection: Connection | null;
       state: string;
-      activeRadioId: number | null;
+      radioId: number | null;
     };
     return { db, bus, manager, internals };
   }
 
-  function fakeConnection(sendTextMessage: () => Promise<{ result: number; expectedAckCrc: number; estTimeout: number }>): Connection {
+  function fakeConnection(
+    sendTextMessage: () => Promise<{ result: number; expectedAckCrc: number; estTimeout: number }>,
+  ): Connection {
     return Object.assign(new EventEmitter(), { sendTextMessage }) as unknown as Connection;
   }
 
@@ -794,17 +932,23 @@ describe("outbound retry worker", () => {
       internals.connection = fakeConnection(() => Promise.reject(new Error("radio rejected")));
       internals.state = "connected";
       // mirror initialSync: a connected radio has a resolved identity the worker scopes to
-      internals.activeRadioId = manager.store.resolveRadio("f".repeat(64), "R");
+      internals.radioId = manager.store.resolveRadio("f".repeat(64), "R");
 
       const message = await manager.sendDirectMessage("ab".repeat(32), "will fail");
       await until(() => manager.store.getMessage(message.id)?.status === "failed");
-      expect(manager.store.getOutbound(message.id)).toMatchObject({ state: "failed", attempts: 1, lastError: "radio rejected" });
+      expect(manager.store.getOutbound(message.id)).toMatchObject({
+        state: "failed",
+        attempts: 1,
+        lastError: "radio rejected",
+      });
 
       // retrying a non-failed entry is rejected; an unknown id is not found
       expect(() => manager.retryOutbound(999_999)).toThrow(/not in the outbound queue/);
 
       // swap in a working radio and retry: it hands off and clears the queue
-      internals.connection = fakeConnection(() => Promise.resolve({ result: 0, expectedAckCrc: 7, estTimeout: 20 }));
+      internals.connection = fakeConnection(() =>
+        Promise.resolve({ result: 0, expectedAckCrc: 7, estTimeout: 20 }),
+      );
       const retried = manager.retryOutbound(message.id);
       expect(retried.status).toBe("pending");
       await until(() => manager.store.getMessage(message.id)?.status === "sent");
@@ -843,12 +987,19 @@ describe("outbound retry worker", () => {
   });
 });
 
-function delayedConnection(): { emitter: EventEmitter; connection: Connection; close: ReturnType<typeof vi.fn> } {
+function delayedConnection(): {
+  emitter: EventEmitter;
+  connection: Connection;
+  close: ReturnType<typeof vi.fn>;
+} {
   const emitter = new EventEmitter();
   const close = vi.fn().mockResolvedValue(undefined);
   return {
     emitter,
-    connection: Object.assign(emitter, { connect: vi.fn().mockResolvedValue(undefined), close }) as unknown as Connection,
+    connection: Object.assign(emitter, {
+      connect: vi.fn().mockResolvedValue(undefined),
+      close,
+    }) as unknown as Connection,
     close,
   };
 }
@@ -862,3 +1013,218 @@ function channelReader(respond: (idx: number, emitter: EventEmitter) => void): C
     },
   }) as unknown as Connection;
 }
+
+/**
+ * A standalone RadioLink with no hub, database shared with nothing else, and
+ * an injectable "connected" state — for proving two links never share
+ * per-connection state (issue #53, Stage 3). Mirrors bareManager()'s trick,
+ * one level down.
+ */
+function bareLink(label: string) {
+  const db = openDb(":memory:");
+  const bus = new Bus();
+  const store = new Store(db);
+  const config = testConfig(0);
+  const link = new RadioLink({
+    key: null,
+    label,
+    db,
+    store,
+    bus,
+    config,
+    getEffectiveSettings: () => ({
+      connection: "tcp",
+      serialPort: null,
+      serialBaud: 115200,
+      tcpHost: "127.0.0.1",
+      tcpPort: 0,
+      bleAddress: null,
+    }),
+    initialStandby: false,
+    initialRadioId: null,
+  });
+  const internals = link as unknown as {
+    connection: Connection | null;
+    state: string;
+    radioId: number | null;
+    attachListeners(connection: Connection): void;
+  };
+  return { db, bus, store, link, internals };
+}
+
+describe("concurrent radio links (issue #53, Stage 3)", () => {
+  // The single highest-risk regression for the RadioLink extraction: every
+  // per-connection queue (uncorrelatedCommandQueue, directSendQueue /
+  // pendingDirectDelivery) must be a RadioLink instance field, not
+  // accidentally hoisted to module- or hub-level state. If it were, one
+  // link's in-flight work would silently serialize or cross-talk with
+  // another's — no type error, just wrong behavior under concurrency.
+
+  it("keeps the uncorrelated-command queue isolated: a slow channel write on one link never blocks another", async () => {
+    const a = bareLink("A");
+    const b = bareLink("B");
+    try {
+      a.internals.radioId = a.store.resolveRadio("aa".repeat(32), "Radio A");
+      b.internals.radioId = b.store.resolveRadio("bb".repeat(32), "Radio B");
+      a.internals.state = "connected";
+      b.internals.state = "connected";
+
+      const sentA: string[] = [];
+      const sentB: string[] = [];
+      const setChannelConn = (sent: string[]) => {
+        const emitter = new EventEmitter();
+        const connection = Object.assign(emitter, {
+          sendCommandSetChannel(_idx: number, name: string): Promise<void> {
+            sent.push(name);
+            return Promise.resolve();
+          },
+        }) as unknown as Connection;
+        return { emitter, connection };
+      };
+      const connA = setChannelConn(sentA);
+      const connB = setChannelConn(sentB);
+      a.internals.connection = connA.connection;
+      b.internals.connection = connB.connection;
+
+      // Two writes on A: the second is held behind the first by A's own
+      // command queue (same-link serialization, unchanged from before).
+      const firstA = a.link.setChannel(1, "a-first", "a".repeat(32));
+      const secondA = a.link.setChannel(2, "a-second", "a".repeat(32));
+      // B's write is issued while A's queue is still blocked on its first entry.
+      const firstB = b.link.setChannel(1, "b-first", "b".repeat(32));
+
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(sentA).toEqual(["a-first"]); // A's second write still queued behind its first
+      expect(sentB).toEqual(["b-first"]); // B's write was never queued behind A's
+
+      connA.emitter.emit(Constants.ResponseCodes.Ok);
+      await firstA;
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(sentA).toEqual(["a-first", "a-second"]);
+
+      connA.emitter.emit(Constants.ResponseCodes.Ok);
+      connB.emitter.emit(Constants.ResponseCodes.Ok);
+      await Promise.all([secondA, firstB]);
+    } finally {
+      await a.link.stop();
+      await b.link.stop();
+      a.db.close();
+      b.db.close();
+    }
+  });
+
+  it("keeps direct-send ack correlation isolated: a same-CRC ack on one link never delivers the other's pending send", async () => {
+    const a = bareLink("A");
+    const b = bareLink("B");
+    try {
+      const radioA = a.store.resolveRadio("aa".repeat(32), "Radio A");
+      const radioB = b.store.resolveRadio("bb".repeat(32), "Radio B");
+      a.internals.radioId = radioA;
+      b.internals.radioId = radioB;
+      a.internals.state = "connected";
+      b.internals.state = "connected";
+
+      const emitterA = new EventEmitter();
+      const emitterB = new EventEmitter();
+      // Deliberately the same expectedAckCrc on both links — if pending-ack
+      // state were shared, A's ack would also (wrongly) resolve B's send.
+      const connA = Object.assign(emitterA, {
+        async sendTextMessage() {
+          return { result: 0, expectedAckCrc: 999, estTimeout: 5_000 };
+        },
+      }) as unknown as Connection;
+      const connB = Object.assign(emitterB, {
+        async sendTextMessage() {
+          return { result: 0, expectedAckCrc: 999, estTimeout: 5_000 };
+        },
+      }) as unknown as Connection;
+      a.internals.connection = connA;
+      b.internals.connection = connB;
+      a.internals.attachListeners(connA);
+      b.internals.attachListeners(connB);
+
+      const contactKey = "cc".repeat(32);
+      const msgA = a.store.insertMessage(radioA, {
+        kind: "dm",
+        contactKey,
+        direction: "out",
+        text: "to A",
+        senderTimestamp: 1,
+        status: "pending",
+      })!;
+      a.store.enqueueOutbound({
+        radioId: radioA,
+        messageId: msgA.id,
+        kind: "dm",
+        contactKey,
+        channelIdx: null,
+        text: "to A",
+        cli: false,
+        maxAttempts: 5,
+        nextAttemptAt: 1,
+      });
+      const msgB = b.store.insertMessage(radioB, {
+        kind: "dm",
+        contactKey,
+        direction: "out",
+        text: "to B",
+        senderTimestamp: 1,
+        status: "pending",
+      })!;
+      b.store.enqueueOutbound({
+        radioId: radioB,
+        messageId: msgB.id,
+        kind: "dm",
+        contactKey,
+        channelIdx: null,
+        text: "to B",
+        cli: false,
+        maxAttempts: 5,
+        nextAttemptAt: 1,
+      });
+
+      a.link.kickOutbound();
+      b.link.kickOutbound();
+      await until(() => a.store.getMessage(msgA.id)?.status === "sent" && b.store.getMessage(msgB.id)?.status === "sent");
+
+      // Only A's connection reports the ack — B's identically-CRC'd send must stay unresolved.
+      emitterA.emit(Constants.PushCodes.SendConfirmed, { ackCode: 999, roundTrip: 0 });
+      await until(() => a.store.getMessage(msgA.id)?.status === "delivered");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(b.store.getMessage(msgB.id)?.status).toBe("sent"); // not delivered — no cross-talk
+    } finally {
+      await a.link.stop();
+      await b.link.stop();
+      a.db.close();
+      b.db.close();
+    }
+  });
+
+  it("rejects a second concurrent BLE profile immediately, without waiting out a connect attempt (Stage 3b)", async () => {
+    // BlueZ exposes one adapter with no cross-instance discovery coordination
+    // (see issue #20/#43), so at most one BLE link may run at a time — every
+    // other transport may run concurrently. A connect() that never resolves
+    // stands in for a real (slow) BLE handshake, proving the second
+    // activation is rejected up front rather than only after that hangs.
+    const db = openDb(":memory:");
+    const bus = new Bus();
+    const neverConnects = () =>
+      Object.assign(new EventEmitter(), {
+        connect: () => new Promise<void>(() => {}),
+        close: () => Promise.resolve(),
+      }) as unknown as Connection;
+    const manager = new ConnectionManager(testConfig(0), db, bus, "test", 50, neverConnects);
+    try {
+      const bleOne = manager.store.createRadioProfile({ name: "BLE One", connection: "ble", bleAddress: "aa:aa:aa:aa:aa:aa" });
+      const bleTwo = manager.store.createRadioProfile({ name: "BLE Two", connection: "ble", bleAddress: "bb:bb:bb:bb:bb:bb" });
+
+      const activatingFirst = manager.activateProfile(bleOne.id); // starts connecting, never resolves on its own
+      await expect(manager.activateProfile(bleTwo.id)).rejects.toThrow(/BLE radio connection is already active/);
+
+      await manager.stop(); // aborts the still-pending first connect so its promise settles
+      await activatingFirst;
+    } finally {
+      db.close();
+    }
+  });
+});
