@@ -590,7 +590,7 @@ onMounted(() => {
         <span>
           <small>Link state</small>
           <strong>
-            {{ store.connectionState }}<template v-if="store.connectedLinkCount > 1"> · {{ store.connectedLinkCount }} radios</template>
+            {{ store.connectionState === "error" ? "Needs attention" : store.connectionState }}<template v-if="store.connectedLinkCount > 1"> · {{ store.connectedLinkCount }} radios</template>
           </strong>
         </span>
       </div>

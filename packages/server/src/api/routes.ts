@@ -20,7 +20,7 @@ import type { Auth } from "./auth.js";
 import type { Db } from "../db/index.js";
 import type { ServerConfig } from "../config.js";
 import { csvHeaderRow, messageToCsvRow } from "./export.js";
-import { buildDiagnostics, buildSupportBundle } from "./diagnostics.js";
+import { buildDiagnostics, buildSupportBundle, recentDiagnosticLogs } from "./diagnostics.js";
 import {
   ingestContactSchema,
   ingestContacts,
@@ -171,6 +171,15 @@ export function buildApi(
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       res.setHeader("Content-Disposition", `attachment; filename="meshkeep-diagnostics-${stamp}.json"`);
       res.json(bundle);
+    }),
+  );
+  // Logs can contain operational detail, so keep the interactive viewer
+  // session-only just like the downloadable support bundle.
+  api.get(
+    "/diagnostics/logs",
+    auth.sessionGuard,
+    handle((_req, res) => {
+      res.json({ logs: recentDiagnosticLogs() });
     }),
   );
 

@@ -1,6 +1,12 @@
+import { timingSafeEqual } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import request from "supertest";
 import { Auth } from "../src/api/auth.js";
+
+vi.mock("node:crypto", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:crypto")>();
+  return { ...actual, timingSafeEqual: vi.fn(actual.timingSafeEqual) };
+});
 import { openDb } from "../src/db/index.js";
 import { buildHarness } from "./helpers.js";
 
@@ -36,6 +42,21 @@ describe("auth: password mode", () => {
 
   it("rejects a wrong password", async () => {
     await request(app).post("/api/v1/auth/login").send({ password: "nope" }).expect(401);
+  });
+
+  it("compares fixed-length hashes when a password has the wrong length", () => {
+    const db = openDb(":memory:");
+    const auth = new Auth(db, "hunter2-swordfish");
+    const req = { headers: {}, ip: "127.0.0.1" };
+    const res = { setHeader: vi.fn() };
+    vi.mocked(timingSafeEqual).mockClear();
+
+    expect(auth.login("x", req as never, res as never)).toBe("invalid");
+    expect(timingSafeEqual).toHaveBeenCalledTimes(1);
+    const [expectedHash, givenHash] = vi.mocked(timingSafeEqual).mock.calls[0]!;
+    expect(expectedHash).toHaveLength(32);
+    expect(givenHash).toHaveLength(32);
+    db.close();
   });
 
   it("logs in and sets a hardened session cookie", async () => {
@@ -138,7 +159,7 @@ describe("auth: API tokens", () => {
       .expect(401);
   });
 
-  it("serves the diagnostics bundle to a session but never to a bearer token", async () => {
+  it("serves diagnostic logs and bundles to a session but never to a bearer token", async () => {
     const cookie = await authed();
     const created = await request(app)
       .post("/api/v1/tokens")
@@ -148,11 +169,16 @@ describe("auth: API tokens", () => {
 
     // a session cookie may download the bundle
     await request(app).get("/api/v1/diagnostics/bundle").set("Cookie", cookie).expect(200);
+    await request(app).get("/api/v1/diagnostics/logs").set("Cookie", cookie).expect(200);
     // a valid bearer token can read plain diagnostics…
     await request(app).get("/api/v1/diagnostics").set("Authorization", `Bearer ${created.body.token}`).expect(200);
     // …but is refused the config/log-bearing bundle (session-only)
     await request(app)
       .get("/api/v1/diagnostics/bundle")
+      .set("Authorization", `Bearer ${created.body.token}`)
+      .expect(403);
+    await request(app)
+      .get("/api/v1/diagnostics/logs")
       .set("Authorization", `Bearer ${created.body.token}`)
       .expect(403);
   });

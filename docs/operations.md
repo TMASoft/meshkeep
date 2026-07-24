@@ -22,7 +22,7 @@ Tags move; digests do not. For reproducible deploys, pin by digest:
 
 ```sh
 # resolve the digest behind a version tag
-docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.4 \
+docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.12 \
   --format '{{ .Manifest.Digest }}'
 ```
 
@@ -36,7 +36,7 @@ pin it for anything you want to stay put.
 cosign verify \
   --certificate-identity-regexp '^https://github.com/TMASoft/meshkeep/.github/workflows/release.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/tmasoft/meshkeep:0.1.4-beta.4
+  ghcr.io/tmasoft/meshkeep:0.1.4-beta.12
 ```
 
 A valid signature prints the verified certificate identity. Treat a verification
@@ -45,9 +45,9 @@ failure as a supply-chain red flag — do not deploy.
 ### Inspect the SBOM and provenance
 
 ```sh
-docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.4 \
+docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.12 \
   --format '{{ json .SBOM }}'
-docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.4 \
+docker buildx imagetools inspect ghcr.io/tmasoft/meshkeep:0.1.4-beta.12 \
   --format '{{ json .Provenance }}'
 ```
 
@@ -103,6 +103,9 @@ healthcheck:
   an API token cannot fetch it. The UI password is redacted (reported only as
   `uiPasswordSet: true|false`) and secret-shaped log fields are masked. Attach
   this to a bug report.
+- `GET /api/v1/diagnostics/logs` — recent redacted structured events for the
+  Diagnostics page. This is also **session-only**; bearer tokens are refused.
+  The page displays the latest 100 entries and supports manual refresh.
 
 Set `MESHKEEP_LOG_LEVEL` (`debug`/`info`/`warn`/`error`, default `info`) to
 control how much is written to stdout. The in-memory ring buffer that feeds the
@@ -148,10 +151,12 @@ Back up to a different filesystem and verify a restore periodically (see below).
 
 ## Migrations, upgrades, and rollback
 
-- Migrations are numbered and applied **in a transaction each**, bumping
-  `PRAGMA user_version`. An interrupted upgrade leaves `user_version` at the last
-  fully-applied step; the next start re-runs from there. `readyz` stays `503`
-  until `user_version` equals the build's latest migration.
+- Migrations are numbered and applied **in a transaction each**, re-checking
+  `PRAGMA user_version` inside every transaction before applying a step. This
+  makes simultaneous container starts safe: a process skips a step another
+  process already committed. An interrupted upgrade leaves `user_version` at
+  the last fully-applied step; the next start re-runs from there. `readyz` stays
+  `503` until `user_version` equals the build's latest migration.
 - **Forward compatibility:** a newer build applies any missing migrations on
   start. No manual step is required.
 - **Rollback is not automatic.** Migrations have no down-scripts, so a database

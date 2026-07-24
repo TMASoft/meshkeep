@@ -51,8 +51,12 @@ describe("describeConnectError", () => {
     expect(closed).toContain("bluetoothd");
   });
 
-  it("passes unknown BLE errors and non-BLE transports through", () => {
-    expect(describeConnectError("ble", "le-connection-abort-by-local")).toBe("le-connection-abort-by-local");
+  it("explains a local Bluetooth connection abort and preserves unknown errors", () => {
+    const localAbort = describeConnectError("ble", "le-connection-abort-by-local");
+    expect(localAbort).toContain("Bluetooth adapter ended the connection");
+    expect(localAbort).toContain("MeshKeep will retry");
+    expect(localAbort).toContain("move the radio closer");
+    expect(describeConnectError("ble", "unexpected GATT failure")).toBe("unexpected GATT failure");
     expect(describeConnectError("serial", "operation timed out")).toBe("operation timed out");
   });
 });

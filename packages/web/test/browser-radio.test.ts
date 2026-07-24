@@ -346,6 +346,32 @@ describe("message flow", () => {
 });
 
 describe("offline queue", () => {
+  it("replays a queued sync-back when the server recovers during the same session", async () => {
+    const h = harness({ postFails: true });
+    await h.source.start();
+    await h.source.sendChannelMessage(1, "offline channel");
+
+    expect(h.queue.entries.some((entry) => entry.kind === "messages")).toBe(true);
+    h.postIngest.mockImplementation(async (kind: string, payload: unknown) => {
+      h.posts.push({ kind, payload });
+      if (kind === "messages") {
+        const { messages } = payload as { messages: unknown[] };
+        return { messages: messages.map((item, i) => ({ ...(item as object), id: 100 + i })) };
+      }
+      return {};
+    });
+
+    await (h.source as unknown as { flushQueue(): Promise<void> }).flushQueue();
+    expect(h.queue.entries).toHaveLength(0);
+    expect(h.posts).toContainEqual(
+      expect.objectContaining({
+        kind: "messages",
+        payload: expect.objectContaining({ radioKey: "ab" }),
+      }),
+    );
+    await h.source.stop();
+  });
+
   it("buffers sync-backs while the server is unreachable, then flushes", async () => {
     const failing = harness({ postFails: true });
     await failing.source.start();

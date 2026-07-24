@@ -8,15 +8,8 @@
  * caller responsibility.
  */
 
-export type LogLevel = "debug" | "info" | "warn" | "error";
-
-export interface LogEntry {
-  ts: number;
-  level: LogLevel;
-  scope: string;
-  event: string;
-  fields?: Record<string, unknown>;
-}
+export type LogLevel = DiagnosticLogEntry["level"];
+export type LogEntry = DiagnosticLogEntry;
 
 const LEVEL_ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
@@ -75,7 +68,8 @@ export class Logger {
 
   private log(level: LogLevel, event: string, fields?: Record<string, unknown>): void {
     const entry: LogEntry = { ts: Date.now(), level, scope: this.scope, event };
-    if (fields && Object.keys(fields).length > 0) entry.fields = fields;
+    // Keep history stable when callers reuse and later mutate their fields object.
+    if (fields && Object.keys(fields).length > 0) entry.fields = { ...fields };
     ring.push(entry);
     if (LEVEL_ORDER[level] < LEVEL_ORDER[minLevel]) return;
     const line = JSON.stringify(entry);
@@ -113,3 +107,4 @@ export function redactFields(fields: Record<string, unknown>): Record<string, un
 export function sanitizeLogs(entries: LogEntry[]): LogEntry[] {
   return entries.map((entry) => (entry.fields ? { ...entry, fields: redactFields(entry.fields) } : entry));
 }
+import type { DiagnosticLogEntry } from "@meshkeep/shared";

@@ -210,6 +210,15 @@ export interface ServerDiagnostics {
   guidance: string[];
 }
 
+/** A secret-free structured event displayed in the authenticated diagnostics UI. */
+export interface DiagnosticLogEntry {
+  ts: number;
+  level: "debug" | "info" | "warn" | "error";
+  scope: string;
+  event: string;
+  fields?: Record<string, unknown>;
+}
+
 /** Remote node stats returned by a repeater/room server status request. */
 export interface NodeStats {
   battMilliVolts: number;

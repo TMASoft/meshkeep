@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import request from "supertest";
 import { buildHarness } from "./helpers.js";
+import { clearLogs, logger } from "../src/logger.js";
 
 const KEY_A = "a".repeat(64);
 const KEY_B = "b".repeat(64);
@@ -61,6 +62,15 @@ describe("http: diagnostics", () => {
     expect(res.body.config.uiPasswordSet).toBe(false);
     expect(res.body.diagnostics.server.version).toBe("test");
     expect(Array.isArray(res.body.logs)).toBe(true);
+  });
+
+  it("returns sanitized recent logs for the diagnostics viewer", async () => {
+    clearLogs();
+    logger("radio").warn("connection-failed", { token: "secret-token", attempt: 2 });
+    const res = await request(app).get("/api/v1/diagnostics/logs").expect(200);
+    expect(res.body.logs).toEqual([
+      expect.objectContaining({ scope: "radio", event: "connection-failed", fields: { token: "[redacted]", attempt: 2 } }),
+    ]);
   });
 });
 

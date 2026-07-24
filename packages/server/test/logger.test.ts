@@ -14,6 +14,13 @@ describe("logger ring buffer", () => {
     expect(typeof entry!.ts).toBe("number");
   });
 
+  it("isolates buffered fields from later caller mutation", () => {
+    const fields = { attempt: 1 };
+    logger("radio").info("reconnect-scheduled", fields);
+    fields.attempt = 2;
+    expect(recentLogs()[0]!.fields).toEqual({ attempt: 1 });
+  });
+
   it("retains entries regardless of the emit level threshold", () => {
     setLogLevel("error"); // debug/info are not written to stdout…
     logger("api").debug("quiet");

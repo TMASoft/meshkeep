@@ -15,6 +15,43 @@ function openAtVersion(path: string, version: number): Database.Database {
 }
 
 describe("database migrations", () => {
+  it("rechecks the schema version after a concurrent startup migrates the database", () => {
+    const directory = mkdtempSync(join(tmpdir(), "meshkeep-db-"));
+    const path = join(directory, "meshkeep.db");
+    const originalTransaction = Database.prototype.transaction;
+    let rivalStarted = false;
+
+    // Make the rival complete its startup after this instance has reached
+    // migrate(), but before this instance begins its first transaction.
+    Object.defineProperty(Database.prototype, "transaction", {
+      configurable: true,
+      value: function (this: Database.Database, ...args: Parameters<typeof originalTransaction>) {
+        if (!rivalStarted) {
+          rivalStarted = true;
+          const rival = openDb(path);
+          rival.close();
+        }
+        return originalTransaction.apply(this, args);
+      },
+    });
+
+    try {
+      expect(() => {
+        const db = openDb(path);
+        db.close();
+      }).not.toThrow();
+      const migrated = new Database(path);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(MIGRATIONS.length);
+      migrated.close();
+    } finally {
+      Object.defineProperty(Database.prototype, "transaction", {
+        configurable: true,
+        value: originalTransaction,
+      });
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("separates legacy sender prefixes without changing known full keys", () => {
     const directory = mkdtempSync(join(tmpdir(), "meshkeep-db-"));
     const path = join(directory, "meshkeep.db");

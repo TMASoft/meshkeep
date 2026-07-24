@@ -79,9 +79,9 @@ export class Auth {
       console.warn(`[auth] login throttled for ${client}`);
       return "throttled";
     }
-    const expected = Buffer.from(this.uiPassword);
-    const given = Buffer.from(password);
-    if (expected.length !== given.length || !timingSafeEqual(expected, given)) {
+    const expectedHash = createHash("sha256").update(this.uiPassword).digest();
+    const givenHash = createHash("sha256").update(password).digest();
+    if (!timingSafeEqual(expectedHash, givenHash)) {
       this.recordFailure(client);
       console.warn(`[auth] failed login from ${client}`);
       return "invalid";

@@ -9,6 +9,7 @@ import { Store } from "../src/db/store.js";
 import { openDb, type Db } from "../src/db/index.js";
 import { Bus } from "../src/bus.js";
 import type { ServerConfig } from "../src/config.js";
+import { clearLogs, recentLogs, setLogLevel } from "../src/logger.js";
 
 /** White-box access to the one link Stage 3a ever runs, keyed by profile id (null = default). */
 interface LinkInternals {
@@ -745,6 +746,8 @@ describe("connection lifecycle races", () => {
     await manager?.stop();
     db?.close();
     vi.useRealTimers();
+    clearLogs();
+    setLogLevel("info");
   });
 
   it("treats configuration errors as permanent and suppresses reconnect until settings change", async () => {
@@ -838,6 +841,26 @@ describe("connection lifecycle races", () => {
 
     expect(connect).toHaveBeenCalledOnce();
     expect(manager.getState()).toBe("standby");
+  });
+
+  it("buffers connection failures and scheduled retries for diagnostics", async () => {
+    vi.useFakeTimers();
+    setLogLevel("error");
+    const connection = Object.assign(new EventEmitter(), {
+      connect: vi.fn().mockRejectedValue(new Error("offline")),
+      close: vi.fn().mockResolvedValue(undefined),
+    }) as unknown as Connection;
+    db = openDb(":memory:");
+    manager = new ConnectionManager(testConfig(1), db, new Bus(), "test", 50, () => connection);
+
+    await manager.start();
+
+    expect(recentLogs()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ scope: "radio", event: "connection-failed", fields: expect.objectContaining({ error: "offline" }) }),
+        expect.objectContaining({ scope: "radio", event: "reconnect-scheduled", fields: expect.objectContaining({ delayMs: 2_000 }) }),
+      ]),
+    );
   });
 
   it("tears down a dropped link before creating a fresh transport for reconnect", async () => {

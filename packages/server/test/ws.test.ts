@@ -114,6 +114,16 @@ describe("websocket endpoint", () => {
     ws.terminate();
   });
 
+  it("removes its HTTP upgrade listener when the WebSocket server closes", async () => {
+    const ctx = await wsHarness(null);
+    server = ctx.server;
+    expect(ctx.server.listenerCount("upgrade")).toBe(1);
+
+    await new Promise<void>((resolve) => ctx.wss.close(() => resolve()));
+
+    expect(ctx.server.listenerCount("upgrade")).toBe(0);
+  });
+
   it("fans bus events out to connected clients", async () => {
     const ctx = await wsHarness(null);
     server = ctx.server;

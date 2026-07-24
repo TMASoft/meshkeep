@@ -189,7 +189,9 @@ With a real radio: `MESHKEEP_CONNECTION=serial MESHKEEP_SERIAL_PORT=/dev/ttyACM0
 - Liveness `GET /api/healthz`, readiness `GET /api/readyz` (503 until the schema
   is migrated) — both outside the authenticated API for orchestrator probes.
 - The **Health** tab (and `GET /api/v1/diagnostics`) shows transport, firmware,
-  database, and map diagnostics; download a redacted support bundle from there.
+  database, and map diagnostics plus the latest redacted server lifecycle logs;
+  download a redacted support bundle from there. The log viewer and bundle are
+  available to browser sessions only, never bearer tokens.
 - Backup, restore, upgrade/rollback, integrity checks, and write-contention
   behavior are documented in [`docs/operations.md`](docs/operations.md).
 - Released images are multi-arch, cosign-signed, and carry SBOM + SLSA provenance

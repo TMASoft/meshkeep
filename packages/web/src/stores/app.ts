@@ -5,6 +5,7 @@ import type {
   ConnectionState,
   Contact,
   ConversationUnread,
+  DiagnosticLogEntry,
   LinkStatus,
   Message,
   MessageSearchResult,
@@ -499,6 +500,12 @@ export const useAppStore = defineStore("app", {
     /** Aggregated, secret-free server diagnostics for the diagnostics page. */
     async fetchDiagnostics(): Promise<ServerDiagnostics> {
       return await api<ServerDiagnostics>("/diagnostics");
+    },
+
+    /** Session-only, secret-free server logs for the diagnostics page. */
+    async fetchDiagnosticLogs(): Promise<DiagnosticLogEntry[]> {
+      const { logs } = await api<{ logs: DiagnosticLogEntry[] }>("/diagnostics/logs");
+      return logs;
     },
 
     async fetchTelemetry(contactKey: string): Promise<SensorReading[]> {

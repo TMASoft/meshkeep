@@ -95,6 +95,7 @@ export class BrowserRadioSource {
   private constants: typeof import("@liamcottle/meshcore.js/src/constants.js")["default"] | null = null;
   private bufferUtils: typeof import("@liamcottle/meshcore.js/src/buffer_utils.js")["default"] | null = null;
   private releaseLock: (() => void) | null = null;
+  private radioKey: string | null = null;
   private contacts: Contact[] = [];
   private pendingAck: PendingAck | null = null;
   private directSendQueue: Promise<void> = Promise.resolve();
@@ -245,6 +246,7 @@ export class BrowserRadioSource {
       // older firmware; not fatal
     }
     const self = selfInfoFromRaw(rawSelf, device);
+    this.radioKey = self.publicKey.toLowerCase();
     this.callbacks.onSelf(self);
     if (!this.privateSession) {
       await this.postOrQueue("self", { self });
@@ -306,7 +308,7 @@ export class BrowserRadioSource {
    */
   private async ingestIncoming(items: IngestItem[]): Promise<void> {
     try {
-      const result = await this.deps.postIngest("messages", { messages: items });
+      const result = await this.postIngest("messages", { messages: items });
       this.reportIngestResult("messages", result);
     } catch {
       for (const item of items) this.callbacks.onLocalMessage(this.toLocalMessage(item));
@@ -416,7 +418,7 @@ export class BrowserRadioSource {
   private async recordOutgoing(item: IngestItem): Promise<Message> {
     if (!this.privateSession) {
       try {
-        const result = (await this.deps.postIngest("messages", { messages: [item] })) as { messages: Message[] };
+        const result = (await this.postIngest("messages", { messages: [item] })) as { messages: Message[] };
         this.reportIngestResult("messages", result);
         if (result.messages[0]) return result.messages[0];
       } catch {
@@ -505,7 +507,7 @@ export class BrowserRadioSource {
 
   private async postOrQueue(kind: QueueEntry["kind"], payload: unknown): Promise<void> {
     try {
-      const result = await this.deps.postIngest(kind, payload);
+      const result = await this.postIngest(kind, payload);
       this.reportIngestResult(kind, result);
     } catch {
       await this.deps.queue.put({ kind, payload });
@@ -515,9 +517,17 @@ export class BrowserRadioSource {
   /** Replay queued sync-backs (server was unreachable when they happened). */
   private async flushQueue(): Promise<void> {
     await flushQueueOnce(this.deps.queue, async (kind, payload) => {
-      const result = await this.deps.postIngest(kind, payload);
+      const result = await this.postIngest(kind, payload);
       this.reportIngestResult(kind, result);
     });
+  }
+
+  /** The server scopes browser sync-backs to the radio that produced them. */
+  private postIngest(kind: QueueEntry["kind"], payload: unknown): Promise<unknown> {
+    if ((kind === "contacts" || kind === "messages") && this.radioKey && payload && typeof payload === "object") {
+      return this.deps.postIngest(kind, { ...payload, radioKey: this.radioKey });
+    }
+    return this.deps.postIngest(kind, payload);
   }
 
   private reportIngestResult(kind: QueueEntry["kind"], result: unknown): void {

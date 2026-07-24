@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
-import type { ServerDiagnostics } from "@meshkeep/shared";
+import { computed, onMounted, ref } from "vue";
+import type { DiagnosticLogEntry, ServerDiagnostics } from "@meshkeep/shared";
 import { useAppStore } from "../stores/app";
 import AppIcon from "../components/AppIcon.vue";
 
 const store = useAppStore();
 const diagnostics = ref<ServerDiagnostics | null>(null);
+const logs = ref<DiagnosticLogEntry[]>([]);
 const state = ref<"loading" | "ready" | "error">("loading");
 const errorText = ref<string | null>(null);
 
@@ -13,7 +14,9 @@ async function load() {
   state.value = "loading";
   errorText.value = null;
   try {
-    diagnostics.value = await store.fetchDiagnostics();
+    const [snapshot, entries] = await Promise.all([store.fetchDiagnostics(), store.fetchDiagnosticLogs()]);
+    diagnostics.value = snapshot;
+    logs.value = entries;
     state.value = "ready";
   } catch (error) {
     errorText.value = error instanceof Error ? error.message : "Failed to load diagnostics";
@@ -54,6 +57,24 @@ function fmtMhz(hz: number | null): string {
 
 function fmtKhz(hz: number | null): string {
   return hz ? `${(hz / 1000).toFixed(0)} kHz` : "—";
+}
+
+const visibleLogs = computed(() => logs.value.slice(-100).reverse());
+
+function connectionLabel(state: string): string {
+  return state === "error" ? "Needs attention" : state;
+}
+
+function fmtLogTime(milliseconds: number): string {
+  return new Date(milliseconds).toLocaleString();
+}
+
+function fmtLogFields(fields: Record<string, unknown> | undefined): string {
+  if (!fields) return "";
+  const text = Object.entries(fields)
+    .map(([key, value]) => `${key}=${typeof value === "string" ? value : JSON.stringify(value)}`)
+    .join(" · ");
+  return text.length > 240 ? `${text.slice(0, 237)}...` : text;
 }
 </script>
 
@@ -99,7 +120,7 @@ function fmtKhz(hz: number | null): string {
       <section class="module">
         <div class="module-heading"><div><AppIcon name="radio" :size="16" /><h2>Connection</h2></div></div>
         <dl class="spec">
-          <div><dt>State</dt><dd class="capitalize">{{ diagnostics.connection.state }}</dd></div>
+          <div><dt>State</dt><dd class="capitalize">{{ connectionLabel(diagnostics.connection.state) }}</dd></div>
           <div><dt>Transport</dt><dd>{{ diagnostics.connection.transport }}</dd></div>
           <div><dt>Target</dt><dd>{{ diagnostics.connection.target ?? "—" }}</dd></div>
           <div><dt>Connected</dt><dd>{{ fmtTime(diagnostics.connection.connectedAt) }}</dd></div>
@@ -173,6 +194,20 @@ function fmtKhz(hz: number | null): string {
           </div>
         </dl>
       </section>
+
+      <section class="module logs-module">
+        <div class="module-heading"><div><AppIcon name="signal" :size="16" /><h2>Recent server logs</h2></div></div>
+        <p class="logs-note">Latest {{ visibleLogs.length }} of {{ logs.length }} secret-free structured events from this server session.</p>
+        <div v-if="visibleLogs.length" class="log-list" aria-label="Recent server logs">
+          <article v-for="entry in visibleLogs" :key="`${entry.ts}-${entry.scope}-${entry.event}`" class="log-entry">
+            <time :datetime="new Date(entry.ts).toISOString()">{{ fmtLogTime(entry.ts) }}</time>
+            <span class="log-level" :class="entry.level">{{ entry.level }}</span>
+            <strong>{{ entry.scope }} · {{ entry.event }}</strong>
+            <span v-if="entry.fields" class="log-fields">{{ fmtLogFields(entry.fields) }}</span>
+          </article>
+        </div>
+        <p v-else class="logs-empty">No server events have been captured yet.</p>
+      </section>
     </div>
   </div>
 </template>
@@ -197,6 +232,17 @@ function fmtKhz(hz: number | null): string {
 .module-heading { display: flex; min-height: 52px; align-items: center; border-bottom: 1px solid var(--border); padding: 0 18px; }
 .module-heading > div { display: flex; align-items: center; gap: 9px; color: var(--text-muted); }
 .module-heading h2 { margin: 0; color: var(--text); font-size: 14px; font-weight: 680; }
+.logs-module { grid-column: 1 / -1; }
+.logs-note, .logs-empty { margin: 0; padding: 12px 18px; color: var(--text-muted); font-size: 11px; }
+.log-list { max-height: 420px; overflow: auto; padding: 0 18px 12px; }
+.log-entry { display: grid; grid-template-columns: 152px 52px minmax(145px, auto) minmax(200px, 1fr); gap: 10px; align-items: baseline; border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent); padding: 8px 0; font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px; line-height: 1.45; }
+.log-entry time, .log-fields { color: var(--text-faint); overflow-wrap: anywhere; }
+.log-entry strong { color: var(--text); font-weight: 650; }
+.log-level { font-size: 9px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.log-level.debug { color: var(--text-faint); }
+.log-level.info { color: var(--cyan); }
+.log-level.warn { color: var(--amber); }
+.log-level.error { color: var(--danger); }
 .spec { display: grid; margin: 0; padding: 8px 18px 16px; }
 .spec > div { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 7px 0; border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent); }
 .spec > div:last-child { border-bottom: 0; }
@@ -212,5 +258,7 @@ function fmtKhz(hz: number | null): string {
 @media (max-width: 720px) {
   .page-heading { flex-direction: column; align-items: flex-start; }
   .diag-grid { grid-template-columns: 1fr; }
+  .log-entry { grid-template-columns: 1fr auto; }
+  .log-entry strong, .log-fields { grid-column: 1 / -1; }
 }
 </style>

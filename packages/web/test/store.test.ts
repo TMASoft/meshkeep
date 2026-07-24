@@ -242,6 +242,14 @@ describe("diagnostics fetch", () => {
     expect(apiMock).toHaveBeenCalledWith("/diagnostics");
     expect(result).toBe(payload);
   });
+
+  it("requests session-only diagnostic logs", async () => {
+    const logs = [{ ts: 1, level: "warn" as const, scope: "radio", event: "reconnect-scheduled" }];
+    apiMock.mockResolvedValueOnce({ logs });
+    const store = useAppStore();
+    await expect(store.fetchDiagnosticLogs()).resolves.toEqual(logs);
+    expect(apiMock).toHaveBeenCalledWith("/diagnostics/logs");
+  });
 });
 
 describe("battery display follows the active radio driver", () => {

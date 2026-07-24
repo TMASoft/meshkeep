@@ -390,11 +390,13 @@ export function databaseDiagnostics(db: Db): DatabaseDiagnostics {
 }
 
 function migrate(db: Db): void {
-  const current = db.pragma("user_version", { simple: true }) as number;
-  for (let version = current; version < MIGRATIONS.length; version++) {
+  for (let version = 0; version < MIGRATIONS.length; version++) {
     const apply = db.transaction(() => {
-      db.exec(MIGRATIONS[version]);
-      db.pragma(`user_version = ${version + 1}`);
+      const current = db.pragma("user_version", { simple: true }) as number;
+      if (current <= version) {
+        db.exec(MIGRATIONS[version]);
+        db.pragma(`user_version = ${version + 1}`);
+      }
     });
     apply();
   }

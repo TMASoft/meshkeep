@@ -1,9 +1,9 @@
-import type { ServerDiagnostics } from "@meshkeep/shared";
+import type { DiagnosticLogEntry, ServerDiagnostics } from "@meshkeep/shared";
 import { databaseDiagnostics, type Db } from "../db/index.js";
 import type { ConnectionManager } from "../radio/manager.js";
 import type { MapCache } from "../map/cache.js";
 import type { ServerConfig } from "../config.js";
-import { recentLogs, sanitizeLogs, type LogEntry } from "../logger.js";
+import { recentLogs, sanitizeLogs } from "../logger.js";
 
 /**
  * Assemble a secret-free diagnostics snapshot: transport/reconnect, firmware,
@@ -82,7 +82,12 @@ export interface SupportBundle {
   /** Effective configuration with secrets redacted (uiPassword → uiPasswordSet). */
   config: Record<string, unknown>;
   /** Recent structured logs with secret-shaped fields redacted. */
-  logs: LogEntry[];
+  logs: DiagnosticLogEntry[];
+}
+
+/** Recent secret-free logs for the interactive diagnostics page. */
+export function recentDiagnosticLogs(): DiagnosticLogEntry[] {
+  return sanitizeLogs(recentLogs());
 }
 
 /** Effective config for the bundle with the UI password replaced by a boolean. */
@@ -107,6 +112,6 @@ export function buildSupportBundle(
     generatedAt: Math.floor(Date.now() / 1000),
     diagnostics: buildDiagnostics(manager, db, mapCache, config, version),
     config: redactedConfig(config),
-    logs: sanitizeLogs(recentLogs()),
+    logs: recentDiagnosticLogs(),
   };
 }

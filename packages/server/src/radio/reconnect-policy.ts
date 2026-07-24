@@ -75,5 +75,8 @@ export function describeConnectError(transport: ConnectionTransport, message: st
   if (/operation timed out|device not found|timed out connecting/i.test(message)) {
     return `radio not found (${message}) — is it powered, in range, and not claimed by another client?`;
   }
+  if (/le-connection-abort-by-local/i.test(message)) {
+    return "Bluetooth adapter ended the connection (le-connection-abort-by-local) — MeshKeep will retry; move the radio closer to this computer and close other Bluetooth clients";
+  }
   return message;
 }

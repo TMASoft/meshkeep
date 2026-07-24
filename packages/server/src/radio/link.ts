@@ -14,6 +14,7 @@ import type { ServerConfig } from "../config.js";
 import type { Bus } from "../bus.js";
 import type { Db } from "../db/index.js";
 import { Store, type OutboundEntry } from "../db/store.js";
+import { logger } from "../logger.js";
 import { createConnection } from "./transports.js";
 import { describeConnectError, nextReconnectDelay, reconnectPolicyFor, validateConnectionSettings } from "./reconnect-policy.js";
 
@@ -31,6 +32,7 @@ const OUTBOUND_MIN_BACKOFF_MS = 3_000;
 const OUTBOUND_MAX_BACKOFF_MS = 120_000;
 // Idle re-check ceiling so the worker periodically re-evaluates due entries.
 const OUTBOUND_TIMER_CAP_MS = 60_000;
+const log = logger("radio");
 
 const nowSecs = () => Math.floor(Date.now() / 1000);
 
@@ -325,14 +327,14 @@ export class RadioLink {
       if (configError) {
         // permanent: retrying cannot fix configuration — surface it and stay
         // put until the settings change (override, claim, or restart)
-        console.error(`[radio:${this.label}] configuration error: ${configError}`);
+        log.error("configuration-error", { label: this.label, transport: effective.connection, error: configError });
         this.setState("error", `configuration error: ${configError}`);
         return;
       }
       if (effective.connection === "ble") {
         const conflict = this.beforeConnect?.();
         if (conflict) {
-          console.warn(`[radio:${this.label}] ${conflict}`);
+          log.warn("connection-conflict", { label: this.label, transport: effective.connection, error: conflict });
           this.setState("error", conflict);
           this.scheduleReconnect();
           return;
@@ -371,6 +373,7 @@ export class RadioLink {
       this.connectedAt = Math.floor(Date.now() / 1000);
       this.reconnectDelay = 0;
       this.setState("connected", null);
+      log.info("connected", { label: this.label, transport: effective.connection });
 
       // Drain anything that queued while we were away (offline sends, backoffs).
       void this.processOutboundQueue();
@@ -382,7 +385,7 @@ export class RadioLink {
       if (error instanceof LifecycleCancelledError || !connection || !this.isCurrent(connection, generation)) return;
       const raw = error instanceof Error ? error.message : String(error ?? "connect failed");
       const message = describeConnectError(this.getEffectiveSettings().connection, raw);
-      console.error(`[radio:${this.label}] connect failed: ${message}`);
+      log.error("connection-failed", { label: this.label, transport: this.getEffectiveSettings().connection, error: message });
       await this.teardown();
       this.setState("error", message);
       this.scheduleReconnect();
@@ -394,7 +397,7 @@ export class RadioLink {
     const policy = reconnectPolicyFor(this.getEffectiveSettings().connection);
     const delay = Math.max(this.reconnectDelay, policy.minDelayMs);
     this.reconnectDelay = nextReconnectDelay(delay, policy);
-    console.log(`[radio:${this.label}] reconnecting in ${Math.round(delay / 1000)}s`);
+    log.info("reconnect-scheduled", { label: this.label, transport: this.getEffectiveSettings().connection, delayMs: delay });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       void this.connect();
@@ -404,7 +407,7 @@ export class RadioLink {
   private attachListeners(connection: Connection, generation = this.lifecycleGeneration): void {
     connection.on("disconnected", () => {
       if (!this.isCurrent(connection, generation)) return;
-      console.log(`[radio:${this.label}] disconnected`);
+      log.warn("disconnected", { label: this.label, transport: this.getEffectiveSettings().connection });
       void this.teardown().then(() => {
         if (!this.stopped && !this.standby) {
           this.setState("error", "connection lost");

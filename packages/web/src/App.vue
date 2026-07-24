@@ -181,6 +181,8 @@ const stateColor = computed(() => {
       return "offline";
   }
 });
+
+const connectionLabel = computed(() => (store.connectionState === "error" ? "Needs attention" : store.connectionState));
 </script>
 
 <template>
@@ -262,10 +264,10 @@ const stateColor = computed(() => {
             :title="store.status?.connection.lastError ?? ''"
           >
             <span class="state-light" :class="stateColor" />
-            <span class="capitalize">{{ store.connectionState }}</span>
+            <span class="capitalize">{{ connectionLabel }}</span>
           </div>
           <span class="sr-only" aria-live="polite">
-            Radio {{ store.connectionState }}{{ store.status?.connection.lastError ? `: ${store.status.connection.lastError}` : "" }}
+            Radio {{ connectionLabel }}{{ store.status?.connection.lastError ? `: ${store.status.connection.lastError}` : "" }}
           </span>
           <button
             class="mobile-appearance appearance-toggle"
