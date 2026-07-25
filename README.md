@@ -11,7 +11,8 @@ your recent mesh messages and node status on the launcher dashboard.
 ## Features
 
 - **Responsive interface** — field-ready desktop and mobile layouts with light/dark themes and adjustable density
-- **Comms** — direct messages and channels, delivery acks, unread counts, live updates over WebSocket
+- **Comms** — direct messages and channels, delivery acks, unread counts, live updates over
+  WebSocket, per-conversation mute and archive
 - **Channels** — create, join (paste a shared key), and edit encrypted group channels in-app
 - **Room servers & repeaters** — password login, room posts, repeater status readout, and a
   remote CLI console (message a repeater to send CLI commands, like the official app)
@@ -63,12 +64,16 @@ Both values are host-specific — the checked-in file ships placeholders. Copies
 
 - **Comms** contains channels and direct-message contacts. On phones, selecting a conversation
   opens a dedicated thread; use the back control to return to the conversation list. The ⓘ
-  control in a thread shows contact details with share-link, route-reset, CSV-export, and
-  remove actions; the + control above **Contacts** imports a `meshcore://` link, and the +
-  above **Channels** creates or joins a channel (pick a slot, name it, and generate a fresh
-  secret or paste one you were given — copy a channel's secret from its ⓘ panel to invite
-  others). For room servers and repeaters, ⓘ also holds the password login and a live
+  control in a thread shows contact details with share-link, route-reset, CSV-export, mute,
+  archive, and remove actions; the + control above **Contacts** imports a `meshcore://` link,
+  and the + above **Channels** creates or joins a channel (pick a slot, name it, and generate
+  a fresh secret or paste one you were given — copy a channel's secret from its ⓘ panel to
+  invite others). For room servers and repeaters, ⓘ also holds the password login and a live
   status readout; messages you type to a **repeater** are sent as remote CLI commands.
+  Muting a conversation keeps its unread count but skips notifications; archiving moves it out
+  of the main list into a collapsed **Archived** section. Both are per-conversation, per-browser
+  preferences (saved to `localStorage`, keyed by radio for channels and by public key for
+  contacts) and survive contact renames, removals, and re-adds.
 - **Network** plots this node and positioned contacts over the cached global MeshCore map.
 - **Radio** shows companion hardware and link status, edits node settings and RF parameters,
   charts battery history, sends adverts, shares this node as a `meshcore://` link, edits the

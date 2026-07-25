@@ -18,6 +18,12 @@ import type {
 import { api, ApiError, connectEvents, type WsStatus } from "../api/client";
 import { BrowserRadioSource, type BrowserRadioKind } from "../sources/browser-radio";
 import { notifyIncoming } from "../notifications";
+import {
+  conversationPreferenceKey,
+  savedConversationPreferences,
+  saveConversationPreferences,
+  type ConversationPreference,
+} from "../conversation-preferences";
 
 // lives outside the store: holds a live connection object, must not be reactive
 let browserSource: BrowserRadioSource | null = null;
@@ -116,6 +122,10 @@ export const useAppStore = defineStore("app", {
     // (connected) radio; a pinned id lets the user read another radio's history.
     viewingRadioId: null as number | null,
     unread: {} as Record<string, number>,
+    // Browser-local user preferences. The key includes the radio id because a
+    // channel slot is meaningful only on its own radio; direct-message keys
+    // retain their public key through contact rename/remove/re-add cycles.
+    conversationPreferences: savedConversationPreferences(),
     // room servers / repeaters this session has authenticated with
     nodeLogins: {} as Record<string, boolean>,
     loaded: false,
@@ -175,11 +185,15 @@ export const useAppStore = defineStore("app", {
     activeRadioId: (state): number | null => state.status?.activeRadioId ?? null,
     /** The radio whose data is on screen: the pinned one, else active, else the most-recent. */
     effectiveRadioId(state): number | null {
-      return state.viewingRadioId ?? state.status?.activeRadioId ?? state.status?.radios[0]?.id ?? null;
+      return state.viewingRadioId ?? state.status?.activeRadioId ?? state.status?.radios?.[0]?.id ?? null;
     },
     viewingRadio(): RadioSummary | null {
       const id = this.effectiveRadioId;
       return id == null ? null : this.radios.find((radio) => radio.id === id) ?? null;
+    },
+    conversationPreference() {
+      return (id: ConversationId): ConversationPreference =>
+        this.conversationPreferences[conversationPreferenceKey(this.effectiveRadioId, id)] ?? { archived: false, muted: false };
     },
     /**
      * Every connection the server currently maintains (issue #53, Stage 3) —
@@ -386,6 +400,18 @@ export const useAppStore = defineStore("app", {
         method: "POST",
         body: JSON.stringify(id.kind === "dm" ? (id.contactKey ? { contact: id.contactKey } : { sender: id.contactPrefix }) : { channel: id.channelIdx }),
       }).catch(() => {});
+    },
+
+    setConversationPreference(id: ConversationId, patch: Partial<ConversationPreference>) {
+      const key = conversationPreferenceKey(this.effectiveRadioId, id);
+      const current = this.conversationPreferences[key] ?? { archived: false, muted: false };
+      const next = { ...current, ...patch };
+      if (!next.archived && !next.muted) {
+        delete this.conversationPreferences[key];
+      } else {
+        this.conversationPreferences[key] = next;
+      }
+      saveConversationPreferences(this.conversationPreferences);
     },
 
     /**
@@ -665,7 +691,7 @@ export const useAppStore = defineStore("app", {
         this.unread[key] = (this.unread[key] ?? 0) + 1;
       }
       if (message.direction === "in" && !isSelfEcho) {
-        notifyIncoming(message, { conversationActive: Boolean(isActive) });
+        notifyIncoming(message, { conversationActive: Boolean(isActive), muted: this.conversationPreference(id).muted });
       }
     },
 

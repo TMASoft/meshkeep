@@ -92,6 +92,15 @@ describe("notifyIncoming", () => {
     expect(constructed[0]!.title).toContain("#test");
   });
 
+  it("keeps unread accounting separate by suppressing notifications for a muted conversation only", () => {
+    pref = "all";
+    notifyIncoming(message(), { conversationActive: false, muted: true });
+    expect(constructed).toHaveLength(0);
+
+    notifyIncoming(message({ id: 2 }), { conversationActive: false });
+    expect(constructed).toHaveLength(1);
+  });
+
   it("stays quiet for the active conversation while the tab is visible", () => {
     pref = "dms";
     notifyIncoming(message(), { conversationActive: true });

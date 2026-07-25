@@ -419,6 +419,20 @@ describe("message handling", () => {
     expect(store.unread["ch:3"]).toBe(2); // outgoing messages never count
   });
 
+  it("keeps unread accounting while a muted conversation suppresses its notification", () => {
+    const store = useAppStore();
+    const id = { kind: "dm", contactKey: KEY_A } as const;
+    store.setConversationPreference(id, { muted: true, archived: true });
+    store.appendMessage(message());
+
+    expect(store.unread[conversationKey(id)]).toBe(1);
+    expect(store.conversationPreference(id)).toEqual({ muted: true, archived: true });
+    expect(notifyIncomingMock).toHaveBeenCalledWith(message(), { conversationActive: false, muted: true });
+
+    store.setConversationPreference(id, { muted: false, archived: false });
+    expect(store.conversationPreference(id)).toEqual({ muted: false, archived: false });
+  });
+
   it("exposes an unknown sender and moves its live conversation after unique contact resolution", () => {
     const store = useAppStore();
     const prefix = "abcdef123456";

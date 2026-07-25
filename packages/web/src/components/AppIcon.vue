@@ -24,6 +24,7 @@ withDefaults(
       | "alert"
       | "logout"
       | "download"
+      | "archive"
       | "plus"
       | "info"
       | "trash"
@@ -132,6 +133,10 @@ withDefaults(
     <template v-else-if="name === 'download'">
       <path d="M12 3v12M7 10l5 5 5-5" />
       <path d="M4 19h16" />
+    </template>
+    <template v-else-if="name === 'archive'">
+      <rect x="3" y="5" width="18" height="4" rx="1" />
+      <path d="M5 9v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M9 13h6" />
     </template>
     <template v-else-if="name === 'plus'">
       <path d="M12 5v14M5 12h14" />

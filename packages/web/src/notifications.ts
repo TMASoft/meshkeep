@@ -58,10 +58,11 @@ export function clearNotificationNavigator(): void {
  * isn't the active one. Messages arriving in the active, visible conversation
  * never notify (they're already on screen — mirrors the unread accounting).
  */
-export function notifyIncoming(message: Message, opts: { conversationActive: boolean }): void {
+export function notifyIncoming(message: Message, opts: { conversationActive: boolean; muted?: boolean }): void {
   const pref = savedNotifyPref();
   if (pref === "off") return;
   if (message.direction !== "in") return;
+  if (opts.muted) return;
   if (message.kind === "channel" && pref !== "all") return;
   if (!document.hidden && opts.conversationActive) return;
   if (!notificationsSupported() || Notification.permission !== "granted") return;

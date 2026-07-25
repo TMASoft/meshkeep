@@ -36,13 +36,38 @@ const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 const active = computed(() => store.activeConversation);
 const activeKey = computed(() => (active.value ? conversationKey(active.value) : null));
 const messages = computed<Message[]>(() => (activeKey.value ? store.conversations[activeKey.value] ?? [] : []));
-const filteredContacts = computed(() => {
+const matchedContacts = computed(() => {
   const query = search.value.trim().toLocaleLowerCase();
   if (!query) return store.contacts;
   return store.contacts.filter(
     (contact) => contact.name?.toLocaleLowerCase().includes(query) || contact.publicKey.toLocaleLowerCase().includes(query),
   );
 });
+const isArchived = (id: ConversationId) => store.conversationPreference(id).archived;
+const filteredContacts = computed(() => matchedContacts.value.filter((contact) => !isArchived({ kind: "dm", contactKey: contact.publicKey })));
+const visibleChannels = computed(() => store.channels.filter((channel) => !isArchived({ kind: "channel", channelIdx: channel.idx })));
+const visibleUnknownSenders = computed(() => store.unknownSenders.filter((message) => !isArchived(unknownConversation(message))));
+const archivedConversations = computed(() => [
+  ...store.channels
+    .filter((channel) => isArchived({ kind: "channel", channelIdx: channel.idx }))
+    .map((channel) => ({ id: { kind: "channel", channelIdx: channel.idx } as ConversationId, title: channel.name, detail: `Channel ${channel.idx}`, icon: "channel" as const })),
+  ...store.contacts
+    .filter((contact) => isArchived({ kind: "dm", contactKey: contact.publicKey }))
+    .map((contact) => ({
+      id: { kind: "dm", contactKey: contact.publicKey } as ConversationId,
+      title: contact.name || shortKey(contact.publicKey),
+      detail: `${contact.type} node`,
+      icon: contactIcon(contact),
+    })),
+  ...store.unknownSenders
+    .filter((message) => isArchived(unknownConversation(message)))
+    .map((message) => ({
+      id: unknownConversation(message),
+      title: unknownLabel(message),
+      detail: shortKey(message.contactKey ?? message.contactPrefix ?? ""),
+      icon: "user" as const,
+    })),
+]);
 const totalUnread = computed(() => Object.values(store.unread).reduce((total, count) => total + count, 0));
 
 const activeTitle = computed(() => {
@@ -128,6 +153,18 @@ function closeMobileThread() {
   store.activeConversation = null;
   error.value = null;
   void nextTick(() => lastConversationButton.value?.focus());
+}
+
+function toggleArchive() {
+  if (!active.value) return;
+  const archived = store.conversationPreference(active.value).archived;
+  store.setConversationPreference(active.value, { archived: !archived });
+}
+
+function toggleMute() {
+  if (!active.value) return;
+  const muted = store.conversationPreference(active.value).muted;
+  store.setConversationPreference(active.value, { muted: !muted });
 }
 
 async function send() {
@@ -704,7 +741,7 @@ function fmtLastAdvert(epoch: number): string {
               >
                 <AppIcon name="plus" :size="14" />
               </button>
-              {{ store.channels.length.toString().padStart(2, "0") }}
+              {{ visibleChannels.length.toString().padStart(2, "0") }}
             </span>
           </div>
           <form v-if="channelFormOpen" class="channel-form" @submit.prevent="submitChannel">
@@ -741,7 +778,7 @@ function fmtLastAdvert(epoch: number): string {
             </button>
           </form>
           <button
-            v-for="channel in store.channels"
+            v-for="channel in visibleChannels"
             :key="`ch-${channel.idx}`"
             class="conversation-row"
             :class="{ active: active?.kind === 'channel' && active.channelIdx === channel.idx }"
@@ -760,6 +797,7 @@ function fmtLastAdvert(epoch: number): string {
             </span>
           </button>
           <p v-if="!store.channels.length" class="group-empty">No configured channels</p>
+          <p v-else-if="!visibleChannels.length" class="group-empty">All channels are archived</p>
         </section>
 
         <section class="conversation-group" aria-labelledby="contacts-heading">
@@ -820,13 +858,13 @@ function fmtLastAdvert(epoch: number): string {
           <p v-else-if="!filteredContacts.length" class="group-empty">No matching nodes</p>
         </section>
 
-        <section v-if="store.unknownSenders.length" class="conversation-group" aria-labelledby="unknown-senders-heading">
+        <section v-if="visibleUnknownSenders.length" class="conversation-group" aria-labelledby="unknown-senders-heading">
           <div class="group-heading">
             <h2 id="unknown-senders-heading">Unknown senders</h2>
-            <span class="group-heading-tools">{{ store.unknownSenders.length.toString().padStart(2, "0") }}</span>
+            <span class="group-heading-tools">{{ visibleUnknownSenders.length.toString().padStart(2, "0") }}</span>
           </div>
           <button
-            v-for="message in store.unknownSenders"
+            v-for="message in visibleUnknownSenders"
             :key="message.contactKey ?? message.contactPrefix ?? message.id"
             class="conversation-row"
             :class="{ active: activeKey === conversationKey(unknownConversation(message)) }"
@@ -842,6 +880,32 @@ function fmtLastAdvert(epoch: number): string {
             </span>
             <span v-if="store.unread[conversationKey(unknownConversation(message))]" class="unread-badge">
               {{ store.unread[conversationKey(unknownConversation(message))] }}
+            </span>
+          </button>
+        </section>
+
+        <section v-if="archivedConversations.length" class="conversation-group" aria-labelledby="archived-heading">
+          <div class="group-heading">
+            <h2 id="archived-heading">Archived</h2>
+            <span class="group-heading-tools">{{ archivedConversations.length.toString().padStart(2, "0") }}</span>
+          </div>
+          <button
+            v-for="conversation in archivedConversations"
+            :key="conversationKey(conversation.id)"
+            class="conversation-row archived-row"
+            :class="{ active: activeKey === conversationKey(conversation.id) }"
+            type="button"
+            :disabled="opening"
+            :aria-current="activeKey === conversationKey(conversation.id) ? 'true' : undefined"
+            @click="open(conversation.id, $event)"
+          >
+            <span class="conversation-avatar" :class="{ 'channel-avatar': conversation.id.kind === 'channel' }"><AppIcon :name="conversation.icon" :size="18" /></span>
+            <span class="conversation-copy">
+              <strong>{{ conversation.title }}</strong>
+              <small>{{ conversation.detail }}</small>
+            </span>
+            <span v-if="store.unread[conversationKey(conversation.id)]" class="unread-badge">
+              {{ store.unread[conversationKey(conversation.id)] }}
             </span>
           </button>
         </section>
@@ -998,6 +1062,12 @@ function fmtLastAdvert(epoch: number): string {
             <a :href="exportHref" download>
               <AppIcon name="download" :size="15" /> Export CSV
             </a>
+            <button type="button" @click="toggleMute">
+              <AppIcon name="alert" :size="15" /> {{ store.conversationPreference(active).muted ? "Unmute conversation" : "Mute conversation" }}
+            </button>
+            <button type="button" @click="toggleArchive">
+              <AppIcon name="archive" :size="15" /> {{ store.conversationPreference(active).archived ? "Unarchive conversation" : "Archive conversation" }}
+            </button>
             <button
               v-if="activeContact"
               class="danger"
