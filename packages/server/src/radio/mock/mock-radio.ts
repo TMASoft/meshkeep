@@ -299,7 +299,7 @@ export class MockRadio {
     this.sockets.add(socket);
     this.readBuffers.set(socket, Buffer.alloc(0));
     this.log("client connected");
-    socket.on("data", (data) => this.onData(socket, data));
+    socket.on("data", (data) => this.onData(socket, typeof data === "string" ? Buffer.from(data) : data));
     socket.on("close", () => {
       this.sockets.delete(socket);
       this.readBuffers.delete(socket);
