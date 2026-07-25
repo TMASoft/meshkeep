@@ -92,6 +92,22 @@ describe("notifyIncoming", () => {
     expect(constructed[0]!.title).toContain("#test");
   });
 
+  it("parses an inline 'name: msg' sender on an unsigned channel message, matching the chat thread", () => {
+    pref = "all";
+    const channelMessage = message({
+      kind: "channel",
+      channelIdx: 3,
+      channelName: "#test",
+      contactKey: null,
+      contactName: null,
+      text: "MCTA-Rak: Bing bong",
+    });
+    notifyIncoming(channelMessage, { conversationActive: false });
+    expect(constructed).toHaveLength(1);
+    expect(constructed[0]!.title).toBe("#test · MCTA-Rak");
+    expect(constructed[0]!.options.body).toBe("Bing bong");
+  });
+
   it("keeps unread accounting separate by suppressing notifications for a muted conversation only", () => {
     pref = "all";
     notifyIncoming(message(), { conversationActive: false, muted: true });

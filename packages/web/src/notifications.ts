@@ -1,4 +1,5 @@
 import type { Message } from "@meshkeep/shared";
+import { displayMessage } from "./message-display";
 import type { ConversationId } from "./stores/app";
 
 /** off = never notify · dms = incoming DMs only · all = DMs + channel messages */
@@ -73,10 +74,14 @@ export function notifyIncoming(message: Message, opts: { conversationActive: boo
         ? { kind: "dm", contactKey: message.contactKey }
         : { kind: "dm", contactPrefix: message.contactPrefix ?? "" }
       : { kind: "channel", channelIdx: message.channelIdx ?? 0 };
-  const sender = message.contactName ?? message.authorName ?? shortKey(message.contactKey ?? message.contactPrefix);
+  // channel texts carry their sender inline as "name: msg" (group-text convention);
+  // displayMessage is the same helper the chat thread uses for this split (issue #22).
+  const display = displayMessage(message);
+  const sender =
+    display.sender ?? message.contactName ?? message.authorName ?? shortKey(message.contactKey ?? message.contactPrefix);
   const title =
     message.kind === "dm" ? sender : `${message.channelName ?? `channel ${message.channelIdx}`} · ${sender}`;
-  const body = message.text.length > 140 ? `${message.text.slice(0, 139)}…` : message.text;
+  const body = display.text.length > 140 ? `${display.text.slice(0, 139)}…` : display.text;
 
   try {
     // one notification per conversation: newer messages replace older ones
