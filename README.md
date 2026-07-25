@@ -170,6 +170,12 @@ event: `pending → sent → delivered`, or `retrying → failed` after `MESHKEE
 Inspect and manage the queue with `GET /api/v1/messages/outbound`, `POST /api/v1/messages/:id/retry`,
 and `POST /api/v1/messages/:id/cancel` (retry/cancel need write scope).
 
+A `400` on any endpoint returns `{ "error": "invalid request", "details": [...] }`, where each
+entry is a Zod issue object (`path`, `message`, `code`, plus type-specific fields). As of
+v0.1.4-beta.17 (Zod 4) those per-issue fields changed shape — notably `type` became `origin` and
+message wording changed — for any integration that parses `details` beyond checking it's a
+non-empty array.
+
 ## Development
 
 ```sh
