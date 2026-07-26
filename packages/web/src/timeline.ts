@@ -69,7 +69,7 @@ export function wsToTimelineEvent(event: WsEvent): TimelineEvent | null {
 }
 
 function clampWindow(start: number, end: number, now: number): TimeWindow {
-  let span = Math.min(Math.max(end - start, MIN_SPAN), MAX_SPAN);
+  const span = Math.min(Math.max(end - start, MIN_SPAN), MAX_SPAN);
   let clampedEnd = end;
   const maxEnd = now + span * FUTURE_HEADROOM;
   if (clampedEnd > maxEnd) clampedEnd = maxEnd;
