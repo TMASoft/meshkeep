@@ -11,6 +11,9 @@ export interface ServerConfig {
   bleAddress: string | null;
   uiPassword: string | null;
   telemetryRetentionDays: number;
+  telemetryPollMinutes: number;
+  telemetryMonitorMinutes: number;
+  timelineRetentionDays: number;
   outboundMaxAttempts: number;
   mapRefreshMinutes: number;
   mapUpstream: string;
@@ -73,6 +76,9 @@ export function loadConfig(): ServerConfig {
     bleAddress: env("MESHKEEP_BLE_ADDRESS"),
     uiPassword: env("MESHKEEP_UI_PASSWORD"),
     telemetryRetentionDays: envInt("MESHKEEP_TELEMETRY_RETENTION_DAYS", 30, 1, 3650),
+    telemetryPollMinutes: envInt("MESHKEEP_TELEMETRY_POLL_MINUTES", 5, 1, 60),
+    telemetryMonitorMinutes: envInt("MESHKEEP_TELEMETRY_MONITOR_MINUTES", 30, 5, 1440),
+    timelineRetentionDays: envInt("MESHKEEP_TIMELINE_RETENTION_DAYS", 90, 1, 3650),
     outboundMaxAttempts: envInt("MESHKEEP_OUTBOUND_MAX_ATTEMPTS", 5, 1, 20),
     mapRefreshMinutes: envInt("MESHKEEP_MAP_REFRESH_MINUTES", 10, 1, 1440),
     mapUpstream: env("MESHKEEP_MAP_UPSTREAM") ?? "https://map.meshcore.io/api/v1/nodes",

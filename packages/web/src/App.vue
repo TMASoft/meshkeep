@@ -78,6 +78,7 @@ watch(notify, async (value, previous) => {
 const navLinks = [
   { to: "/chat", label: "Comms", icon: "chat" as const },
   { to: "/map", label: "Network", icon: "map" as const },
+  { to: "/timeline", label: "Timeline", icon: "pulse" as const },
   { to: "/device", label: "Radio", icon: "radio" as const },
   { to: "/diagnostics", label: "Health", icon: "signal" as const },
 ];
@@ -457,7 +458,7 @@ const connectionLabel = computed(() => (store.connectionState === "error" ? "Nee
   .repo-link { width: 32px; height: 32px; border: 0; }
   .connection-metric span:last-child { display: none; }
   .mobile-appearance { display: grid; }
-  .mobile-nav { position: relative; z-index: 1000; display: grid; height: calc(62px + env(safe-area-inset-bottom)); flex: 0 0 calc(62px + env(safe-area-inset-bottom)); grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--border); background: var(--surface-1); padding-bottom: env(safe-area-inset-bottom); }
+  .mobile-nav { position: relative; z-index: 1000; display: grid; height: calc(62px + env(safe-area-inset-bottom)); flex: 0 0 calc(62px + env(safe-area-inset-bottom)); grid-template-columns: repeat(5, 1fr); border-top: 1px solid var(--border); background: var(--surface-1); padding-bottom: env(safe-area-inset-bottom); }
   .mobile-nav-link { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; color: var(--text-faint); font-size: 10px; font-weight: 700; text-decoration: none; }
   .mobile-nav-link.router-link-active { color: var(--accent); }
   .mobile-nav-link.router-link-active::before { position: absolute; top: -1px; width: 32px; height: 2px; background: var(--accent); content: ""; }

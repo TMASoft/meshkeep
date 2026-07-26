@@ -30,6 +30,7 @@ withDefaults(
       | "trash"
       | "link"
       | "lock"
+      | "pulse"
       | "github";
     size?: number;
     strokeWidth?: number;
@@ -156,6 +157,9 @@ withDefaults(
     <template v-else-if="name === 'lock'">
       <rect x="5" y="11" width="14" height="10" rx="2" />
       <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+    </template>
+    <template v-else-if="name === 'pulse'">
+      <path d="M2 12h4l3-7 4 14 3-7h6" />
     </template>
     <template v-else-if="name === 'github'">
       <path

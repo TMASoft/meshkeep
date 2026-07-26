@@ -1,4 +1,4 @@
-import type { Message } from "@meshkeep/shared";
+import type { Message, TelemetryAlertEvent } from "@meshkeep/shared";
 import { displayMessage } from "./message-display";
 import type { ConversationId } from "./stores/app";
 
@@ -91,6 +91,32 @@ export function notifyIncoming(message: Message, opts: { conversationActive: boo
       navigate?.(id);
       notification.close();
     };
+  } catch {
+    // some platforms (e.g. Android Chrome) only allow Notification via a
+    // service worker — treat as unsupported rather than erroring the app
+  }
+}
+
+/**
+ * Notify for a telemetry threshold transition (issue #52). Gated on the same
+ * on/off preference as message notifications — turning notifications off
+ * should silence everything, not just messages.
+ */
+export function notifyAlert(event: TelemetryAlertEvent): void {
+  if (savedNotifyPref() === "off") return;
+  if (!notificationsSupported() || Notification.permission !== "granted") return;
+
+  const subject = event.contactName ?? (event.contactKey ? shortKey(event.contactKey) : "This radio");
+  const comparison = event.comparator === "below" ? "below" : "above";
+  const title = event.direction === "breach" ? `${subject}: ${event.label} alert` : `${subject}: ${event.label} recovered`;
+  const body =
+    event.direction === "breach"
+      ? `${event.label} is ${event.value} (${comparison} ${event.threshold})`
+      : `${event.label} is back to ${event.value}`;
+
+  try {
+    // one notification per rule: a later transition replaces the earlier one
+    new Notification(title, { body, tag: `meshkeep-alert-${event.ruleId}` });
   } catch {
     // some platforms (e.g. Android Chrome) only allow Notification via a
     // service worker — treat as unsupported rather than erroring the app

@@ -1,4 +1,5 @@
 import type { Message } from "@meshkeep/shared";
+import type { TelemetryExportRow } from "../db/store.js";
 
 const CSV_COLUMNS = [
   "id",
@@ -46,6 +47,26 @@ export function messageToCsvRow(message: Message): string {
     csvField(message.text),
     csvField(new Date(message.senderTimestamp * 1000).toISOString()),
     csvField(message.status),
+  ].join(",")}\r\n`;
+}
+
+const TELEMETRY_CSV_COLUMNS = ["ts_utc", "contact_key", "contact_name", "metric", "label", "value", "unit"] as const;
+
+/** The telemetry-export CSV header line, terminated with CRLF. */
+export function csvTelemetryHeaderRow(): string {
+  return `${TELEMETRY_CSV_COLUMNS.join(",")}\r\n`;
+}
+
+/** One flattened telemetry sample rendered as a CRLF-terminated CSV row. */
+export function telemetryToCsvRow(row: TelemetryExportRow): string {
+  return `${[
+    csvField(new Date(row.ts * 1000).toISOString()),
+    csvField(row.contactKey),
+    csvField(row.contactName),
+    csvField(row.metric),
+    csvField(row.label),
+    csvField(row.value),
+    csvField(row.unit),
   ].join(",")}\r\n`;
 }
 

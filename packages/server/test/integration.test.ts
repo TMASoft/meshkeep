@@ -39,6 +39,9 @@ function testConfig(port: number): ServerConfig {
     bleAddress: null,
     uiPassword: null,
     telemetryRetentionDays: 30,
+    telemetryPollMinutes: 5,
+    telemetryMonitorMinutes: 30,
+    timelineRetentionDays: 90,
     outboundMaxAttempts: 5,
     mapRefreshMinutes: 10,
     mapUpstream: "https://map.meshcore.io/api/v1/nodes",
@@ -712,6 +715,42 @@ describe("mock radio end-to-end", () => {
     expect(event.message.authorPrefix).toBe(alice.publicKey.slice(0, 8));
     expect(event.message.authorName).toBe("Mock Alice");
   }, 15_000);
+
+  it("records timeline events for link transitions and adverts", async () => {
+    const radioId = manager.getActiveRadioId()!;
+    const to = () => Math.floor(Date.now() / 1000) + 10;
+
+    // the connect in beforeEach recorded exactly one link transition
+    const connected = manager.store.getTimeline([radioId], 0, to(), ["link"], 100);
+    expect(connected.events).toHaveLength(1);
+    expect(connected.events[0].kind === "link" && connected.events[0].link.state).toBe("connected");
+
+    // a NewAdvert push persists an advert snapshot and publishes timeline.event
+    const advertEvent = waitForEvent(bus, (e) => e.type === "timeline.event" && e.event.kind === "advert");
+    const link = soleLinkInternals(manager);
+    (link.connection as unknown as EventEmitter).emit(Constants.PushCodes.NewAdvert, {
+      publicKey: new Uint8Array(32).fill(9),
+      type: 1,
+      flags: 0,
+      outPathLen: 0,
+      advName: "Advert Node",
+      lastAdvert: 123,
+      advLat: 0,
+      advLon: 0,
+    });
+    const pushed = (await advertEvent) as Extract<WsEvent, { type: "timeline.event" }>;
+    expect(pushed.event.kind === "advert" && pushed.event.advert.name).toBe("Advert Node");
+    expect(pushed.event.kind === "advert" && pushed.event.advert.observed).toBe("new");
+    expect(manager.store.getTimeline([radioId], 0, to(), ["advert"], 100).events).toHaveLength(1);
+
+    // a clean stop records exactly one disconnected transition
+    await manager.stop();
+    const transitions = manager.store.getTimeline([radioId], 0, to(), ["link"], 100);
+    expect(transitions.events.map((e) => (e.kind === "link" ? e.link.state : e.kind))).toEqual([
+      "connected",
+      "disconnected",
+    ]);
+  });
 
   it("persists history across a manager restart", async () => {
     const alice = manager.store

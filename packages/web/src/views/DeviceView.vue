@@ -1,6 +1,15 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
-import type { BleCandidate, ConnectionSettings, DetectedSerialPort, RadioProfile, TelemetryPoint } from "@meshkeep/shared";
+import type {
+  AlertComparator,
+  BleCandidate,
+  ConnectionSettings,
+  DetectedSerialPort,
+  RadioProfile,
+  TelemetryAlertEvent,
+  TelemetryAlertRule,
+  TelemetryPoint,
+} from "@meshkeep/shared";
 import { api } from "../api/client";
 import { useAppStore, radioSuffix } from "../stores/app";
 import { browserRadioSupport, type BrowserRadioKind } from "../sources/browser-radio";
@@ -560,6 +569,76 @@ watch(
   { immediate: false },
 );
 
+// ---- battery alert rules & history ----
+
+const alertRules = ref<TelemetryAlertRule[]>([]);
+const alertEvents = ref<TelemetryAlertEvent[]>([]);
+const alertForm = reactive({ comparator: "below" as AlertComparator, threshold: "" });
+const alertBusy = ref(false);
+const alertError = ref<string | null>(null);
+
+async function loadAlertRules() {
+  try {
+    const { rules } = await api<{ rules: TelemetryAlertRule[] }>(
+      `/telemetry/alerts/rules${radioSuffix(store.effectiveRadioId)}`,
+    );
+    alertRules.value = rules.filter((r) => r.contactKey === null);
+  } catch {
+    // leave the previous list in place
+  }
+}
+
+async function loadAlertEvents() {
+  try {
+    const { events } = await api<{ events: TelemetryAlertEvent[] }>(
+      `/telemetry/alerts?hours=720${radioSuffix(store.effectiveRadioId, "&")}`,
+    );
+    alertEvents.value = events.filter((e) => e.contactKey === null);
+  } catch {
+    // leave the previous list in place
+  }
+}
+
+// A live telemetry.alert push (app.ts) lands in store.alertHistory — refresh
+// the history list rather than re-deriving it from the WsEvent payload alone,
+// since a rule can also be added/removed from another tab.
+watch(
+  () => store.alertHistory.length,
+  () => void loadAlertEvents(),
+);
+
+async function addAlertRule() {
+  const threshold = Number.parseInt(alertForm.threshold, 10);
+  if (!Number.isFinite(threshold)) {
+    alertError.value = "Enter a battery threshold in mV";
+    return;
+  }
+  alertBusy.value = true;
+  alertError.value = null;
+  try {
+    await api(`/telemetry/alerts/rules${radioSuffix(store.effectiveRadioId)}`, {
+      method: "POST",
+      body: JSON.stringify({ contactKey: null, metric: "battery_mv", comparator: alertForm.comparator, threshold }),
+    });
+    alertForm.threshold = "";
+    await loadAlertRules();
+  } catch (error) {
+    alertError.value = error instanceof Error ? error.message : "Failed to add alert rule";
+  } finally {
+    alertBusy.value = false;
+  }
+}
+
+async function removeAlertRule(id: number) {
+  alertBusy.value = true;
+  try {
+    await api(`/telemetry/alerts/rules/${id}${radioSuffix(store.effectiveRadioId)}`, { method: "DELETE" });
+    await loadAlertRules();
+  } finally {
+    alertBusy.value = false;
+  }
+}
+
 // ---- sharing & export ----
 
 async function copyShareUri() {
@@ -574,6 +653,8 @@ onMounted(() => {
   void loadTelemetry();
   void loadConnConfig();
   void loadProfiles();
+  void loadAlertRules();
+  void loadAlertEvents();
 });
 </script>
 
@@ -843,9 +924,56 @@ onMounted(() => {
           </template>
         </section>
 
+        <section class="module alerts-module">
+          <div class="module-heading">
+            <div><span class="module-index">06</span><h2>Battery alerts</h2></div>
+            <span class="module-hint">{{ alertRules.length }} rule{{ alertRules.length === 1 ? "" : "s" }}</span>
+          </div>
+          <p class="module-description">
+            Get notified when this radio's battery crosses a threshold. Alerts fire once per
+            crossing (not on every sample) and deliver as a browser notification, same as messages.
+          </p>
+          <form class="alert-form" @submit.prevent="addAlertRule">
+            <select v-model="alertForm.comparator" class="field-select" aria-label="Comparator">
+              <option value="below">Below</option>
+              <option value="above">Above</option>
+            </select>
+            <input
+              v-model="alertForm.threshold"
+              type="number"
+              inputmode="numeric"
+              placeholder="mV, e.g. 3300"
+              aria-label="Threshold in millivolts"
+            />
+            <button class="button secondary" type="submit" :disabled="alertBusy || !alertForm.threshold">Add</button>
+          </form>
+          <p v-if="alertError" class="alert-error">{{ alertError }}</p>
+          <ul v-if="alertRules.length" class="alert-rule-list">
+            <li v-for="rule in alertRules" :key="rule.id">
+              <span>
+                Battery {{ rule.comparator }} {{ rule.threshold }} mV
+                <em :class="rule.lastState">{{ rule.lastState }}</em>
+              </span>
+              <button type="button" class="icon-button" :disabled="alertBusy" title="Remove rule" @click="removeAlertRule(rule.id)">
+                <AppIcon name="trash" :size="14" />
+              </button>
+            </li>
+          </ul>
+          <div v-if="alertEvents.length" class="alert-history">
+            <span class="instrument-label">Recent alerts</span>
+            <ul>
+              <li v-for="event in alertEvents.slice(0, 8)" :key="event.id">
+                <span :class="event.direction">{{ event.direction === "breach" ? "Alert" : "Recovered" }}</span>
+                {{ event.label }} {{ event.value }} mV ({{ event.comparator }} {{ event.threshold }})
+                <time>{{ new Date(event.ts * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) }}</time>
+              </li>
+            </ul>
+          </div>
+        </section>
+
         <section class="module actions-module">
           <div class="module-heading">
-            <div><span class="module-index">06</span><h2>Field actions</h2></div>
+            <div><span class="module-index">07</span><h2>Field actions</h2></div>
           </div>
 
           <div class="action-block">
@@ -901,7 +1029,7 @@ onMounted(() => {
 
         <section class="module connection-module">
           <div class="module-heading">
-            <div><span class="module-index">07</span><h2>Connection</h2></div>
+            <div><span class="module-index">08</span><h2>Connection</h2></div>
             <span v-if="connConfig?.activeProfile" class="module-hint override-hint">profile · {{ connConfig.activeProfile.name }}</span>
             <span v-else-if="connConfig?.override" class="module-hint override-hint">override active</span>
             <span v-else class="module-hint">from environment</span>
@@ -1080,7 +1208,7 @@ onMounted(() => {
 
         <section class="module token-module">
           <div class="module-heading">
-            <div><span class="module-index">08</span><h2>API access</h2></div>
+            <div><span class="module-index">09</span><h2>API access</h2></div>
             <span class="token-count">{{ tokens.length }} active</span>
           </div>
           <p class="module-description">Tokens grant integrations API access. New tokens are read-only unless write scope is chosen.</p>
@@ -1130,7 +1258,7 @@ onMounted(() => {
 
         <section class="module data-module">
           <div class="module-heading">
-            <div><span class="module-index">09</span><h2>Data export</h2></div>
+            <div><span class="module-index">10</span><h2>Data export</h2></div>
             <span class="module-hint">{{ store.status?.counts.messages ?? 0 }} messages</span>
           </div>
           <p class="module-description">
@@ -1142,6 +1270,15 @@ onMounted(() => {
               <AppIcon name="download" :size="16" /> CSV
             </a>
             <a class="button secondary" href="/api/v1/messages/export?format=json" download>
+              <AppIcon name="download" :size="16" /> JSON
+            </a>
+          </div>
+          <p class="module-description export-subheading">Telemetry (battery &amp; sensor history, last 30 days)</p>
+          <div class="export-buttons">
+            <a class="button secondary" href="/api/v1/telemetry/export?format=csv" download>
+              <AppIcon name="download" :size="16" /> CSV
+            </a>
+            <a class="button secondary" href="/api/v1/telemetry/export?format=json" download>
               <AppIcon name="download" :size="16" /> JSON
             </a>
           </div>
@@ -1309,6 +1446,28 @@ onMounted(() => {
 .detect-button { flex: 0 0 auto; }
 .export-buttons { display: flex; gap: 8px; padding: 0 18px 18px; }
 .export-buttons .button { flex: 1; text-decoration: none; }
+.export-subheading { margin-top: 0; border-top: 1px solid var(--border); padding-top: 14px; }
+.alert-form { display: flex; gap: 8px; padding: 0 18px 14px; }
+.alert-form .field-select { width: auto; flex: 0 0 90px; }
+.alert-form input { flex: 1; height: 40px; border: 1px solid var(--border); border-radius: var(--radius-sm); outline: 0; background: var(--surface-2); padding: 0 10px; color: var(--text); font-size: 12px; }
+.alert-form input:focus { border-color: var(--cyan); }
+.alert-form .button { flex: 0 0 auto; }
+.alert-error { margin: -6px 18px 12px; color: var(--danger); font-size: 10px; }
+.alert-rule-list { display: flex; flex-direction: column; border-top: 1px solid var(--border); list-style: none; margin: 0; padding: 0; }
+.alert-rule-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 18px; font-size: 11px; }
+.alert-rule-list li + li { border-top: 1px solid var(--border); }
+.alert-rule-list em { margin-left: 6px; border-radius: 4px; padding: 1px 6px; font-size: 9px; font-style: normal; text-transform: uppercase; }
+.alert-rule-list em.ok { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
+.alert-rule-list em.breached { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
+.icon-button { display: grid; width: 32px; height: 32px; flex: 0 0 auto; place-items: center; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-faint); cursor: pointer; }
+.icon-button:hover { color: var(--danger); }
+.alert-history { border-top: 1px solid var(--border); padding: 14px 18px 18px; }
+.alert-history .instrument-label { display: block; margin-bottom: 8px; color: var(--text-faint); font-family: monospace; font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+.alert-history ul { display: flex; flex-direction: column; gap: 6px; list-style: none; margin: 0; padding: 0; }
+.alert-history li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; color: var(--text-muted); font-size: 10px; }
+.alert-history time { margin-left: auto; color: var(--text-faint); font-family: monospace; font-size: 9px; }
+.alert-history .breach { color: var(--danger); font-weight: 700; }
+.alert-history .recover { color: var(--accent); font-weight: 700; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 980px) {

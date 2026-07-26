@@ -259,6 +259,107 @@ export interface ContactTelemetryPoint {
   readings: SensorReading[];
 }
 
+/** A contact opted into background telemetry polling (issue #52). */
+export interface TelemetryMonitor {
+  contactKey: string;
+  createdAt: number;
+}
+
+export type AlertComparator = "below" | "above";
+
+/**
+ * A configured threshold on either the local radio's battery (contactKey
+ * null, metric "battery_mv") or a remote contact's Cayenne sensor channel
+ * (metric "<channel>:<type>", matching the sensor sparkline keys already
+ * used client-side). lastState debounces delivery to transitions only.
+ */
+export interface TelemetryAlertRule {
+  id: number;
+  contactKey: string | null;
+  metric: string;
+  comparator: AlertComparator;
+  threshold: number;
+  lastState: "ok" | "breached";
+}
+
+/** One fired threshold transition, also the notification payload. */
+export interface TelemetryAlertEvent {
+  id: number;
+  ruleId: number;
+  contactKey: string | null;
+  contactName: string | null;
+  metric: string;
+  label: string;
+  value: number;
+  threshold: number;
+  comparator: AlertComparator;
+  direction: "breach" | "recover";
+  ts: number;
+}
+
+// Timeline (per-radio event history). Adverts and link transitions are stored
+// in their own table; message/alert/telemetry entries are derived at query
+// time from the tables that already hold them, so nothing is duplicated.
+export type TimelineEventKind = "advert" | "message" | "alert" | "link" | "telemetry";
+
+/** Snapshot of a contact as it looked when the advert arrived. */
+export interface TimelineAdvertPayload {
+  contactKey: string;
+  name: string;
+  type: ContactType;
+  flags: number;
+  outPathLen: number;
+  lat: number | null;
+  lon: number | null;
+  /** "new" = full NewAdvert frame; "seen" = key-only Advert push. */
+  observed: "new" | "seen";
+}
+
+export interface TimelineLinkPayload {
+  state: "connected" | "disconnected";
+  transport: ConnectionTransport;
+  label: string;
+  error: string | null;
+}
+
+export interface TimelineMessagePayload {
+  messageId: number;
+  messageKind: MessageKind;
+  direction: MessageDirection;
+  contactKey: string | null;
+  contactPrefix: string | null;
+  contactName: string | null;
+  channelIdx: number | null;
+  channelName: string | null;
+  senderTimestamp: number;
+  preview: string;
+}
+
+export interface TimelineTelemetryPayload {
+  /** Null for the local radio's own battery samples. */
+  contactKey: string | null;
+  contactName: string | null;
+  batteryMv: number | null;
+  readings: SensorReading[];
+}
+
+/**
+ * One normalized timeline entry. `id` is source-prefixed (adv:/lnk:/msg:/
+ * alr:/tlm:) so ids are unique across the tables the feed is merged from.
+ */
+interface TimelineEventBase {
+  id: string;
+  radioId: number;
+  ts: number;
+}
+
+export type TimelineEvent =
+  | (TimelineEventBase & { kind: "advert"; advert: TimelineAdvertPayload })
+  | (TimelineEventBase & { kind: "link"; link: TimelineLinkPayload })
+  | (TimelineEventBase & { kind: "message"; message: TimelineMessagePayload })
+  | (TimelineEventBase & { kind: "alert"; alert: TelemetryAlertEvent })
+  | (TimelineEventBase & { kind: "telemetry"; telemetry: TimelineTelemetryPayload });
+
 /** Connection settings the server can be pointed at (env or runtime override). */
 export interface ConnectionSettings {
   connection: ConnectionTransport;
@@ -322,7 +423,9 @@ export type WsEvent =
   | { type: "contact.updated"; radioId: number; contact: Contact }
   | { type: "contact.removed"; radioId: number; publicKey: string }
   | { type: "self.updated"; radioId: number; self: SelfInfo }
-  | { type: "telemetry"; radioId: number; batteryMilliVolts: number; ts: number };
+  | { type: "telemetry"; radioId: number; batteryMilliVolts: number; ts: number }
+  | { type: "telemetry.alert"; radioId: number; event: TelemetryAlertEvent }
+  | { type: "timeline.event"; radioId: number; event: TimelineEvent };
 
 export const CONTACT_TYPE_FROM_ADV: Record<number, ContactType> = {
   0: "none",

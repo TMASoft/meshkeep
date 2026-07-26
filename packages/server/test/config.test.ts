@@ -11,6 +11,9 @@ describe("configuration bounds", () => {
     expect(config.port).toBe(8080);
     expect(config.serialBaud).toBe(115_200);
     expect(config.telemetryRetentionDays).toBe(30);
+    expect(config.telemetryPollMinutes).toBe(5);
+    expect(config.telemetryMonitorMinutes).toBe(30);
+    expect(config.timelineRetentionDays).toBe(90);
   });
 
   it("rejects non-integer numeric values", () => {
@@ -26,6 +29,12 @@ describe("configuration bounds", () => {
     ["MESHKEEP_TELEMETRY_RETENTION_DAYS", "0"],
     ["MESHKEEP_MAP_REFRESH_MINUTES", "0"],
     ["MESHKEEP_MAP_REFRESH_MINUTES", "999999"],
+    ["MESHKEEP_TELEMETRY_POLL_MINUTES", "0"],
+    ["MESHKEEP_TELEMETRY_POLL_MINUTES", "61"],
+    ["MESHKEEP_TELEMETRY_MONITOR_MINUTES", "1"],
+    ["MESHKEEP_TELEMETRY_MONITOR_MINUTES", "99999"],
+    ["MESHKEEP_TIMELINE_RETENTION_DAYS", "0"],
+    ["MESHKEEP_TIMELINE_RETENTION_DAYS", "4000"],
   ];
 
   for (const [name, value] of outOfRange) {

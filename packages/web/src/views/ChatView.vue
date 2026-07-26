@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, reactive, ref, watch } from "vue";
 import type {
+  AlertComparator,
   Contact,
   ContactTelemetryPoint,
   Message,
   MessageSearchResult,
   NodeStats,
   SensorReading,
+  TelemetryAlertRule,
 } from "@meshkeep/shared";
 import {
   buildChannelShareUri,
@@ -546,6 +548,7 @@ const requestTelemetry = () =>
 // ---- per-contact telemetry history ----
 
 const telemetryHistory = ref<ContactTelemetryPoint[] | null>(null);
+const telemetryHours = ref(24 * 7);
 
 async function loadTelemetryHistory() {
   const contact = activeContact.value;
@@ -555,17 +558,111 @@ async function loadTelemetryHistory() {
   }
   try {
     const { points } = await api<{ points: ContactTelemetryPoint[] }>(
-      `/contacts/${contact.publicKey}/telemetry/history`,
+      `/contacts/${contact.publicKey}/telemetry/history?hours=${telemetryHours.value}`,
     );
     telemetryHistory.value = points;
   } catch {
     telemetryHistory.value = null;
   }
 }
+watch(telemetryHours, loadTelemetryHistory);
 
 watch([detailsOpen, activeContact], ([open]) => {
   telemetryHistory.value = null;
   if (open && activeContact.value) void loadTelemetryHistory();
+});
+
+// ---- background telemetry monitoring & per-channel alerts (issue #52) ----
+
+const isMonitored = ref(false);
+const monitorBusy = ref(false);
+
+async function loadMonitorState() {
+  const contact = activeContact.value;
+  if (!contact) {
+    isMonitored.value = false;
+    return;
+  }
+  try {
+    const { monitored } = await api<{ monitored: boolean }>(
+      `/contacts/${contact.publicKey}/telemetry/monitor${radioSuffix(store.effectiveRadioId)}`,
+    );
+    isMonitored.value = monitored;
+  } catch {
+    isMonitored.value = false;
+  }
+}
+
+async function toggleMonitor() {
+  const contact = activeContact.value;
+  if (!contact || monitorBusy.value) return;
+  monitorBusy.value = true;
+  try {
+    await api(`/contacts/${contact.publicKey}/telemetry/monitor${radioSuffix(store.effectiveRadioId)}`, {
+      method: isMonitored.value ? "DELETE" : "POST",
+    });
+    isMonitored.value = !isMonitored.value;
+  } finally {
+    monitorBusy.value = false;
+  }
+}
+
+const contactAlertRules = ref<TelemetryAlertRule[]>([]);
+const contactAlertForms = reactive<Record<string, { comparator: AlertComparator; threshold: string }>>({});
+
+function alertFormFor(metricKey: string) {
+  return (contactAlertForms[metricKey] ??= { comparator: "above", threshold: "" });
+}
+
+function rulesForMetric(metricKey: string): TelemetryAlertRule[] {
+  return contactAlertRules.value.filter((r) => r.metric === metricKey);
+}
+
+async function loadContactAlertRules() {
+  const contact = activeContact.value;
+  if (!contact) {
+    contactAlertRules.value = [];
+    return;
+  }
+  try {
+    const { rules } = await api<{ rules: TelemetryAlertRule[] }>(
+      `/telemetry/alerts/rules${radioSuffix(store.effectiveRadioId)}`,
+    );
+    contactAlertRules.value = rules.filter((r) => r.contactKey === contact.publicKey);
+  } catch {
+    contactAlertRules.value = [];
+  }
+}
+
+async function addContactAlertRule(metricKey: string) {
+  const contact = activeContact.value;
+  const form = alertFormFor(metricKey);
+  const threshold = Number.parseFloat(form.threshold);
+  if (!contact || !Number.isFinite(threshold)) return;
+  await api(`/telemetry/alerts/rules${radioSuffix(store.effectiveRadioId)}`, {
+    method: "POST",
+    body: JSON.stringify({
+      contactKey: contact.publicKey,
+      metric: metricKey,
+      comparator: form.comparator,
+      threshold,
+    }),
+  });
+  form.threshold = "";
+  await loadContactAlertRules();
+}
+
+async function removeContactAlertRule(id: number) {
+  await api(`/telemetry/alerts/rules/${id}${radioSuffix(store.effectiveRadioId)}`, { method: "DELETE" });
+  await loadContactAlertRules();
+}
+
+watch([detailsOpen, activeContact], ([open]) => {
+  contactAlertRules.value = [];
+  if (open && activeContact.value) {
+    void loadMonitorState();
+    void loadContactAlertRules();
+  }
 });
 
 interface SensorSeries {
@@ -1006,7 +1103,14 @@ function fmtLastAdvert(epoch: number): string {
           </dl>
 
           <div v-if="sensorSeries.length" class="telemetry-history">
-            <span class="instrument-label">Telemetry history</span>
+            <div class="telemetry-history-head">
+              <span class="instrument-label">Telemetry history</span>
+              <div class="range-toggle" role="group" aria-label="History range">
+                <button type="button" :class="{ active: telemetryHours === 24 }" @click="telemetryHours = 24">24h</button>
+                <button type="button" :class="{ active: telemetryHours === 24 * 7 }" @click="telemetryHours = 24 * 7">7d</button>
+                <button type="button" :class="{ active: telemetryHours === 24 * 30 }" @click="telemetryHours = 24 * 30">30d</button>
+              </div>
+            </div>
             <div v-for="series in sensorSeries" :key="series.key" class="sensor-chart">
               <div class="sensor-chart-head">
                 <span>{{ series.label }}</span>
@@ -1019,6 +1123,29 @@ function fmtLastAdvert(epoch: number): string {
                 <span>{{ series.min }}{{ series.unit ? ` ${series.unit}` : "" }}</span>
                 <span>{{ series.max }}{{ series.unit ? ` ${series.unit}` : "" }}</span>
               </div>
+              <ul v-if="rulesForMetric(series.key).length" class="sensor-alert-rules">
+                <li v-for="rule in rulesForMetric(series.key)" :key="rule.id">
+                  Alert {{ rule.comparator }} {{ rule.threshold }}{{ series.unit ? ` ${series.unit}` : "" }}
+                  <em :class="rule.lastState">{{ rule.lastState }}</em>
+                  <button type="button" class="icon-button" title="Remove alert" @click="removeContactAlertRule(rule.id)">
+                    <AppIcon name="trash" :size="12" />
+                  </button>
+                </li>
+              </ul>
+              <form class="sensor-alert-form" @submit.prevent="addContactAlertRule(series.key)">
+                <select v-model="alertFormFor(series.key).comparator" class="field-select" aria-label="Comparator">
+                  <option value="above">Above</option>
+                  <option value="below">Below</option>
+                </select>
+                <input
+                  v-model="alertFormFor(series.key).threshold"
+                  type="number"
+                  inputmode="decimal"
+                  :placeholder="`Alert threshold${series.unit ? ` (${series.unit})` : ''}`"
+                  aria-label="Alert threshold"
+                />
+                <button type="submit" :disabled="!alertFormFor(series.key).threshold">Add</button>
+              </form>
             </div>
           </div>
 
@@ -1037,6 +1164,15 @@ function fmtLastAdvert(epoch: number): string {
               </button>
               <button type="button" :disabled="detailsBusy !== null || !caps.nodeTools" :title="caps.guidance ?? undefined" @click="requestTelemetry">
                 <AppIcon name="battery" :size="15" /> {{ detailsBusy === "telemetry" ? "Requesting" : "Request telemetry" }}
+              </button>
+              <button
+                type="button"
+                :class="{ active: isMonitored }"
+                :disabled="monitorBusy || !caps.nodeTools"
+                :title="caps.guidance ?? (isMonitored ? 'Stop background telemetry polling for this contact' : 'Background-poll this contact periodically')"
+                @click="toggleMonitor"
+              >
+                <AppIcon name="signal" :size="15" /> {{ isMonitored ? "Monitoring" : "Monitor telemetry" }}
               </button>
               <button type="button" :disabled="detailsBusy !== null || !caps.manageContacts" :title="caps.guidance ?? undefined" @click="copyContactUri">
                 <AppIcon name="link" :size="15" /> {{ detailsBusy === "share" ? "Copying" : "Copy share link" }}
@@ -1297,11 +1433,29 @@ function fmtLastAdvert(epoch: number): string {
 .result-snippet mark { border-radius: 2px; background: color-mix(in srgb, var(--accent) 28%, transparent); color: inherit; }
 .result-day { flex: 0 0 auto; color: var(--text-faint); font-size: 10px; }
 .telemetry-history { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.telemetry-history-head { display: flex; align-items: center; justify-content: space-between; }
+.range-toggle { display: flex; gap: 3px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); padding: 3px; }
+.range-toggle button { min-width: 36px; border: 0; border-radius: 5px; background: transparent; padding: 5px 7px; color: var(--text-muted); font-family: monospace; font-size: 9px; font-weight: 700; cursor: pointer; }
+.range-toggle button.active { background: var(--surface-3); color: var(--accent); }
 .sensor-chart svg { display: block; width: 100%; height: 44px; }
 .sensor-chart-line { stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 .sensor-chart-head { display: flex; justify-content: space-between; margin-bottom: 2px; font-size: 11px; color: var(--text-muted); }
 .sensor-chart-head span:last-child { color: var(--text); font-weight: 650; }
 .sensor-chart-scale { display: flex; justify-content: space-between; color: var(--text-faint); font-size: 9px; }
+.sensor-alert-rules { display: flex; flex-direction: column; gap: 3px; list-style: none; margin: 6px 0 0; padding: 0; }
+.sensor-alert-rules li { display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 10px; }
+.sensor-alert-rules em { border-radius: 4px; padding: 1px 6px; font-size: 9px; font-style: normal; text-transform: uppercase; }
+.sensor-alert-rules em.ok { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
+.sensor-alert-rules em.breached { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
+.sensor-alert-rules .icon-button { margin-left: auto; }
+.icon-button { display: grid; width: 26px; height: 26px; flex: 0 0 auto; place-items: center; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-faint); cursor: pointer; }
+.icon-button:hover { color: var(--danger); }
+.sensor-alert-form { display: flex; gap: 6px; margin-top: 6px; }
+.sensor-alert-form .field-select { width: auto; flex: 0 0 78px; height: 30px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); padding: 0 6px; color: var(--text); font-size: 10px; }
+.sensor-alert-form input { flex: 1; min-width: 0; height: 30px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); padding: 0 8px; color: var(--text); font-size: 10px; }
+.sensor-alert-form button { flex: 0 0 auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); padding: 0 10px; color: var(--text); font-size: 10px; font-weight: 700; cursor: pointer; }
+.sensor-alert-form button:disabled { opacity: .5; cursor: not-allowed; }
+.details-actions button.active { border-color: var(--accent); color: var(--accent); }
 .message-row.out { justify-content: flex-end; }
 .message-bubble { max-width: min(68%, 680px); border: 1px solid var(--border); border-radius: 13px 13px 13px 4px; background: var(--surface-2); padding: calc(10px * var(--space-unit)) 12px 8px; box-shadow: 0 8px 20px rgb(0 0 0 / .08); }
 .message-row.out .message-bubble { border-color: color-mix(in srgb, var(--accent) 34%, var(--border)); border-radius: 13px 13px 4px 13px; background: color-mix(in srgb, var(--accent) 10%, var(--surface-2)); }

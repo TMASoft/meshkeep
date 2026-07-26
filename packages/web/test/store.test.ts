@@ -778,6 +778,46 @@ describe("radio switching (issue #53)", () => {
     expect(store.effectiveRadioId).toBe(1);
   });
 
+  it("collects timeline entries from every radio, bypassing the view filter", () => {
+    const store = useAppStore();
+    store.status = { activeRadioId: 1, radios } as typeof store.status;
+    // a background radio's message never reaches the conversation state…
+    store.onEvent({ type: "message.new", radioId: 2, message: message({ id: 21, text: "background" }) });
+    expect(store.recent).toHaveLength(0);
+    // …but its timeline entry is captured for the multi-radio timeline view
+    expect(store.timelineFeed).toHaveLength(1);
+    expect(store.timelineFeed[0]).toMatchObject({ id: "msg:21", radioId: 2, kind: "message" });
+    expect(store.timelineSeq).toBe(1);
+
+    // pre-built timeline events (adverts, link transitions) land in the feed too
+    store.onEvent({
+      type: "timeline.event",
+      radioId: 2,
+      event: {
+        id: "lnk:1",
+        radioId: 2,
+        ts: 1_784_000_000,
+        kind: "link",
+        link: { state: "connected", transport: "tcp", label: "default", error: null },
+      },
+    });
+    expect(store.timelineFeed).toHaveLength(2);
+    expect(store.timelineSeq).toBe(2);
+  });
+
+  it("caps the live timeline feed at 200 entries", () => {
+    const store = useAppStore();
+    store.status = { activeRadioId: 1, radios } as typeof store.status;
+    for (let i = 0; i < 210; i++) {
+      store.onEvent({ type: "message.new", radioId: 2, message: message({ id: 1000 + i }) });
+    }
+    expect(store.timelineFeed).toHaveLength(200);
+    // oldest entries were dropped, newest kept
+    expect(store.timelineFeed[store.timelineFeed.length - 1].id).toBe("msg:1209");
+    expect(store.timelineFeed[0].id).toBe("msg:1010");
+    expect(store.timelineSeq).toBe(210);
+  });
+
   it("a forgotten pinned radio falls back to following the active one", () => {
     const store = useAppStore();
     store.status = { activeRadioId: 1, radios } as typeof store.status;

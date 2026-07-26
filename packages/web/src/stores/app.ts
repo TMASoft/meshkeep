@@ -13,11 +13,14 @@ import type {
   RadioSummary,
   SensorReading,
   ServerDiagnostics,
+  TelemetryAlertEvent,
+  TimelineEvent,
   WsEvent,
 } from "@meshkeep/shared";
+import { wsToTimelineEvent } from "../timeline";
 import { api, ApiError, connectEvents, type WsStatus } from "../api/client";
 import { BrowserRadioSource, type BrowserRadioKind } from "../sources/browser-radio";
-import { notifyIncoming } from "../notifications";
+import { notifyAlert, notifyIncoming } from "../notifications";
 import {
   conversationPreferenceKey,
   savedConversationPreferences,
@@ -142,6 +145,15 @@ export const useAppStore = defineStore("app", {
       privateSession: boolean;
       batteryMilliVolts: number | null;
     },
+    // Most-recent-first, capped so a noisy rule can't grow this unbounded for
+    // the life of the tab; full history is available via GET /telemetry/alerts.
+    alertHistory: [] as TelemetryAlertEvent[],
+    // Live timeline entries from *any* radio, appended before the per-radio
+    // event filter — the timeline view overlays several radios' histories, so
+    // it must see events the conversation/contact state deliberately ignores.
+    // Capped; the view merges these into its own fetched window by id.
+    timelineFeed: [] as TimelineEvent[],
+    timelineSeq: 0,
   }),
 
   getters: {
@@ -748,6 +760,14 @@ export const useAppStore = defineStore("app", {
     },
 
     onEvent(event: WsEvent) {
+      // The timeline overlays several radios' histories, so its feed collects
+      // entries from every radio *before* the per-radio filter below; the
+      // timeline view applies its own radio selection.
+      const timelineEvent = wsToTimelineEvent(event);
+      if (timelineEvent) {
+        this.timelineFeed = [...this.timelineFeed.slice(-199), timelineEvent];
+        this.timelineSeq++;
+      }
       // Per-radio events carry a radioId; ignore those for a radio other than the
       // one in view so a background radio's traffic never leaks into the display.
       // (status.changed is global and has no radioId, so it always applies.)
@@ -808,6 +828,13 @@ export const useAppStore = defineStore("app", {
           break;
         case "telemetry":
           if (this.status) this.status.batteryMilliVolts = event.batteryMilliVolts;
+          break;
+        case "telemetry.alert":
+          this.alertHistory = [event.event, ...this.alertHistory].slice(0, 50);
+          notifyAlert(event.event);
+          break;
+        case "timeline.event":
+          // already captured in timelineFeed above
           break;
       }
     },

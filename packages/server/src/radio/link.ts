@@ -22,7 +22,6 @@ const CONNECT_TIMEOUT_MS = 15_000;
 // BLE needs discovery + GATT enumeration (and possibly a pairing handshake)
 const BLE_CONNECT_TIMEOUT_MS = 45_000;
 const CLOCK_DRIFT_TOLERANCE_SECS = 30;
-const BATTERY_POLL_MS = 5 * 60_000;
 const MAX_CHANNELS = 8;
 
 // Outbound retry backoff: hand-off failures (radio rejected the frame) back off
@@ -152,6 +151,7 @@ export class RadioLink {
   private reconnectDelay = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private batteryTimer: NodeJS.Timeout | null = null;
+  private contactPollTimer: NodeJS.Timeout | null = null;
   private lifecycleGeneration = 0;
   private lifecycleAbort = new AbortController();
   // The physical radio (radios.id) this link reads/writes. Resolved from the
@@ -293,6 +293,10 @@ export class RadioLink {
       clearInterval(this.batteryTimer);
       this.batteryTimer = null;
     }
+    if (this.contactPollTimer) {
+      clearInterval(this.contactPollTimer);
+      this.contactPollTimer = null;
+    }
     if (this.outboundTimer) {
       clearTimeout(this.outboundTimer);
       this.outboundTimer = null;
@@ -310,9 +314,30 @@ export class RadioLink {
   }
 
   private setState(state: ConnectionState, error: string | null): void {
+    const prev = this.state;
     this.state = state;
     this.lastError = error;
+    // Record link transitions at the single state choke point so every path
+    // (connection loss, stop, release, settings change) is covered once.
+    // Reconnect churn (connecting/syncing/error cycles) records nothing —
+    // only entering or leaving "connected" is a timeline fact.
+    if (this.radioId !== null && state !== prev) {
+      if (state === "connected") this.recordLinkTransition("connected", null);
+      else if (prev === "connected") this.recordLinkTransition("disconnected", error);
+    }
     this.onStateChange?.();
+  }
+
+  private recordLinkTransition(state: "connected" | "disconnected", error: string | null): void {
+    if (this.radioId === null) return;
+    const event = this.store.recordLinkEvent(this.radioId, {
+      state,
+      transport: this.getEffectiveSettings().connection,
+      label: this.label,
+      error,
+    });
+    this.store.trimTimeline(this.config.timelineRetentionDays);
+    this.bus.publish({ type: "timeline.event", radioId: this.radioId, event });
   }
 
   private async connect(): Promise<void> {
@@ -378,9 +403,18 @@ export class RadioLink {
       // Drain anything that queued while we were away (offline sends, backoffs).
       void this.processOutboundQueue();
 
-      this.batteryTimer = setInterval(() => {
-        void this.pollBattery(activeConnection, generation, signal);
-      }, BATTERY_POLL_MS);
+      this.batteryTimer = setInterval(
+        () => {
+          void this.pollBattery(activeConnection, generation, signal);
+        },
+        this.config.telemetryPollMinutes * 60_000,
+      );
+      this.contactPollTimer = setInterval(
+        () => {
+          void this.pollNextMonitoredContact();
+        },
+        this.config.telemetryMonitorMinutes * 60_000,
+      );
     } catch (error) {
       if (error instanceof LifecycleCancelledError || !connection || !this.isCurrent(connection, generation)) return;
       const raw = error instanceof Error ? error.message : String(error ?? "connect failed");
@@ -437,7 +471,12 @@ export class RadioLink {
         .then(() => {
           if (!this.isCurrent(connection, generation) || this.radioId === null) return;
           const contact = this.store.touchContactSeen(this.radioId, key);
-          if (contact) this.bus.publish({ type: "contact.updated", radioId: this.radioId, contact });
+          if (contact) {
+            this.bus.publish({ type: "contact.updated", radioId: this.radioId, contact });
+            const event = this.store.recordAdvert(this.radioId, contact, "seen");
+            this.store.trimTimeline(this.config.timelineRetentionDays);
+            this.bus.publish({ type: "timeline.event", radioId: this.radioId, event });
+          }
         });
     });
 
@@ -446,6 +485,9 @@ export class RadioLink {
       const contact = rawContactToContact(advert);
       this.store.upsertContact(this.radioId, contact);
       this.bus.publish({ type: "contact.updated", radioId: this.radioId, contact });
+      const event = this.store.recordAdvert(this.radioId, contact, "new");
+      this.store.trimTimeline(this.config.timelineRetentionDays);
+      this.bus.publish({ type: "timeline.event", radioId: this.radioId, event });
     });
 
     connection.on(Constants.PushCodes.PathUpdated, (_push: { publicKey: Uint8Array }) => {
@@ -937,10 +979,30 @@ export class RadioLink {
       value: item.value,
     }));
     if (readings.length) {
-      this.store.recordContactTelemetry(this.requireRadio(), contactKey, readings);
+      const radioId = this.requireRadio();
+      this.store.recordContactTelemetry(radioId, contactKey, readings);
       this.store.trimTelemetry(this.config.telemetryRetentionDays);
+      const samples = readings
+        .filter((r): r is SensorReading & { value: number } => typeof r.value === "number")
+        .map((r) => ({ metric: `${r.channel}:${r.type}`, label: r.label, value: r.value }));
+      for (const event of this.store.evaluateAlerts(radioId, contactKey, samples)) {
+        this.bus.publish({ type: "telemetry.alert", radioId, event });
+      }
     }
     return readings;
+  }
+
+  /** Poll the single most-overdue monitored contact, if any (issue #52 capacity bound). */
+  private async pollNextMonitoredContact(): Promise<void> {
+    if (this.radioId === null) return;
+    const contactKey = this.store.nextDueMonitor(this.radioId);
+    if (!contactKey) return;
+    try {
+      await this.requestTelemetry(contactKey);
+    } catch (error) {
+      if (error instanceof LifecycleCancelledError) return;
+      console.warn(`[radio:${this.label}] monitored-contact telemetry poll failed`, error);
+    }
   }
 
   private async pollBattery(
@@ -960,6 +1022,12 @@ export class RadioLink {
         batteryMilliVolts: battery.batteryMilliVolts,
         ts: Math.floor(Date.now() / 1000),
       });
+      const alerts = this.store.evaluateAlerts(radioId, null, [
+        { metric: "battery_mv", label: "Battery", value: battery.batteryMilliVolts },
+      ]);
+      for (const event of alerts) {
+        this.bus.publish({ type: "telemetry.alert", radioId, event });
+      }
     } catch (error) {
       if (error instanceof LifecycleCancelledError) return;
       console.warn(`[radio:${this.label}] battery poll failed`, error);

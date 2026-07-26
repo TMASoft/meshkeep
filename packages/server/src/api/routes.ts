@@ -19,7 +19,7 @@ import type { Bus } from "../bus.js";
 import type { Auth } from "./auth.js";
 import type { Db } from "../db/index.js";
 import type { ServerConfig } from "../config.js";
-import { csvHeaderRow, messageToCsvRow } from "./export.js";
+import { csvHeaderRow, csvTelemetryHeaderRow, messageToCsvRow, telemetryToCsvRow } from "./export.js";
 import { buildDiagnostics, buildSupportBundle, recentDiagnosticLogs } from "./diagnostics.js";
 import {
   ingestContactSchema,
@@ -254,6 +254,27 @@ export function buildApi(
       res.json({
         points: manager.store.getContactTelemetry(readRadioId(req), hexKey(req.params.key), since),
       });
+    }),
+  );
+  api.get(
+    "/contacts/:key/telemetry/monitor",
+    handle((req, res) => {
+      const monitors = manager.store.listMonitors(readRadioId(req));
+      res.json({ monitored: monitors.some((m) => m.contactKey === hexKey(req.params.key)) });
+    }),
+  );
+  api.post(
+    "/contacts/:key/telemetry/monitor",
+    handle((req, res) => {
+      manager.store.addMonitor(readRadioId(req), hexKey(req.params.key));
+      res.status(201).json({ ok: true });
+    }),
+  );
+  api.delete(
+    "/contacts/:key/telemetry/monitor",
+    handle((req, res) => {
+      manager.store.removeMonitor(readRadioId(req), hexKey(req.params.key));
+      res.json({ ok: true });
     }),
   );
   api.post(
@@ -590,6 +611,137 @@ export function buildApi(
         .parse(req.query.hours ?? 24);
       const since = Math.floor(Date.now() / 1000) - hours * 3600;
       res.json({ points: manager.store.getTelemetry(readRadioId(req), since) });
+    }),
+  );
+  api.get(
+    "/telemetry/monitors",
+    handle((req, res) => {
+      res.json({ monitors: manager.store.listMonitors(readRadioId(req)) });
+    }),
+  );
+  api.get(
+    "/telemetry/alerts/rules",
+    handle((req, res) => {
+      res.json({ rules: manager.store.listAlertRules(readRadioId(req)) });
+    }),
+  );
+  api.post(
+    "/telemetry/alerts/rules",
+    handle((req, res) => {
+      const body = z
+        .object({
+          contactKey: z
+            .string()
+            .regex(/^[0-9a-f]{64}$/i)
+            .nullable(),
+          metric: z.string().min(1).max(64),
+          comparator: z.enum(["below", "above"]),
+          threshold: z.number(),
+        })
+        .parse(req.body);
+      const rule = manager.store.addAlertRule(readRadioId(req), {
+        ...body,
+        contactKey: body.contactKey?.toLowerCase() ?? null,
+      });
+      res.status(201).json({ rule });
+    }),
+  );
+  api.delete(
+    "/telemetry/alerts/rules/:id",
+    handle((req, res) => {
+      const id = z.coerce.number().int().positive().parse(req.params.id);
+      manager.store.removeAlertRule(readRadioId(req), id);
+      res.json({ ok: true });
+    }),
+  );
+  api.get(
+    "/telemetry/alerts",
+    handle((req, res) => {
+      const hours = z.coerce
+        .number()
+        .int()
+        .min(1)
+        .max(24 * 30)
+        .default(24 * 7)
+        .parse(req.query.hours ?? 24 * 7);
+      const since = Math.floor(Date.now() / 1000) - hours * 3600;
+      res.json({ events: manager.store.listAlertEvents(readRadioId(req), since) });
+    }),
+  );
+  api.get(
+    "/telemetry/export",
+    handle((req, res) => {
+      const query = z
+        .object({
+          format: z.enum(["csv", "json"]).default("csv"),
+          hours: z.coerce
+            .number()
+            .int()
+            .min(1)
+            .max(24 * 30)
+            .default(24 * 30),
+          contactKey: z
+            .string()
+            .regex(/^[0-9a-f]{64}$/i)
+            .optional(),
+        })
+        .parse(req.query);
+      const since = Math.floor(Date.now() / 1000) - query.hours * 3600;
+      const rows = manager.store.exportTelemetry(readRadioId(req), since, query.contactKey?.toLowerCase());
+      const stamp = new Date().toISOString().slice(0, 10);
+      if (query.format === "json") {
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename="meshkeep-telemetry-${stamp}.json"`);
+        res.json({ exportedAt: Math.floor(Date.now() / 1000), samples: rows });
+      } else {
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename="meshkeep-telemetry-${stamp}.csv"`);
+        let body = csvTelemetryHeaderRow();
+        for (const row of rows) body += telemetryToCsvRow(row);
+        res.send(body);
+      }
+    }),
+  );
+
+  // ---- timeline ----
+  // One merged per-radio event feed. `radioIds` may name several stored radios
+  // (the view overlays the history of every radio ever attached); omitted, it
+  // follows the same default-radio resolution as every other read. `kinds`
+  // defaults to everything except raw telemetry samples, matching the UI's
+  // off-by-default telemetry layer.
+  api.get(
+    "/timeline",
+    handle((req, res) => {
+      const query = z
+        .object({
+          radioIds: z
+            .string()
+            .regex(/^\d+(,\d+)*$/)
+            .optional(),
+          from: z.coerce.number().int().nonnegative(),
+          to: z.coerce.number().int().positive(),
+          kinds: z
+            .string()
+            .transform((raw) => raw.split(","))
+            .pipe(z.array(z.enum(["advert", "message", "alert", "link", "telemetry"])))
+            .optional(),
+          limit: z.coerce.number().int().min(1).max(5000).default(2000),
+        })
+        .refine((q) => q.to > q.from, { message: "to must be after from" })
+        .parse(req.query);
+      let radioIds: number[];
+      if (query.radioIds) {
+        radioIds = [...new Set(query.radioIds.split(",").map(Number))];
+        for (const id of radioIds) {
+          if (!manager.hasRadio(id)) throw new RadioNotFoundError(`radio ${id} not found`);
+        }
+      } else {
+        // Same default-radio resolution as every other read; 0 matches no
+        // radio and yields an empty feed before anything has synced.
+        radioIds = [readRadioId(req)];
+      }
+      const kinds = query.kinds ?? ["advert", "message", "alert", "link"];
+      res.json(manager.store.getTimeline(radioIds, query.from, query.to, kinds, query.limit));
     }),
   );
 

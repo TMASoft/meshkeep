@@ -6,6 +6,7 @@ import ChatView from "./views/ChatView.vue";
 import MapView from "./views/MapView.vue";
 import DeviceView from "./views/DeviceView.vue";
 import DiagnosticsView from "./views/DiagnosticsView.vue";
+import TimelineView from "./views/TimelineView.vue";
 import "./style.css";
 
 function savedPreference(key: string, fallback: string): string {
@@ -32,6 +33,7 @@ const router = createRouter({
     { path: "/", redirect: "/chat" },
     { path: "/chat", component: ChatView },
     { path: "/map", component: MapView },
+    { path: "/timeline", component: TimelineView },
     { path: "/device", component: DeviceView },
     { path: "/diagnostics", component: DiagnosticsView },
   ],

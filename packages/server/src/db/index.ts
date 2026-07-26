@@ -343,6 +343,71 @@ export const MIGRATIONS: string[] = [
 
   DELETE FROM settings WHERE key IN ('connection.activeProfileId', 'connection.activeRadioId', 'connection.standby');
   `,
+  // 13: telemetry monitoring (issue #52). telemetry_monitors is the opt-in set
+  // of contacts a radio's background scheduler polls (explicit opt-in, not
+  // "every known contact", is itself the capacity bound). telemetry_alert_rules
+  // holds one threshold per (radio, optional contact, metric); contact_key
+  // IS NULL + metric = 'battery_mv' is the own-node battery rule, otherwise
+  // metric is the "<channel>:<type>" Cayenne key already used client-side for
+  // sensor sparklines. last_state tracks ok/breached so evaluation only fires
+  // on a transition, not on every sample while a breach persists.
+  // telemetry_alert_events is the fired-transition history, also the payload
+  // for notification delivery.
+  `
+  CREATE TABLE telemetry_monitors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    radio_id INTEGER NOT NULL,
+    contact_key TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (radio_id, contact_key)
+  );
+
+  CREATE TABLE telemetry_alert_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    radio_id INTEGER NOT NULL,
+    contact_key TEXT,
+    metric TEXT NOT NULL,
+    comparator TEXT NOT NULL CHECK (comparator IN ('below', 'above')),
+    threshold REAL NOT NULL,
+    last_state TEXT NOT NULL DEFAULT 'ok' CHECK (last_state IN ('ok', 'breached')),
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX idx_telemetry_alert_rules_lookup ON telemetry_alert_rules (radio_id, contact_key, metric);
+
+  CREATE TABLE telemetry_alert_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER NOT NULL,
+    radio_id INTEGER NOT NULL,
+    contact_key TEXT,
+    metric TEXT NOT NULL,
+    label TEXT NOT NULL,
+    value REAL NOT NULL,
+    threshold REAL NOT NULL,
+    comparator TEXT NOT NULL CHECK (comparator IN ('below', 'above')),
+    direction TEXT NOT NULL CHECK (direction IN ('breach', 'recover')),
+    ts INTEGER NOT NULL
+  );
+  CREATE INDEX idx_telemetry_alert_events_radio ON telemetry_alert_events (radio_id, ts);
+  `,
+  // 14: timeline. Stores only the event kinds that have no persistent history
+  // of their own — received adverts and link connect/disconnect transitions.
+  // Message/alert/telemetry timeline entries are derived at query time from
+  // the tables that already hold them, so nothing is duplicated. payload_json
+  // is a snapshot taken when the event happened (an advert row keeps the name
+  // the node advertised then, not the contact's current name).
+  `
+  CREATE TABLE timeline_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    radio_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('advert', 'link')),
+    ts INTEGER NOT NULL,
+    contact_key TEXT,
+    payload_json TEXT NOT NULL
+  );
+  CREATE INDEX idx_timeline_events_radio ON timeline_events (radio_id, ts);
+
+  CREATE INDEX idx_messages_radio_time ON messages (radio_id, created_at);
+  `,
 ];
 
 export type Db = Database.Database;

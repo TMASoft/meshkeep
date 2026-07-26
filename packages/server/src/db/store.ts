@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type {
+  AlertComparator,
   Channel,
   Contact,
   ContactTelemetryPoint,
@@ -14,7 +15,14 @@ import type {
   RadioSummary,
   SelfInfo,
   SensorReading,
+  TelemetryAlertEvent,
+  TelemetryAlertRule,
+  TelemetryMonitor,
   TelemetryPoint,
+  TimelineAdvertPayload,
+  TimelineEvent,
+  TimelineEventKind,
+  TimelineLinkPayload,
 } from "@meshkeep/shared";
 import type { Db } from "./index.js";
 
@@ -305,6 +313,10 @@ export class Store {
       this.db.prepare("DELETE FROM messages WHERE radio_id = ?").run(id);
       this.db.prepare("DELETE FROM outbound_queue WHERE radio_id = ?").run(id);
       this.db.prepare("DELETE FROM telemetry WHERE radio_id = ?").run(id);
+      this.db.prepare("DELETE FROM telemetry_monitors WHERE radio_id = ?").run(id);
+      this.db.prepare("DELETE FROM telemetry_alert_rules WHERE radio_id = ?").run(id);
+      this.db.prepare("DELETE FROM telemetry_alert_events WHERE radio_id = ?").run(id);
+      this.db.prepare("DELETE FROM timeline_events WHERE radio_id = ?").run(id);
       this.db.prepare("DELETE FROM channels WHERE radio_id = ?").run(id);
       this.db.prepare("DELETE FROM contacts WHERE radio_id = ?").run(id);
       this.db.prepare("DELETE FROM self WHERE radio_id = ?").run(id);
@@ -1098,4 +1110,468 @@ export class Store {
       .get(radioId) as { battery_mv: number } | undefined;
     return row?.battery_mv ?? null;
   }
+
+  /**
+   * Flatten stored telemetry (own-node battery plus every numeric contact
+   * sensor reading) into one row per metric sample, for export. Non-numeric
+   * readings (e.g. GPS) are skipped — same choice the web sensor sparklines
+   * already make.
+   */
+  exportTelemetry(radioId: number, sinceTs: number, contactKey?: string): TelemetryExportRow[] {
+    const rows = (
+      contactKey
+        ? this.db
+            .prepare(
+              `SELECT t.ts, t.battery_mv, t.raw_json, t.contact_key, c.name AS contact_name
+               FROM telemetry t
+               LEFT JOIN contacts c ON c.radio_id = t.radio_id AND c.public_key = t.contact_key
+               WHERE t.radio_id = ? AND t.ts >= ? AND t.contact_key = ?
+               ORDER BY t.ts ASC`,
+            )
+            .all(radioId, sinceTs, contactKey)
+        : this.db
+            .prepare(
+              `SELECT t.ts, t.battery_mv, t.raw_json, t.contact_key, c.name AS contact_name
+               FROM telemetry t
+               LEFT JOIN contacts c ON c.radio_id = t.radio_id AND c.public_key = t.contact_key
+               WHERE t.radio_id = ? AND t.ts >= ?
+               ORDER BY t.ts ASC`,
+            )
+            .all(radioId, sinceTs)
+    ) as Array<{
+      ts: number;
+      battery_mv: number | null;
+      raw_json: string | null;
+      contact_key: string | null;
+      contact_name: string | null;
+    }>;
+    const out: TelemetryExportRow[] = [];
+    for (const row of rows) {
+      if (row.contact_key === null) {
+        if (row.battery_mv === null) continue;
+        out.push({
+          ts: row.ts,
+          contactKey: null,
+          contactName: null,
+          metric: "battery_mv",
+          label: "Battery",
+          value: row.battery_mv,
+          unit: "mV",
+        });
+        continue;
+      }
+      if (!row.raw_json) continue;
+      const readings = JSON.parse(row.raw_json) as SensorReading[];
+      for (const reading of readings) {
+        if (typeof reading.value !== "number") continue;
+        out.push({
+          ts: row.ts,
+          contactKey: row.contact_key,
+          contactName: row.contact_name,
+          metric: `${reading.channel}:${reading.type}`,
+          label: reading.label,
+          value: reading.value,
+          unit: reading.unit,
+        });
+      }
+    }
+    return out;
+  }
+
+  // ---- telemetry monitors (issue #52) ----
+
+  /** Opt a contact into the background telemetry-polling round-robin. */
+  addMonitor(radioId: number, contactKey: string): void {
+    this.db
+      .prepare(
+        "INSERT INTO telemetry_monitors (radio_id, contact_key, created_at) VALUES (?, ?, ?) ON CONFLICT(radio_id, contact_key) DO NOTHING",
+      )
+      .run(radioId, contactKey, now());
+  }
+
+  removeMonitor(radioId: number, contactKey: string): void {
+    this.db.prepare("DELETE FROM telemetry_monitors WHERE radio_id = ? AND contact_key = ?").run(radioId, contactKey);
+  }
+
+  listMonitors(radioId: number): TelemetryMonitor[] {
+    const rows = this.db
+      .prepare("SELECT contact_key, created_at FROM telemetry_monitors WHERE radio_id = ? ORDER BY created_at ASC")
+      .all(radioId) as Array<{ contact_key: string; created_at: number }>;
+    return rows.map((r) => ({ contactKey: r.contact_key, createdAt: r.created_at }));
+  }
+
+  /**
+   * The most-overdue monitored contact (never-polled first, then oldest
+   * sample first), or null if nothing is monitored. Callers poll at most this
+   * one contact per scheduler tick — the capacity bound for contact telemetry.
+   */
+  nextDueMonitor(radioId: number): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT m.contact_key AS contact_key
+         FROM telemetry_monitors m
+         LEFT JOIN (
+           SELECT contact_key, MAX(ts) AS last_ts FROM telemetry WHERE radio_id = ? AND contact_key IS NOT NULL GROUP BY contact_key
+         ) t ON t.contact_key = m.contact_key
+         WHERE m.radio_id = ?
+         ORDER BY t.last_ts ASC
+         LIMIT 1`,
+      )
+      .get(radioId, radioId) as { contact_key: string } | undefined;
+    return row?.contact_key ?? null;
+  }
+
+  // ---- telemetry alert rules & events (issue #52) ----
+
+  listAlertRules(radioId: number): TelemetryAlertRule[] {
+    const rows = this.db
+      .prepare(
+        "SELECT id, contact_key, metric, comparator, threshold, last_state FROM telemetry_alert_rules WHERE radio_id = ? ORDER BY id ASC",
+      )
+      .all(radioId) as AlertRuleRow[];
+    return rows.map(rowToAlertRule);
+  }
+
+  addAlertRule(
+    radioId: number,
+    rule: { contactKey: string | null; metric: string; comparator: AlertComparator; threshold: number },
+  ): TelemetryAlertRule {
+    const info = this.db
+      .prepare(
+        "INSERT INTO telemetry_alert_rules (radio_id, contact_key, metric, comparator, threshold, last_state, created_at) VALUES (?, ?, ?, ?, ?, 'ok', ?)",
+      )
+      .run(radioId, rule.contactKey, rule.metric, rule.comparator, rule.threshold, now());
+    return {
+      id: Number(info.lastInsertRowid),
+      contactKey: rule.contactKey,
+      metric: rule.metric,
+      comparator: rule.comparator,
+      threshold: rule.threshold,
+      lastState: "ok",
+    };
+  }
+
+  removeAlertRule(radioId: number, ruleId: number): void {
+    this.db.prepare("DELETE FROM telemetry_alert_rules WHERE radio_id = ? AND id = ?").run(radioId, ruleId);
+  }
+
+  listAlertEvents(radioId: number, sinceTs: number): TelemetryAlertEvent[] {
+    const rows = this.db
+      .prepare(
+        `SELECT e.id, e.rule_id, e.contact_key, e.metric, e.label, e.value, e.threshold, e.comparator, e.direction, e.ts,
+                c.name AS contact_name
+         FROM telemetry_alert_events e
+         LEFT JOIN contacts c ON c.radio_id = e.radio_id AND c.public_key = e.contact_key
+         WHERE e.radio_id = ? AND e.ts >= ?
+         ORDER BY e.ts DESC`,
+      )
+      .all(radioId, sinceTs) as AlertEventRow[];
+    return rows.map(rowToAlertEvent);
+  }
+
+  /**
+   * Compare freshly-recorded samples against configured rules and fire any
+   * ok<->breached transitions. Called right after a sample is persisted (the
+   * own-node battery poll or a contact telemetry response), so this is the
+   * single choke point for alert delivery — every recorded sample passes
+   * through it exactly once.
+   */
+  evaluateAlerts(
+    radioId: number,
+    contactKey: string | null,
+    samples: Array<{ metric: string; label: string; value: number }>,
+  ): TelemetryAlertEvent[] {
+    if (!samples.length) return [];
+    const fired: TelemetryAlertEvent[] = [];
+    const contactRow = contactKey
+      ? (this.db.prepare("SELECT name FROM contacts WHERE radio_id = ? AND public_key = ?").get(radioId, contactKey) as
+          | { name: string }
+          | undefined)
+      : undefined;
+    const contactName = contactRow?.name ?? null;
+    for (const sample of samples) {
+      const rules = this.db
+        .prepare(
+          "SELECT id, contact_key, metric, comparator, threshold, last_state FROM telemetry_alert_rules WHERE radio_id = ? AND contact_key IS ? AND metric = ?",
+        )
+        .all(radioId, contactKey, sample.metric) as AlertRuleRow[];
+      for (const rule of rules) {
+        const breached = rule.comparator === "below" ? sample.value < rule.threshold : sample.value > rule.threshold;
+        const newState: "ok" | "breached" = breached ? "breached" : "ok";
+        if (newState === rule.last_state) continue;
+        this.db.prepare("UPDATE telemetry_alert_rules SET last_state = ? WHERE id = ?").run(newState, rule.id);
+        const ts = now();
+        const direction: "breach" | "recover" = breached ? "breach" : "recover";
+        const info = this.db
+          .prepare(
+            "INSERT INTO telemetry_alert_events (rule_id, radio_id, contact_key, metric, label, value, threshold, comparator, direction, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          )
+          .run(
+            rule.id,
+            radioId,
+            contactKey,
+            sample.metric,
+            sample.label,
+            sample.value,
+            rule.threshold,
+            rule.comparator,
+            direction,
+            ts,
+          );
+        fired.push({
+          id: Number(info.lastInsertRowid),
+          ruleId: rule.id,
+          contactKey,
+          contactName,
+          metric: sample.metric,
+          label: sample.label,
+          value: sample.value,
+          threshold: rule.threshold,
+          comparator: rule.comparator,
+          direction,
+          ts,
+        });
+      }
+    }
+    return fired;
+  }
+
+  // ---- timeline ----
+
+  /**
+   * Persist one received advert as a snapshot of the contact at advert time
+   * (an advert row keeps the name the node advertised then, not whatever the
+   * contact is renamed to later).
+   */
+  recordAdvert(radioId: number, contact: Contact, observed: "new" | "seen"): TimelineEvent {
+    const payload: TimelineAdvertPayload = {
+      contactKey: contact.publicKey,
+      name: contact.name,
+      type: contact.type,
+      flags: contact.flags,
+      outPathLen: contact.outPathLen,
+      lat: contact.lat,
+      lon: contact.lon,
+      observed,
+    };
+    const ts = now();
+    const info = this.db
+      .prepare("INSERT INTO timeline_events (radio_id, kind, ts, contact_key, payload_json) VALUES (?, 'advert', ?, ?, ?)")
+      .run(radioId, ts, contact.publicKey, JSON.stringify(payload));
+    return { id: `adv:${info.lastInsertRowid}`, radioId, ts, kind: "advert", advert: payload };
+  }
+
+  recordLinkEvent(radioId: number, link: TimelineLinkPayload): TimelineEvent {
+    const ts = now();
+    const info = this.db
+      .prepare("INSERT INTO timeline_events (radio_id, kind, ts, contact_key, payload_json) VALUES (?, 'link', ?, NULL, ?)")
+      .run(radioId, ts, JSON.stringify(link));
+    return { id: `lnk:${info.lastInsertRowid}`, radioId, ts, kind: "link", link };
+  }
+
+  /**
+   * One merged, ascending event feed across the requested radios and kinds.
+   * Adverts and link transitions come from timeline_events; message, alert,
+   * and telemetry entries are derived from the tables that already store them.
+   * Each source is fetched with `limit + 1` so `truncated` is reliable even
+   * when a single source overflows the cap on its own.
+   */
+  getTimeline(
+    radioIds: number[],
+    fromTs: number,
+    toTs: number,
+    kinds: TimelineEventKind[],
+    limit: number,
+  ): { events: TimelineEvent[]; truncated: boolean } {
+    const merged: TimelineEvent[] = [];
+    const fetch = limit + 1;
+    for (const radioId of radioIds) {
+      const stored = (["advert", "link"] as const).filter((kind) => kinds.includes(kind));
+      if (stored.length > 0) {
+        const rows = this.db
+          .prepare(
+            `SELECT id, kind, ts, payload_json FROM timeline_events
+             WHERE radio_id = ? AND kind IN (${stored.map(() => "?").join(", ")}) AND ts >= ? AND ts <= ?
+             ORDER BY ts ASC LIMIT ?`,
+          )
+          .all(radioId, ...stored, fromTs, toTs, fetch) as Array<{
+          id: number;
+          kind: "advert" | "link";
+          ts: number;
+          payload_json: string;
+        }>;
+        for (const row of rows) {
+          merged.push(
+            row.kind === "advert"
+              ? { id: `adv:${row.id}`, radioId, ts: row.ts, kind: "advert", advert: JSON.parse(row.payload_json) as TimelineAdvertPayload }
+              : { id: `lnk:${row.id}`, radioId, ts: row.ts, kind: "link", link: JSON.parse(row.payload_json) as TimelineLinkPayload },
+          );
+        }
+      }
+      if (kinds.includes("message")) {
+        const rows = this.db
+          .prepare(
+            `SELECT m.id, m.kind, m.direction, m.contact_key, m.contact_prefix, m.channel_idx,
+                    m.sender_timestamp, m.created_at, substr(m.text, 1, 140) AS preview,
+                    c.name AS contact_name, ch.name AS channel_name
+             FROM messages m
+             LEFT JOIN contacts c ON c.public_key = m.contact_key AND c.radio_id = m.radio_id
+             LEFT JOIN channels ch ON ch.idx = m.channel_idx AND ch.radio_id = m.radio_id
+             WHERE m.radio_id = ? AND m.created_at >= ? AND m.created_at <= ?
+             ORDER BY m.created_at ASC LIMIT ?`,
+          )
+          .all(radioId, fromTs, toTs, fetch) as Array<{
+          id: number;
+          kind: MessageKind;
+          direction: MessageDirection;
+          contact_key: string | null;
+          contact_prefix: string | null;
+          channel_idx: number | null;
+          sender_timestamp: number;
+          created_at: number;
+          preview: string;
+          contact_name: string | null;
+          channel_name: string | null;
+        }>;
+        for (const row of rows) {
+          merged.push({
+            id: `msg:${row.id}`,
+            radioId,
+            ts: row.created_at,
+            kind: "message",
+            message: {
+              messageId: row.id,
+              messageKind: row.kind,
+              direction: row.direction,
+              contactKey: row.contact_key,
+              contactPrefix: row.contact_prefix,
+              contactName: row.contact_name,
+              channelIdx: row.channel_idx,
+              channelName: row.channel_name,
+              senderTimestamp: row.sender_timestamp,
+              preview: row.preview,
+            },
+          });
+        }
+      }
+      if (kinds.includes("alert")) {
+        const rows = this.db
+          .prepare(
+            `SELECT e.id, e.rule_id, e.contact_key, e.metric, e.label, e.value, e.threshold, e.comparator, e.direction, e.ts,
+                    c.name AS contact_name
+             FROM telemetry_alert_events e
+             LEFT JOIN contacts c ON c.radio_id = e.radio_id AND c.public_key = e.contact_key
+             WHERE e.radio_id = ? AND e.ts >= ? AND e.ts <= ?
+             ORDER BY e.ts ASC LIMIT ?`,
+          )
+          .all(radioId, fromTs, toTs, fetch) as AlertEventRow[];
+        for (const row of rows) {
+          merged.push({ id: `alr:${row.id}`, radioId, ts: row.ts, kind: "alert", alert: rowToAlertEvent(row) });
+        }
+      }
+      if (kinds.includes("telemetry")) {
+        const rows = this.db
+          .prepare(
+            `SELECT t.id, t.ts, t.battery_mv, t.raw_json, t.contact_key, c.name AS contact_name
+             FROM telemetry t
+             LEFT JOIN contacts c ON c.radio_id = t.radio_id AND c.public_key = t.contact_key
+             WHERE t.radio_id = ? AND t.ts >= ? AND t.ts <= ?
+             ORDER BY t.ts ASC LIMIT ?`,
+          )
+          .all(radioId, fromTs, toTs, fetch) as Array<{
+          id: number;
+          ts: number;
+          battery_mv: number | null;
+          raw_json: string | null;
+          contact_key: string | null;
+          contact_name: string | null;
+        }>;
+        for (const row of rows) {
+          merged.push({
+            id: `tlm:${row.id}`,
+            radioId,
+            ts: row.ts,
+            kind: "telemetry",
+            telemetry: {
+              contactKey: row.contact_key,
+              contactName: row.contact_name,
+              batteryMv: row.battery_mv,
+              readings: row.contact_key && row.raw_json ? (JSON.parse(row.raw_json) as SensorReading[]) : [],
+            },
+          });
+        }
+      }
+    }
+    merged.sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const truncated = merged.length > limit;
+    return { events: truncated ? merged.slice(0, limit) : merged, truncated };
+  }
+
+  /** Delete timeline rows older than the retention window (all radios). Returns rows removed. */
+  trimTimeline(retentionDays: number): number {
+    if (!Number.isFinite(retentionDays) || retentionDays <= 0) return 0;
+    const cutoff = now() - Math.floor(retentionDays * 86_400);
+    return this.db.prepare("DELETE FROM timeline_events WHERE ts < ?").run(cutoff).changes;
+  }
+}
+
+/** One flattened telemetry sample, ready for CSV/JSON export. */
+export interface TelemetryExportRow {
+  ts: number;
+  contactKey: string | null;
+  contactName: string | null;
+  metric: string;
+  label: string;
+  value: number;
+  unit: string | null;
+}
+
+interface AlertRuleRow {
+  id: number;
+  contact_key: string | null;
+  metric: string;
+  comparator: AlertComparator;
+  threshold: number;
+  last_state: "ok" | "breached";
+}
+
+function rowToAlertRule(row: AlertRuleRow): TelemetryAlertRule {
+  return {
+    id: row.id,
+    contactKey: row.contact_key,
+    metric: row.metric,
+    comparator: row.comparator,
+    threshold: row.threshold,
+    lastState: row.last_state,
+  };
+}
+
+interface AlertEventRow {
+  id: number;
+  rule_id: number;
+  contact_key: string | null;
+  metric: string;
+  label: string;
+  value: number;
+  threshold: number;
+  comparator: AlertComparator;
+  direction: "breach" | "recover";
+  ts: number;
+  contact_name: string | null;
+}
+
+function rowToAlertEvent(row: AlertEventRow): TelemetryAlertEvent {
+  return {
+    id: row.id,
+    ruleId: row.rule_id,
+    contactKey: row.contact_key,
+    contactName: row.contact_name,
+    metric: row.metric,
+    label: row.label,
+    value: row.value,
+    threshold: row.threshold,
+    comparator: row.comparator,
+    direction: row.direction,
+    ts: row.ts,
+  };
 }
