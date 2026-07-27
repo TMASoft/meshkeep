@@ -23,10 +23,25 @@ import type {
   TimelineEvent,
   TimelineEventKind,
   TimelineLinkPayload,
+  TimelineOverview,
+  TimelineOverviewBucket,
 } from "@meshkeep/shared";
 import type { Db } from "./index.js";
 
 const now = () => Math.floor(Date.now() / 1000);
+
+/**
+ * Where each timeline kind physically lives, for the overview aggregate. These
+ * fragments are compile-time constants — only radio ids and bucket sizes are
+ * ever bound as parameters.
+ */
+const OVERVIEW_SOURCES: Record<TimelineEventKind, { table: string; tsCol: string; where: string }> = {
+  advert: { table: "timeline_events", tsCol: "ts", where: "AND kind = 'advert'" },
+  link: { table: "timeline_events", tsCol: "ts", where: "AND kind = 'link'" },
+  message: { table: "messages", tsCol: "created_at", where: "" },
+  alert: { table: "telemetry_alert_events", tsCol: "ts", where: "" },
+  telemetry: { table: "telemetry", tsCol: "ts", where: "" },
+};
 
 /** Store-internal outbound entry: the shared shape plus the radio and `cli` flag the worker needs. */
 export interface OutboundEntry extends OutboundQueueEntry {
@@ -1505,6 +1520,61 @@ export class Store {
     merged.sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     const truncated = merged.length > limit;
     return { events: truncated ? merged.slice(0, limit) : merged, truncated };
+  }
+
+  /**
+   * Bucketed event counts across the *whole* stored history of `radioIds`, for
+   * the navigator strip under the timeline. Only counts cross the wire, so the
+   * client can show every event that exists without fetching them all.
+   * `from`/`to` are the real extent of the matching rows.
+   */
+  getTimelineOverview(radioIds: number[], kinds: TimelineEventKind[], bucketCount: number): TimelineOverview {
+    const empty: TimelineOverview = { from: 0, to: 0, bucketSecs: 0, buckets: [], total: 0 };
+    if (radioIds.length === 0 || kinds.length === 0) return empty;
+    const idList = radioIds.map(() => "?").join(", ");
+
+    let from = Infinity;
+    let to = -Infinity;
+    for (const kind of kinds) {
+      const source = OVERVIEW_SOURCES[kind];
+      const row = this.db
+        .prepare(
+          `SELECT MIN(${source.tsCol}) AS lo, MAX(${source.tsCol}) AS hi FROM ${source.table}
+           WHERE radio_id IN (${idList}) ${source.where}`,
+        )
+        .get(...radioIds) as { lo: number | null; hi: number | null };
+      if (row.lo !== null) from = Math.min(from, row.lo);
+      if (row.hi !== null) to = Math.max(to, row.hi);
+    }
+    if (!Number.isFinite(from)) return empty;
+
+    // A history spanning a single instant still needs a positive width to bucket over.
+    const bucketSecs = Math.max(1, Math.ceil(Math.max(to - from, 1) / Math.max(bucketCount, 1)));
+    const byTs = new Map<number, TimelineOverviewBucket>();
+    let total = 0;
+    for (const kind of kinds) {
+      const source = OVERVIEW_SOURCES[kind];
+      // CAST, not integer division: bound numbers can arrive as REAL, which
+      // would make `/` floating and scatter counts across fractional buckets.
+      const rows = this.db
+        .prepare(
+          `SELECT CAST((${source.tsCol} - ?) / ? AS INTEGER) AS bucket, COUNT(*) AS n FROM ${source.table}
+           WHERE radio_id IN (${idList}) ${source.where}
+           GROUP BY bucket`,
+        )
+        .all(from, bucketSecs, ...radioIds) as Array<{ bucket: number; n: number }>;
+      for (const row of rows) {
+        const ts = from + row.bucket * bucketSecs;
+        let bucket = byTs.get(ts);
+        if (bucket === undefined) {
+          bucket = { ts, counts: {} };
+          byTs.set(ts, bucket);
+        }
+        bucket.counts[kind] = (bucket.counts[kind] ?? 0) + row.n;
+        total += row.n;
+      }
+    }
+    return { from, to, bucketSecs, buckets: [...byTs.values()].sort((a, b) => a.ts - b.ts), total };
   }
 
   /** Delete timeline rows older than the retention window (all radios). Returns rows removed. */

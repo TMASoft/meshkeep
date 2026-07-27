@@ -145,6 +145,128 @@ describe("timeline store", () => {
   });
 });
 
+describe("timeline overview", () => {
+  const BASE = 1_700_000_000;
+
+  it("buckets the whole stored extent and reports it", () => {
+    const { manager, db } = buildHarness();
+    const store = manager.store;
+    const radioId = store.resolveRadio("f".repeat(64), "Radio");
+    const insert = db.prepare("INSERT INTO timeline_events (radio_id, kind, ts, payload_json) VALUES (?, 'link', ?, '{}')");
+    for (const offset of [0, 3600, 7200]) insert.run(radioId, BASE + offset);
+
+    const overview = store.getTimelineOverview([radioId], ["link"], 3);
+    expect(overview.from).toBe(BASE);
+    expect(overview.to).toBe(BASE + 7200);
+    expect(overview.bucketSecs).toBe(2400);
+    expect(overview.total).toBe(3);
+    expect(overview.buckets).toEqual([
+      { ts: BASE, counts: { link: 1 } },
+      { ts: BASE + 2400, counts: { link: 1 } },
+      { ts: BASE + 7200, counts: { link: 1 } },
+    ]);
+  });
+
+  it("counts each kind separately, merges radios, and honours the kind filter", () => {
+    const { manager, db } = buildHarness();
+    const store = manager.store;
+    const radioA = store.resolveRadio("f".repeat(64), "Alpha");
+    const radioB = store.resolveRadio("e".repeat(64), "Bravo");
+    db.prepare("INSERT INTO timeline_events (radio_id, kind, ts, payload_json) VALUES (?, 'advert', ?, '{}')").run(radioA, BASE);
+    db.prepare("INSERT INTO timeline_events (radio_id, kind, ts, payload_json) VALUES (?, 'link', ?, '{}')").run(radioA, BASE);
+    db.prepare("INSERT INTO timeline_events (radio_id, kind, ts, payload_json) VALUES (?, 'advert', ?, '{}')").run(radioB, BASE);
+
+    const both = store.getTimelineOverview([radioA, radioB], ["advert", "link"], 10);
+    expect(both.total).toBe(3);
+    expect(both.buckets).toEqual([{ ts: BASE, counts: { advert: 2, link: 1 } }]);
+
+    // filtering by kind drops the other source entirely
+    const advertsOnly = store.getTimelineOverview([radioA, radioB], ["advert"], 10);
+    expect(advertsOnly.total).toBe(2);
+    expect(advertsOnly.buckets).toEqual([{ ts: BASE, counts: { advert: 2 } }]);
+
+    // and radios stay isolated
+    expect(store.getTimelineOverview([radioB], ["advert", "link"], 10).total).toBe(1);
+  });
+
+  it("picks up derived message, alert, and telemetry rows", () => {
+    const { manager } = buildHarness();
+    const store = manager.store;
+    const radioId = store.resolveRadio("f".repeat(64), "Radio");
+    store.upsertContact(radioId, contact(CONTACT_A, "Basecamp"));
+    store.insertMessage(radioId, { kind: "dm", contactKey: CONTACT_A, direction: "in", text: "hi", senderTimestamp: 1000 });
+    store.addAlertRule(radioId, { contactKey: null, metric: "battery_mv", comparator: "below", threshold: 3500 });
+    store.evaluateAlerts(radioId, null, [{ metric: "battery_mv", label: "Battery", value: 3000 }]);
+    store.recordTelemetry(radioId, 4100);
+
+    const overview = store.getTimelineOverview([radioId], ["message", "alert", "telemetry"], 240);
+    expect(overview.total).toBe(3);
+    const counts = overview.buckets.reduce<Record<string, number>>((acc, bucket) => {
+      for (const [kind, n] of Object.entries(bucket.counts)) acc[kind] = (acc[kind] ?? 0) + n;
+      return acc;
+    }, {});
+    expect(counts).toEqual({ message: 1, alert: 1, telemetry: 1 });
+  });
+
+  it("returns an empty summary when there is nothing stored", () => {
+    const { manager } = buildHarness();
+    const radioId = manager.store.resolveRadio("f".repeat(64), "Radio");
+    expect(manager.store.getTimelineOverview([radioId], ["advert", "link"], 240)).toEqual({
+      from: 0,
+      to: 0,
+      bucketSecs: 0,
+      buckets: [],
+      total: 0,
+    });
+    // no radios or no kinds is the same empty answer, not a crash
+    expect(manager.store.getTimelineOverview([], ["advert"], 240).total).toBe(0);
+    expect(manager.store.getTimelineOverview([radioId], [], 240).total).toBe(0);
+  });
+
+  it("keeps a single-instant history bucketable", () => {
+    const { manager, db } = buildHarness();
+    const radioId = manager.store.resolveRadio("f".repeat(64), "Radio");
+    const insert = db.prepare("INSERT INTO timeline_events (radio_id, kind, ts, payload_json) VALUES (?, 'link', ?, '{}')");
+    insert.run(radioId, BASE);
+    insert.run(radioId, BASE);
+
+    const overview = manager.store.getTimelineOverview([radioId], ["link"], 240);
+    expect(overview.from).toBe(BASE);
+    expect(overview.to).toBe(BASE);
+    expect(overview.bucketSecs).toBe(1);
+    expect(overview.buckets).toEqual([{ ts: BASE, counts: { link: 2 } }]);
+  });
+});
+
+describe("timeline overview route", () => {
+  it("serves the summary and excludes telemetry by default", async () => {
+    const { app, manager } = buildHarness();
+    const store = manager.store;
+    const radioId = store.resolveRadio("f".repeat(64), "Radio");
+    store.recordAdvert(radioId, contact(CONTACT_A, "A-node"), "new");
+    store.recordTelemetry(radioId, 4100);
+
+    const res = await request(app).get(`/api/v1/timeline/overview?radioIds=${radioId}`);
+    expect(res.status).toBe(200);
+    expect(res.body.total).toBe(1);
+    expect(res.body.buckets[0].counts).toEqual({ advert: 1 });
+
+    const withTelemetry = await request(app).get(`/api/v1/timeline/overview?radioIds=${radioId}&kinds=advert,telemetry`);
+    expect(withTelemetry.body.total).toBe(2);
+  });
+
+  it("falls back to the default radio and validates its inputs", async () => {
+    const { app, manager } = buildHarness();
+    const radioId = manager.store.resolveRadio("f".repeat(64), "Radio");
+    manager.store.recordAdvert(radioId, contact(CONTACT_A, "A-node"), "new");
+
+    expect((await request(app).get("/api/v1/timeline/overview")).body.total).toBe(1);
+    expect((await request(app).get("/api/v1/timeline/overview?kinds=bogus")).status).toBe(400);
+    expect((await request(app).get("/api/v1/timeline/overview?buckets=1")).status).toBe(400);
+    expect((await request(app).get("/api/v1/timeline/overview?radioIds=9999")).status).toBe(404);
+  });
+});
+
 describe("timeline route", () => {
   it("serves a merged multi-radio feed", async () => {
     const { app, manager } = buildHarness();

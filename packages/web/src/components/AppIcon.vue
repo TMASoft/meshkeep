@@ -26,6 +26,7 @@ withDefaults(
       | "download"
       | "archive"
       | "plus"
+      | "minus"
       | "info"
       | "trash"
       | "link"
@@ -141,6 +142,9 @@ withDefaults(
     </template>
     <template v-else-if="name === 'plus'">
       <path d="M12 5v14M5 12h14" />
+    </template>
+    <template v-else-if="name === 'minus'">
+      <path d="M5 12h14" />
     </template>
     <template v-else-if="name === 'info'">
       <circle cx="12" cy="12" r="9" />

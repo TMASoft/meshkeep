@@ -745,6 +745,40 @@ export function buildApi(
     }),
   );
 
+  // Bucketed counts over the entire stored history of the same radios/kinds,
+  // for the navigator strip under the timeline. Unlike `/timeline` this takes
+  // no window — its whole job is to show what exists outside the current one.
+  api.get(
+    "/timeline/overview",
+    handle((req, res) => {
+      const query = z
+        .object({
+          radioIds: z
+            .string()
+            .regex(/^\d+(,\d+)*$/)
+            .optional(),
+          kinds: z
+            .string()
+            .transform((raw) => raw.split(","))
+            .pipe(z.array(z.enum(["advert", "message", "alert", "link", "telemetry"])))
+            .optional(),
+          buckets: z.coerce.number().int().min(10).max(1000).default(240),
+        })
+        .parse(req.query);
+      let radioIds: number[];
+      if (query.radioIds) {
+        radioIds = [...new Set(query.radioIds.split(",").map(Number))];
+        for (const id of radioIds) {
+          if (!manager.hasRadio(id)) throw new RadioNotFoundError(`radio ${id} not found`);
+        }
+      } else {
+        radioIds = [readRadioId(req)];
+      }
+      const kinds = query.kinds ?? ["advert", "message", "alert", "link"];
+      res.json(manager.store.getTimelineOverview(radioIds, kinds, query.buckets));
+    }),
+  );
+
   // ---- hardware detection (Radio → Connection) ----
   api.get(
     "/system/ports",

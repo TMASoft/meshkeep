@@ -92,6 +92,54 @@ export function panBy(view: TimeWindow, deltaSecs: number, now: number): TimeWin
   return clampWindow(view.start + deltaSecs, view.end + deltaSecs, now);
 }
 
+/** Move the window so `ts` sits at its centre, keeping the current span. */
+export function centerOn(view: TimeWindow, ts: number, now: number): TimeWindow {
+  const half = (view.end - view.start) / 2;
+  return clampWindow(ts - half, ts + half, now);
+}
+
+/**
+ * Domain the navigator strip is drawn over: the whole stored extent, widened
+ * when needed so the current window always fits inside it — otherwise zooming
+ * out past the oldest event would push the viewport marker off the strip.
+ * `extent` is null when nothing is stored, leaving just the window.
+ */
+export function overviewDomain(extent: { from: number; to: number } | null, view: TimeWindow): TimeWindow {
+  const start = Math.min(extent?.from ?? view.start, view.start);
+  const end = Math.max(extent?.to ?? view.end, view.end);
+  return end > start ? { start, end } : { start, end: start + MIN_SPAN };
+}
+
+// ---- canvas geometry ----
+
+/** Height of the time-axis strip along the bottom of the canvas. */
+export const AXIS_H = 30;
+/** A lane never gets shorter than this, however little room the card has. */
+export const MIN_LANE_H = 84;
+const MIN_KIND_ROW_H = 12;
+/** Past this, extra height goes to margins rather than pushing the rows apart. */
+const MAX_KIND_ROW_H = 44;
+/** Rows reserved per lane — one per kind in KIND_META, so lanes line up whether or not telemetry is shown. */
+const KIND_ROWS = 5;
+
+export interface LaneMetrics {
+  laneH: number;
+  kindRowH: number;
+  /** Offset of the first kind row inside a lane; keeps the rows vertically centred. */
+  padTop: number;
+  /** Total canvas height, lanes plus axis. */
+  height: number;
+}
+
+/** Distribute `availPx` of card height over `laneCount` lanes and their kind rows. */
+export function laneMetrics(availPx: number, laneCount: number): LaneMetrics {
+  const lanes = Math.max(laneCount, 1);
+  const laneH = Math.max(MIN_LANE_H, (availPx - AXIS_H) / lanes);
+  const kindRowH = Math.min(MAX_KIND_ROW_H, Math.max(MIN_KIND_ROW_H, (laneH - 36) / (KIND_ROWS - 1)));
+  const padTop = Math.max(18, (laneH - kindRowH * (KIND_ROWS - 1)) / 2);
+  return { laneH, kindRowH, padTop, height: laneH * lanes + AXIS_H };
+}
+
 /** Tick steps from 1 minute to 30 days; the ladder picks the first step wide enough. */
 const TICK_STEPS = [60, 300, 900, 3600, 10_800, 21_600, 43_200, 86_400, 172_800, 604_800, 1_209_600, 2_592_000];
 const TARGET_TICK_PX = 80;

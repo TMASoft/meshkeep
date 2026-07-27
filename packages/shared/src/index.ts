@@ -360,6 +360,28 @@ export type TimelineEvent =
   | (TimelineEventBase & { kind: "alert"; alert: TelemetryAlertEvent })
   | (TimelineEventBase & { kind: "telemetry"; telemetry: TimelineTelemetryPayload });
 
+/** Event counts inside one bucket of the overview histogram, keyed by kind. */
+export interface TimelineOverviewBucket {
+  /** Start of the bucket; it covers [ts, ts + bucketSecs). */
+  ts: number;
+  counts: Partial<Record<TimelineEventKind, number>>;
+}
+
+/**
+ * Coarse density summary of a radio's whole stored history, used to draw the
+ * navigator strip under the zoomable timeline. `from`/`to` are the real extent
+ * of the matching events (both 0 when there are none), so the client can show
+ * everything that exists without fetching it.
+ */
+export interface TimelineOverview {
+  from: number;
+  to: number;
+  bucketSecs: number;
+  /** Ascending by `ts`; empty buckets are omitted. */
+  buckets: TimelineOverviewBucket[];
+  total: number;
+}
+
 /** Connection settings the server can be pointed at (env or runtime override). */
 export interface ConnectionSettings {
   connection: ConnectionTransport;

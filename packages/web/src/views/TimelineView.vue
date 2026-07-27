@@ -1,12 +1,23 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import type { ContactTelemetryPoint, RadioSummary, TimelineEvent, TimelineEventKind } from "@meshkeep/shared";
+import type {
+  ContactTelemetryPoint,
+  RadioSummary,
+  TimelineEvent,
+  TimelineEventKind,
+  TimelineOverview,
+} from "@meshkeep/shared";
 import { api } from "../api/client";
 import { useAppStore, radioSuffix } from "../stores/app";
 import AppIcon from "../components/AppIcon.vue";
 import {
+  AXIS_H,
   KIND_META,
+  MIN_LANE_H,
+  centerOn,
   clusterEvents,
+  laneMetrics,
+  overviewDomain,
   panBy,
   timeTicks,
   zoomAround,
@@ -16,10 +27,9 @@ import {
 
 const store = useAppStore();
 
-const LANE_H = 84;
-const AXIS_H = 30;
-const LANE_PAD_TOP = 18;
-const KIND_ROW_H = 12;
+/** Navigator strip: bar area plus the little axis under it. */
+const OVERVIEW_H = 46;
+const OVERVIEW_AXIS_H = 16;
 const BASE_KINDS: TimelineEventKind[] = ["advert", "message", "alert", "link"];
 const SPAN_PRESETS = [
   { label: "1h", secs: 3600 },
@@ -41,9 +51,11 @@ const truncated = ref(false);
 // Keep following "now" (window slides forward) until the user pans/zooms away.
 const follow = ref(true);
 const widthPx = ref(800);
+const heightPx = ref(MIN_LANE_H + AXIS_H);
 const canvasWrap = ref<HTMLElement | null>(null);
-const popover = ref<{ cluster: TimelineCluster; radioId: number; x: number; y: number } | null>(null);
+const popover = ref<{ cluster: TimelineCluster; radioId: number; x: number; y: number; above: boolean } | null>(null);
 const advertTelemetry = ref<ContactTelemetryPoint | null>(null);
+const overview = ref<TimelineOverview | null>(null);
 
 // Non-reactive per-instance state: the id-keyed event set the fetched window
 // and live feed merge into, plus fetch bookkeeping and timers.
@@ -56,6 +68,11 @@ let drag: { startX: number; view: TimeWindow; moved: boolean } | null = null;
 // A click event still fires after a drag's pointerup; this suppresses it.
 let suppressNextClick = false;
 let fetchSeq = 0;
+let scrubbing = false;
+// The overview covers all of time, so it only reloads on selection changes or
+// once new events have landed — never on a pan or zoom.
+let overviewKey: string | null = null;
+let overviewAt = 0;
 
 const enabledKinds = computed<TimelineEventKind[]>(() =>
   showTelemetry.value ? [...BASE_KINDS, "telemetry"] : BASE_KINDS,
@@ -67,7 +84,9 @@ const lanes = computed<RadioSummary[]>(() =>
     .filter((radio): radio is RadioSummary => radio !== undefined),
 );
 
-const svgHeight = computed(() => Math.max(lanes.value.length, 1) * LANE_H + AXIS_H);
+// Lanes stretch to fill whatever height the card has, down to a floor.
+const metrics = computed(() => laneMetrics(heightPx.value, lanes.value.length));
+const svgHeight = computed(() => metrics.value.height);
 const span = computed(() => view.value.end - view.value.start);
 
 function x(ts: number): number {
@@ -109,8 +128,59 @@ function radioIsLive(radio: RadioSummary): boolean {
 }
 
 function dotY(lane: number, kind: TimelineEventKind): number {
-  return lane * LANE_H + LANE_PAD_TOP + KIND_META[kind].rowOffset * KIND_ROW_H;
+  return lane * metrics.value.laneH + metrics.value.padTop + KIND_META[kind].rowOffset * metrics.value.kindRowH;
 }
+
+// ---- navigator strip ----
+
+const overviewExtent = computed(() =>
+  overview.value !== null && overview.value.total > 0
+    ? { from: overview.value.from, to: overview.value.to }
+    : null,
+);
+const overviewView = computed(() => overviewDomain(overviewExtent.value, view.value));
+const overviewSpan = computed(() => overviewView.value.end - overviewView.value.start);
+
+function overviewX(ts: number): number {
+  return ((ts - overviewView.value.start) / overviewSpan.value) * widthPx.value;
+}
+
+/** One stacked bar per non-empty bucket, scaled against the busiest bucket. */
+const overviewBars = computed(() => {
+  const data = overview.value;
+  if (data === null || data.total === 0) return [];
+  const barW = Math.max(1.5, (data.bucketSecs / overviewSpan.value) * widthPx.value);
+  let peak = 1;
+  for (const bucket of data.buckets) {
+    let sum = 0;
+    for (const kind of enabledKinds.value) sum += bucket.counts[kind] ?? 0;
+    if (sum > peak) peak = sum;
+  }
+  const bars: Array<{ x: number; w: number; segments: Array<{ kind: TimelineEventKind; y: number; h: number }> }> = [];
+  for (const bucket of data.buckets) {
+    const segments: Array<{ kind: TimelineEventKind; y: number; h: number }> = [];
+    let y = OVERVIEW_H;
+    for (const kind of enabledKinds.value) {
+      const count = bucket.counts[kind] ?? 0;
+      if (count === 0) continue;
+      const h = Math.max(1.5, (count / peak) * (OVERVIEW_H - 4));
+      y -= h;
+      segments.push({ kind, y, h });
+    }
+    if (segments.length > 0) bars.push({ x: overviewX(bucket.ts), w: barW, segments });
+  }
+  return bars;
+});
+
+/** The current window, projected onto the strip and clipped to its edges. */
+const overviewViewport = computed(() => {
+  const left = Math.max(overviewX(view.value.start), 0);
+  const right = Math.min(overviewX(view.value.end), widthPx.value);
+  return { x: left, width: Math.max(right - left, 2) };
+});
+
+// Half the density of the main axis — the strip is short, so it needs fewer labels.
+const overviewTicks = computed(() => timeTicks(overviewView.value.start, overviewView.value.end, widthPx.value / 2));
 
 function syncEvents(): void {
   events.value = [...eventsById.values()].sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : 1));
@@ -121,6 +191,7 @@ async function loadEvents(): Promise<void> {
   if (!ids.length) {
     eventsById.clear();
     syncEvents();
+    void loadOverview();
     phase.value = "ready";
     return;
   }
@@ -151,11 +222,41 @@ async function loadEvents(): Promise<void> {
     syncEvents();
     phase.value = "ready";
     errorText.value = null;
+    void loadOverview();
   } catch (error) {
     if (seq !== fetchSeq) return;
     errorText.value = error instanceof Error ? error.message : "Failed to load the timeline";
     phase.value = "error";
   }
+}
+
+/**
+ * Load the whole-history density summary behind the navigator strip. It is a
+ * navigation aid, so failures stay silent — the canvas already reports errors.
+ */
+async function loadOverview(force = false): Promise<void> {
+  const ids = selectedRadioIds.value;
+  if (!ids.length) {
+    overview.value = null;
+    overviewKey = null;
+    return;
+  }
+  const idsKey = ids.join(",");
+  const kindsKey = enabledKinds.value.join(",");
+  const key = `${idsKey}|${kindsKey}`;
+  if (!force && key === overviewKey && Date.now() - overviewAt < 60_000) return;
+  try {
+    overview.value = await api<TimelineOverview>(`/timeline/overview?radioIds=${idsKey}&kinds=${kindsKey}`);
+    overviewKey = key;
+    overviewAt = Date.now();
+  } catch {
+    // keep whatever the strip is already showing
+  }
+}
+
+function refresh(): void {
+  void loadEvents();
+  void loadOverview(true);
 }
 
 function scheduleFetch(): void {
@@ -201,6 +302,9 @@ watch(
     if (added) {
       syncEvents();
       if (follow.value) slideToNow();
+      // Rate-limited inside loadOverview, so a busy mesh refreshes the strip
+      // about once a minute rather than on every frame.
+      void loadOverview();
     }
   },
 );
@@ -273,9 +377,37 @@ function onKeydown(event: KeyboardEvent): void {
   else if (event.key === "-") zoomCentered(1.25);
   else if (event.key === "ArrowLeft") setView(panBy(view.value, -span.value * 0.1, nowSecs()));
   else if (event.key === "ArrowRight") setView(panBy(view.value, span.value * 0.1, nowSecs()));
+  else if (event.key === "Home" && overviewExtent.value) setView(centerOn(view.value, overviewExtent.value.from, nowSecs()));
+  else if (event.key === "End") jumpToNow();
   else if (event.key === "Escape") popover.value = null;
   else return;
   event.preventDefault();
+}
+
+// ---- navigator scrubbing ----
+
+/** Timestamp under the pointer, in the strip's own (whole-history) domain. */
+function scrubTs(event: PointerEvent): number {
+  const rect = (event.currentTarget as Element).getBoundingClientRect();
+  const ratio = Math.min(Math.max((event.clientX - rect.left) / (rect.width || 1), 0), 1);
+  return overviewView.value.start + ratio * overviewSpan.value;
+}
+
+function onScrubDown(event: PointerEvent): void {
+  if (event.button !== 0) return;
+  scrubbing = true;
+  (event.currentTarget as Element).setPointerCapture(event.pointerId);
+  popover.value = null;
+  setView(centerOn(view.value, scrubTs(event), nowSecs()));
+}
+
+function onScrubMove(event: PointerEvent): void {
+  if (!scrubbing) return;
+  setView(centerOn(view.value, scrubTs(event), nowSecs()));
+}
+
+function onScrubUp(): void {
+  scrubbing = false;
 }
 
 // ---- popover ----
@@ -286,7 +418,9 @@ function openPopover(cluster: TimelineCluster, laneIndex: number, radioId: numbe
     return;
   }
   const px = Math.min(Math.max(x(cluster.ts), 130), Math.max(widthPx.value - 130, 130));
-  popover.value = { cluster, radioId, x: px, y: laneIndex * LANE_H + LANE_PAD_TOP };
+  const anchorY = dotY(laneIndex, cluster.kind);
+  // Flip above the dot in the lower part of the canvas so the card stays on screen.
+  popover.value = { cluster, radioId, x: px, y: anchorY, above: anchorY > heightPx.value * 0.55 };
   advertTelemetry.value = null;
   const first = cluster.events[0];
   if (cluster.events.length === 1 && first.kind === "advert") {
@@ -379,15 +513,30 @@ function fmtReadingValue(value: number | Record<string, number>): string {
 
 // ---- lifecycle ----
 
-onMounted(() => {
-  resizeObserver = new ResizeObserver((entries) => {
-    const width = entries[0]?.contentRect.width;
-    if (width) widthPx.value = width;
+/**
+ * Attach the size observer to the canvas. It has to happen when the element
+ * appears rather than on mount: the canvas sits behind `phase === "ready"`, so
+ * on mount there is nothing to observe and the measurements would stay stuck at
+ * their defaults — which left the plot drawn at 800px inside a wider card.
+ */
+function observeCanvas(el: HTMLElement | null): void {
+  resizeObserver?.disconnect();
+  if (el === null) return;
+  resizeObserver ??= new ResizeObserver((entries) => {
+    const box = entries[0]?.contentRect;
+    if (box === undefined) return;
+    if (box.width > 0) widthPx.value = box.width;
+    if (box.height > 0) heightPx.value = box.height;
   });
-  if (canvasWrap.value) {
-    resizeObserver.observe(canvasWrap.value);
-    widthPx.value = canvasWrap.value.clientWidth || widthPx.value;
-  }
+  resizeObserver.observe(el);
+  widthPx.value = el.clientWidth || widthPx.value;
+  heightPx.value = el.clientHeight || heightPx.value;
+}
+
+watch(canvasWrap, observeCanvas, { flush: "post" });
+
+onMounted(() => {
+  observeCanvas(canvasWrap.value);
   followTimer = setInterval(() => {
     if (follow.value) slideToNow();
   }, 30_000);
@@ -410,10 +559,10 @@ onBeforeUnmount(() => {
       <div>
         <span class="instrument-label">Radio event history</span>
         <h1>Timeline</h1>
-        <p>Everything each radio has seen — adverts, messages, alerts, link changes — plotted over time. Scroll to zoom, drag to pan, click a dot for details.</p>
+        <p>Everything each radio has seen — adverts, messages, alerts, link changes — plotted over time. Scroll to zoom, drag to pan, click a dot for details. The strip along the bottom shows the whole history; click it to jump.</p>
       </div>
       <div class="heading-actions">
-        <button type="button" class="button secondary" :disabled="phase === 'loading'" @click="loadEvents">
+        <button type="button" class="button secondary" :disabled="phase === 'loading'" @click="refresh">
           <AppIcon name="pulse" :size="15" />
           Refresh
         </button>
@@ -450,8 +599,12 @@ onBeforeUnmount(() => {
             {{ preset.label }}
           </button>
           <span class="controls-divider" aria-hidden="true" />
-          <button type="button" class="chip" aria-label="Zoom in" @click="zoomCentered(0.8)">＋</button>
-          <button type="button" class="chip" aria-label="Zoom out" @click="zoomCentered(1.25)">－</button>
+          <button type="button" class="chip icon-chip" aria-label="Zoom in" @click="zoomCentered(0.8)">
+            <AppIcon name="plus" :size="14" />
+          </button>
+          <button type="button" class="chip icon-chip" aria-label="Zoom out" @click="zoomCentered(1.25)">
+            <AppIcon name="minus" :size="14" />
+          </button>
           <button type="button" class="chip" :class="{ active: follow }" @click="jumpToNow">Now</button>
           <span class="controls-divider" aria-hidden="true" />
           <label class="toggle">
@@ -491,7 +644,7 @@ onBeforeUnmount(() => {
               v-for="(radio, laneIndex) in lanes"
               :key="radio.id"
               class="lane-label"
-              :style="{ top: `${laneIndex * LANE_H + 6}px` }"
+              :style="{ top: `${laneIndex * metrics.laneH + 6}px` }"
             >
               {{ radioLabel(radio) }}
             </span>
@@ -515,11 +668,25 @@ onBeforeUnmount(() => {
               v-for="(radio, laneIndex) in lanes"
               :key="`bg-${radio.id}`"
               x="0"
-              :y="laneIndex * LANE_H"
+              :y="laneIndex * metrics.laneH"
               :width="widthPx"
-              :height="LANE_H"
+              :height="metrics.laneH"
               :class="laneIndex % 2 ? 'lane-bg alt' : 'lane-bg'"
             />
+            <!-- kind row guides: the only cue for which row a dot sits on once
+                 lanes stretch to fill a tall card -->
+            <g v-for="(radio, laneIndex) in lanes" :key="`rows-${radio.id}`">
+              <line
+                v-for="kind in enabledKinds"
+                :key="kind"
+                x1="0"
+                :x2="widthPx"
+                :y1="dotY(laneIndex, kind)"
+                :y2="dotY(laneIndex, kind)"
+                class="kind-row"
+                :style="{ stroke: `var(${KIND_META[kind].cssVar})` }"
+              />
+            </g>
             <!-- time ticks -->
             <g v-for="tick in ticks" :key="tick.ts">
               <line :x1="x(tick.ts)" :x2="x(tick.ts)" y1="0" :y2="svgHeight - AXIS_H" :class="tick.major ? 'tick major' : 'tick'" />
@@ -560,7 +727,9 @@ onBeforeUnmount(() => {
           <div
             v-if="popover"
             class="event-popover"
-            :style="{ left: `${popover.x}px`, top: `${popover.y + 16}px` }"
+            :style="popover.above
+              ? { left: `${popover.x}px`, bottom: `${heightPx - popover.y + 14}px` }
+              : { left: `${popover.x}px`, top: `${popover.y + 16}px` }"
             role="dialog"
             aria-label="Event details"
           >
@@ -647,14 +816,58 @@ onBeforeUnmount(() => {
             </template>
           </div>
         </div>
+
+        <!-- Navigator: every stored event at once, so the zoomed window always
+             has somewhere to be. Click or drag it to scrub the main canvas. -->
+        <div
+          v-if="lanes.length"
+          class="overview"
+          role="group"
+          tabindex="0"
+          aria-label="History navigator. Click or drag to move the visible window; Home jumps to the oldest event, End to now."
+          @pointerdown="onScrubDown"
+          @pointermove="onScrubMove"
+          @pointerup="onScrubUp"
+          @pointercancel="onScrubUp"
+          @keydown="onKeydown"
+        >
+          <svg class="overview-canvas" :width="widthPx" :height="OVERVIEW_H + OVERVIEW_AXIS_H" aria-hidden="true">
+            <g v-for="(bar, barIndex) in overviewBars" :key="barIndex">
+              <rect
+                v-for="segment in bar.segments"
+                :key="segment.kind"
+                :x="bar.x"
+                :y="segment.y"
+                :width="bar.w"
+                :height="segment.h"
+                :style="{ fill: `var(${KIND_META[segment.kind].cssVar})` }"
+              />
+            </g>
+            <rect
+              class="overview-viewport"
+              :x="overviewViewport.x"
+              y="0"
+              :width="overviewViewport.width"
+              :height="OVERVIEW_H"
+            />
+            <g v-for="tick in overviewTicks" :key="tick.ts">
+              <line :x1="overviewX(tick.ts)" :x2="overviewX(tick.ts)" :y1="OVERVIEW_H" :y2="OVERVIEW_H + 3" class="tick" />
+              <text :x="overviewX(tick.ts) + 3" :y="OVERVIEW_H + 12" class="tick-label">{{ tick.label }}</text>
+            </g>
+          </svg>
+          <span class="overview-label" aria-hidden="true">
+            {{ overview && overview.total > 0 ? "All history" : "No history yet" }}
+          </span>
+        </div>
       </section>
     </div>
   </div>
 </template>
 
 <style scoped>
-.timeline-view { height: 100%; overflow-y: auto; background: var(--bg); padding: calc(28px * var(--space-unit)) clamp(16px, 3vw, 44px) 48px; }
-.page-heading { display: flex; width: min(1180px, 100%); align-items: flex-end; justify-content: space-between; gap: 16px; margin: 0 auto calc(24px * var(--space-unit)); }
+/* Column layout so the canvas card can take every pixel the page doesn't need. */
+.timeline-view { display: flex; height: 100%; flex-direction: column; overflow-y: auto; background: var(--bg); padding: calc(28px * var(--space-unit)) clamp(16px, 3vw, 44px) 48px; }
+.page-heading { display: flex; width: min(1180px, 100%); flex-shrink: 0; align-items: flex-end; justify-content: space-between; gap: 16px; margin: 0 auto calc(24px * var(--space-unit)); }
 .page-heading h1 { margin: 4px 0 4px; font-size: clamp(28px, 4vw, 40px); font-weight: 740; letter-spacing: -.045em; }
 .page-heading p { margin: 0; max-width: 60ch; color: var(--text-muted); font-size: 12px; }
 .instrument-label { color: var(--text-faint); font-family: monospace; font-size: 9px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
@@ -664,9 +877,9 @@ onBeforeUnmount(() => {
 .button:disabled { opacity: .45; cursor: not-allowed; }
 .button.secondary { background: var(--surface-2); color: var(--text); }
 .button.secondary:hover:not(:disabled) { border-color: var(--cyan); color: var(--cyan); }
-.timeline-body { display: flex; width: min(1180px, 100%); flex-direction: column; gap: 16px; margin: 0 auto; }
+.timeline-body { display: flex; width: min(1180px, 100%); flex: 1; min-height: 0; flex-direction: column; gap: 16px; margin: 0 auto; }
 .module { border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface-1); overflow: hidden; }
-.controls-module { display: flex; flex-direction: column; gap: 10px; padding: 14px 18px; overflow: visible; }
+.controls-module { display: flex; flex-shrink: 0; flex-direction: column; gap: 10px; padding: 14px 18px; overflow: visible; }
 .controls-row { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
 .controls-label { min-width: 52px; color: var(--text-faint); font-family: monospace; font-size: 9px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
 .controls-empty { color: var(--text-muted); font-size: 12px; }
@@ -674,15 +887,19 @@ onBeforeUnmount(() => {
 .chip { display: inline-flex; min-height: 30px; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); padding: 0 12px; color: var(--text-muted); font-size: 11px; font-weight: 700; cursor: pointer; transition: border-color 140ms ease, color 140ms ease, background 140ms ease; }
 .chip:hover { border-color: var(--cyan); color: var(--cyan); }
 .chip.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--surface-2)); color: var(--text); }
+.icon-chip { justify-content: center; padding: 0 10px; }
 .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
 .toggle { display: inline-flex; align-items: center; gap: 7px; color: var(--text-muted); font-size: 11px; font-weight: 700; cursor: pointer; }
 .toggle input { accent-color: var(--accent); }
 .legend { display: flex; flex-wrap: wrap; gap: 14px; }
 .legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--text-faint); font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
 .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
-.canvas-module { position: relative; }
-.truncated-note { margin: 0; border-bottom: 1px solid color-mix(in srgb, var(--amber) 35%, var(--border)); background: color-mix(in srgb, var(--amber) 9%, var(--surface-1)); padding: 9px 18px; color: var(--amber); font-size: 11px; }
-.canvas-wrap { position: relative; width: 100%; overflow: hidden; }
+/* `overflow: visible` so an event popover near the bottom lane isn't clipped
+   by the card; the canvas itself is sized exactly and never spills. */
+.canvas-module { position: relative; display: flex; flex: 1; min-height: 300px; flex-direction: column; overflow: visible; }
+.canvas-module > .timeline-state { flex: 1; }
+.truncated-note { flex-shrink: 0; margin: 0; border-radius: var(--radius-lg) var(--radius-lg) 0 0; border-bottom: 1px solid color-mix(in srgb, var(--amber) 35%, var(--border)); background: color-mix(in srgb, var(--amber) 9%, var(--surface-1)); padding: 9px 18px; color: var(--amber); font-size: 11px; }
+.canvas-wrap { position: relative; width: 100%; flex: 1; min-height: 140px; }
 .canvas { display: block; touch-action: pan-y; cursor: grab; outline: none; }
 .canvas:active { cursor: grabbing; }
 .canvas:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
@@ -694,10 +911,16 @@ onBeforeUnmount(() => {
 .tick.major { stroke: var(--border-strong); }
 .tick-label { fill: var(--text-faint); font-family: monospace; font-size: 9.5px; }
 .now-line { stroke: var(--accent); stroke-dasharray: 3 3; }
+.kind-row { opacity: .13; }
 .event-dot { cursor: pointer; }
 .event-dot circle { stroke: var(--bg); stroke-width: 1.5; transition: r 120ms ease; }
 .event-dot:hover circle { stroke: var(--text); }
 .cluster-badge { fill: var(--text-muted); font-family: monospace; font-size: 9.5px; font-weight: 700; pointer-events: none; }
+.overview { position: relative; flex-shrink: 0; border-top: 1px solid var(--border); border-radius: 0 0 var(--radius-lg) var(--radius-lg); background: color-mix(in srgb, var(--surface-2) 45%, var(--surface-1)); overflow: hidden; cursor: pointer; touch-action: pan-y; }
+.overview:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.overview-canvas { display: block; }
+.overview-viewport { fill: color-mix(in srgb, var(--accent) 15%, transparent); stroke: var(--accent); stroke-width: 1; }
+.overview-label { position: absolute; top: 5px; left: 10px; color: var(--text-faint); font-family: monospace; font-size: 9px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; pointer-events: none; }
 .event-popover { position: absolute; z-index: 5; width: min(280px, 84vw); transform: translateX(-50%); border: 1px solid var(--border-strong); border-radius: var(--radius-md); background: var(--surface-raised); box-shadow: var(--shadow); padding: 12px 14px; }
 .popover-close { position: absolute; top: 8px; right: 8px; display: inline-flex; border: 0; background: none; padding: 4px; color: var(--text-faint); cursor: pointer; }
 .popover-close:hover { color: var(--text); }
@@ -718,6 +941,7 @@ onBeforeUnmount(() => {
 .popover-zoom { margin-top: 10px; width: 100%; min-height: 34px; }
 .capitalize { text-transform: capitalize; }
 .timeline-state { display: flex; min-height: 220px; flex-direction: column; align-items: center; justify-content: center; gap: 14px; color: var(--text-muted); text-align: center; }
+.timeline-body > .timeline-state { flex: 1; }
 .spinner { width: 26px; height: 26px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: timeline-spin 700ms linear infinite; }
 @keyframes timeline-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }

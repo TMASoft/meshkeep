@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { Message, TimelineEvent, WsEvent } from "@meshkeep/shared";
 import {
+  AXIS_H,
   MAX_SPAN,
+  MIN_LANE_H,
   MIN_SPAN,
+  centerOn,
   clusterEvents,
+  laneMetrics,
+  overviewDomain,
   panBy,
   timeTicks,
   wsToTimelineEvent,
@@ -123,6 +128,69 @@ describe("panBy", () => {
     const panned = panBy({ start: NOW - 3600, end: NOW }, 7200, NOW);
     expect(panned.end).toBeLessThanOrEqual(NOW + 3600 * 0.05 + 1);
     expect(panned.end - panned.start).toBe(3600);
+  });
+});
+
+describe("centerOn", () => {
+  it("puts the target at the middle of the window, span unchanged", () => {
+    const centered = centerOn({ start: NOW - 3600, end: NOW }, NOW - 86_400, NOW);
+    expect(centered.end - centered.start).toBe(3600);
+    expect((centered.start + centered.end) / 2).toBe(NOW - 86_400);
+  });
+
+  it("stops at the future edge instead of centring past it", () => {
+    const centered = centerOn({ start: NOW - 3600, end: NOW }, NOW + 86_400, NOW);
+    expect(centered.end).toBeLessThanOrEqual(NOW + 3600 * 0.05 + 1);
+    expect(centered.end - centered.start).toBe(3600);
+  });
+});
+
+describe("overviewDomain", () => {
+  const view = { start: NOW - 3600, end: NOW };
+
+  it("uses the stored extent when it contains the window", () => {
+    const extent = { from: NOW - 86_400, to: NOW - 60 };
+    expect(overviewDomain(extent, view)).toEqual({ start: NOW - 86_400, end: NOW });
+  });
+
+  it("widens to keep the window inside the strip", () => {
+    const extent = { from: NOW - 600, to: NOW - 300 };
+    expect(overviewDomain(extent, { start: NOW - 7200, end: NOW + 60 })).toEqual({ start: NOW - 7200, end: NOW + 60 });
+  });
+
+  it("falls back to the window when nothing is stored", () => {
+    expect(overviewDomain(null, view)).toEqual(view);
+  });
+
+  it("never returns a zero-width domain", () => {
+    const domain = overviewDomain({ from: NOW, to: NOW }, { start: NOW, end: NOW });
+    expect(domain.end - domain.start).toBe(MIN_SPAN);
+  });
+});
+
+describe("laneMetrics", () => {
+  it("keeps the original geometry when the card is exactly one lane tall", () => {
+    const metrics = laneMetrics(MIN_LANE_H + AXIS_H, 1);
+    expect(metrics).toEqual({ laneH: 84, kindRowH: 12, padTop: 18, height: 114 });
+  });
+
+  it("never shrinks a lane below the floor, however little room there is", () => {
+    const metrics = laneMetrics(40, 3);
+    expect(metrics.laneH).toBe(MIN_LANE_H);
+    expect(metrics.height).toBe(MIN_LANE_H * 3 + AXIS_H);
+  });
+
+  it("stretches lanes to fill a tall card and centres the kind rows", () => {
+    const metrics = laneMetrics(630, 2);
+    expect(metrics.laneH).toBe(300);
+    expect(metrics.height).toBe(630);
+    // rows stop spreading once they hit the cap; the slack becomes margin
+    expect(metrics.kindRowH).toBe(44);
+    expect(metrics.padTop).toBe((300 - 44 * 4) / 2);
+  });
+
+  it("treats an empty lane list as one lane", () => {
+    expect(laneMetrics(200, 0).height).toBe(laneMetrics(200, 1).height);
   });
 });
 
