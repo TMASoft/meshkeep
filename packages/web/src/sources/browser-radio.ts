@@ -65,13 +65,51 @@ export interface BrowserRadioDeps {
   postIngest(kind: QueueEntry["kind"], payload: unknown): Promise<unknown>;
 }
 
+/**
+ * `WebBleConnection`'s constructor fires its async `init()` (GATT connect,
+ * service/characteristic discovery, notification setup) without awaiting or
+ * catching it; `open()` resolves as soon as the instance exists, well before
+ * that work finishes. A rejection there would otherwise become an unhandled
+ * promise rejection while MeshKeep just sees the "connected" event never
+ * arrive. We monkey-patch the prototype for the duration of this one `open()`
+ * call to capture the promise `init()` returns, keyed by connection instance,
+ * so `waitForConnected` can race it alongside the "connected" event and
+ * surface the real failure instead of a generic timeout.
+ */
+const bleInitOutcomes = new WeakMap<object, Promise<void>>();
+
+export async function openWebBleConnection(): Promise<MeshConnection | null> {
+  const { default: WebBleConnection } = await import(
+    "@liamcottle/meshcore.js/src/connection/web_ble_connection.js"
+  );
+  const proto = WebBleConnection.prototype as unknown as { init: (...args: unknown[]) => Promise<void> };
+  const originalInit = proto.init;
+  proto.init = function (this: object, ...args: unknown[]) {
+    const outcome = originalInit.apply(this, args);
+    bleInitOutcomes.set(this, outcome);
+    // init() is fire-and-forget by design (see class comment above); this
+    // keeps a rejection from also surfacing as an unhandled rejection now
+    // that we track it via bleInitOutcomes instead.
+    outcome.catch(() => {});
+    return outcome;
+  };
+  try {
+    const connection = await WebBleConnection.open();
+    return (connection as MeshConnection | null | undefined) ?? null;
+  } finally {
+    proto.init = originalInit;
+  }
+}
+
 const defaultDeps: BrowserRadioDeps = {
   async openConnection(kind) {
-    const connection =
-      kind === "webserial"
-        ? await (await import("@liamcottle/meshcore.js/src/connection/web_serial_connection.js")).default.open()
-        : await (await import("@liamcottle/meshcore.js/src/connection/web_ble_connection.js")).default.open();
-    return connection ?? null;
+    if (kind === "webserial") {
+      const connection = await (
+        await import("@liamcottle/meshcore.js/src/connection/web_serial_connection.js")
+      ).default.open();
+      return connection ?? null;
+    }
+    return openWebBleConnection();
   },
   acquireLock: acquireRadioLock,
   queue: { put: queuePut, takeAll: queueTakeAll },
@@ -208,6 +246,12 @@ export class BrowserRadioSource {
       connection.once("connected", () => {
         clearTimeout(timeout);
         resolve();
+      });
+      // WebBLE's init() rejecting never fires "connected"; surface that
+      // failure immediately instead of waiting out the generic timeout.
+      bleInitOutcomes.get(connection)?.catch((error: unknown) => {
+        clearTimeout(timeout);
+        reject(error instanceof Error ? error : new Error(String(error)));
       });
     });
   }

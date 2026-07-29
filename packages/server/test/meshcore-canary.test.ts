@@ -118,4 +118,20 @@ describe("meshcore.js surface canary", () => {
     expect(constants.default ?? constants).toBeTruthy();
     expect(bufferUtils.default ?? bufferUtils).toBeTruthy();
   });
+
+  it("WebBleConnection keeps the shape browser-radio.ts's WebBLE init-failure workaround relies on", async () => {
+    // WebBleConnection.open() resolves before its async init() (GATT connect,
+    // service/characteristic discovery) settles: the constructor fires
+    // init() without awaiting or catching it (issue #89). browser-radio.ts
+    // patches WebBleConnection.prototype.init for the duration of one
+    // open() call to capture that promise so a rejection surfaces promptly
+    // instead of a generic timeout. If the dependency ever awaits/catches
+    // init() itself, or drops/renames it, this canary must fail loudly.
+    const { default: WebBleConnection } = await import(
+      "@liamcottle/meshcore.js/src/connection/web_ble_connection.js"
+    );
+    expect(typeof WebBleConnection.prototype.init).toBe("function");
+    expect(typeof WebBleConnection.open).toBe("function");
+    expect(WebBleConnection.prototype.init.constructor.name).toBe("AsyncFunction");
+  });
 });

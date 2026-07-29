@@ -238,6 +238,22 @@ describe("BrowserRadioSource lifecycle", () => {
     expect(h.releaseLock).toHaveBeenCalled();
   });
 
+  it("reconnects cleanly on a fresh attempt after a device-side disconnect", async () => {
+    const first = harness();
+    await first.source.start();
+    first.connection.emit("disconnected");
+    await vi.waitFor(() => {
+      expect(first.states.at(-1)).toEqual({ state: "error", error: "Radio disconnected" });
+    });
+    expect(first.releaseLock).toHaveBeenCalledTimes(1);
+
+    const second = harness();
+    await second.source.start();
+    expect(second.states.map((s) => s.state)).toEqual(["connecting", "syncing", "connected"]);
+    expect(second.selves[0]).toMatchObject({ name: "FakeNode" });
+    await second.source.stop();
+  });
+
   it("start() failure (no device picked) cleans up and rethrows", async () => {
     const h = harness();
     const source = new BrowserRadioSource("webserial", false, {
