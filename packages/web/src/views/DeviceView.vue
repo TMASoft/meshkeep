@@ -14,6 +14,7 @@ import { api } from "../api/client";
 import { useAppStore, radioSuffix } from "../stores/app";
 import { browserRadioSupport, type BrowserRadioKind } from "../sources/browser-radio";
 import AppIcon from "../components/AppIcon.vue";
+import WebhookSubscriptions from "../components/WebhookSubscriptions.vue";
 
 const store = useAppStore();
 const busy = ref<string | null>(null);
@@ -573,6 +574,11 @@ watch(
 
 const alertRules = ref<TelemetryAlertRule[]>([]);
 const alertEvents = ref<TelemetryAlertEvent[]>([]);
+const displayedAlertEvents = computed(() => {
+  const byId = new Map<number, TelemetryAlertEvent>();
+  for (const event of [...alertEvents.value, ...store.alertHistory]) byId.set(event.id, event);
+  return [...byId.values()].sort((a, b) => b.ts - a.ts);
+});
 const alertForm = reactive({ comparator: "below" as AlertComparator, threshold: "" });
 const alertBusy = ref(false);
 const alertError = ref<string | null>(null);
@@ -930,8 +936,8 @@ onMounted(() => {
             <span class="module-hint">{{ alertRules.length }} rule{{ alertRules.length === 1 ? "" : "s" }}</span>
           </div>
           <p class="module-description">
-            Get notified when this radio's battery crosses a threshold. Alerts fire once per
-            crossing (not on every sample) and deliver as a browser notification, same as messages.
+            Rules apply to this radio. Live alerts from every connected radio appear here and deliver as
+            browser notifications; each rule fires once per crossing, not on every sample.
           </p>
           <form class="alert-form" @submit.prevent="addAlertRule">
             <select v-model="alertForm.comparator" class="field-select" aria-label="Comparator">
@@ -959,10 +965,10 @@ onMounted(() => {
               </button>
             </li>
           </ul>
-          <div v-if="alertEvents.length" class="alert-history">
+          <div v-if="displayedAlertEvents.length" class="alert-history">
             <span class="instrument-label">Recent alerts</span>
             <ul>
-              <li v-for="event in alertEvents.slice(0, 8)" :key="event.id">
+              <li v-for="event in displayedAlertEvents.slice(0, 8)" :key="event.id">
                 <span :class="event.direction">{{ event.direction === "breach" ? "Alert" : "Recovered" }}</span>
                 {{ event.label }} {{ event.value }} mV ({{ event.comparator }} {{ event.threshold }})
                 <time>{{ new Date(event.ts * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) }}</time>
@@ -1255,6 +1261,8 @@ onMounted(() => {
           </div>
           <div v-else class="token-empty">No API tokens have been created.</div>
         </section>
+
+        <WebhookSubscriptions :radios="store.radios" />
 
         <section class="module data-module">
           <div class="module-heading">

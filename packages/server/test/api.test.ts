@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Contact, Message, SelfInfo, WsEvent } from "@meshkeep/shared";
-import { csvHeaderRow, messageToCsvRow, messagesToCsv } from "../src/api/export.js";
+import { csvHeaderRow, messageToCsvRow, messagesToCsv, telemetryToCsvRow } from "../src/api/export.js";
 import { ingestContacts, ingestMessages, ingestSelf } from "../src/api/ingest.js";
 import { openDb } from "../src/db/index.js";
 import { Store } from "../src/db/store.js";
@@ -59,6 +59,37 @@ describe("messagesToCsv", () => {
     expect(streamed).toBe(messagesToCsv(list));
     // formula neutralization is preserved on the per-row path used by streaming
     expect(list.map(messageToCsvRow).join("")).toContain("\"'=DANGER,formula\"");
+  });
+});
+
+describe("telemetryToCsvRow", () => {
+  it("keeps negative numeric readings as numeric CSV cells", () => {
+    const csv = telemetryToCsvRow({
+      ts: 1_752_000_000,
+      contactKey: "ab".repeat(32),
+      contactName: "Alice",
+      metric: "temperature_c",
+      label: "Temperature",
+      value: -5,
+      unit: "°C",
+    });
+
+    expect(csv).toContain(",-5,");
+    expect(csv).not.toContain(",'-5,");
+  });
+
+  it("neutralizes formula-like telemetry contact names", () => {
+    const csv = telemetryToCsvRow({
+      ts: 1_752_000_000,
+      contactKey: "ab".repeat(32),
+      contactName: "=HYPERLINK(\"http://evil\")",
+      metric: "temperature_c",
+      label: "Temperature",
+      value: 5,
+      unit: "°C",
+    });
+
+    expect(csv).toContain("\"'=HYPERLINK(\"\"http://evil\"\")\"");
   });
 });
 

@@ -31,6 +31,7 @@ export function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     mapEnabled: true,
     mapTilesUrl: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     mapTilesAttribution: "© OpenStreetMap contributors",
+    webhookMasterKey: null,
     ...overrides,
   };
 }
@@ -50,7 +51,7 @@ export interface Harness {
  */
 export function buildHarness(overrides: Partial<ServerConfig> = {}): Harness {
   const config = testConfig(overrides);
-  const db = openDb(":memory:");
+  const db = openDb(":memory:", config.webhookMasterKey);
   const bus = new Bus();
   const manager = new ConnectionManager(config, db, bus, "test");
   const mapCache = new MapCache(config, "test");

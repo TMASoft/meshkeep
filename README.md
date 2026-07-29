@@ -24,6 +24,8 @@ your recent mesh messages and node status on the launcher dashboard.
 - **Message export** — download full or per-conversation history as CSV/JSON
 - **Access control** — optional password login plus Bearer-token REST API for integrations
   (used by the hll-meshkeep plugin)
+- **Outbound webhooks** — scoped, signed external-event delivery for home automation and
+  other receivers; message text and contact coordinates remain opt-in
 - **Radio anywhere** — USB serial on the server, a remote radio via ser2net/TCP, experimental
   server-side BLE, or **browser-direct**: drive a radio attached to the device you're browsing
   from (WebSerial/WebBluetooth, Chromium + HTTPS/localhost — see `docs/https.md`), with
@@ -120,6 +122,7 @@ a BLE radio near your _browsing_ device is often better served by browser-direct
 | `MESHKEEP_MAP_TILES_URL`                  | `https://tile.openstreetmap.org/{z}/{x}/{y}.png` | Leaflet tile template; use `/tiles/{z}/{x}/{y}.png` for a same-origin self-hosted service            |
 | `MESHKEEP_MAP_TILES_ATTRIBUTION`          | `© OpenStreetMap contributors`                   | visible attribution for the configured tile provider                                                 |
 | `MESHKEEP_LOG_LEVEL`                      | `info`                                           | stdout log verbosity: `debug`, `info`, `warn`, `error`                                               |
+| `MESHKEEP_WEBHOOK_MASTER_KEY`              | unset                                            | base64-encoded 32-byte deployment secret required to create, rotate, or deliver webhooks             |
 
 Connection settings can also be changed at runtime from Radio → Connection; a saved
 override wins over the environment until you reset it. Settings can also be saved as
@@ -170,6 +173,23 @@ event: `pending → sent → delivered`, or `retrying → failed` after `MESHKEE
 Inspect and manage the queue with `GET /api/v1/messages/outbound`, `POST /api/v1/messages/:id/retry`,
 and `POST /api/v1/messages/:id/cancel` (retry/cancel need write scope).
 
+### Webhooks and external events
+
+MeshKeep can project selected radio, message, contact, and telemetry events to an HTTPS receiver.
+Create subscriptions from **Radio → API access → Webhook subscriptions**. This is deliberately
+session-only administration: bearer tokens cannot create, inspect, rotate, pause, or delete a
+subscription. The UI displays a generated signing secret exactly once; save it in the receiver's
+secret store before dismissing it.
+
+The read-only `events.read` token scope can call `GET /api/v1/event-catalog` and inspect redacted
+delivery summaries at `GET /api/v1/webhooks/:id/deliveries`. It cannot read payloads, destinations,
+signing keys, or other API resources. Webhooks use at-least-once delivery, so receivers must
+deduplicate by the pair of the subscription ID and `MeshKeep-Event-Id`; ordering is not guaranteed.
+Message text and contact coordinates are excluded unless the subscription explicitly enables and
+confirms sensitive content. See the [webhook operator and receiver runbook](docs/operations.md#webhooks-and-external-events)
+for event types, receiver verification, destination restrictions, retry limits, deployment, and
+incident response.
+
 A `400` on any endpoint returns `{ "error": "invalid request", "details": [...] }`, where each
 entry is a Zod issue object (`path`, `message`, `code`, plus type-specific fields). As of
 v0.1.4-beta.17 (Zod 4) those per-issue fields changed shape — notably `type` became `origin` and
@@ -205,6 +225,9 @@ With a real radio: `MESHKEEP_CONNECTION=serial MESHKEEP_SERIAL_PORT=/dev/ttyACM0
   available to browser sessions only, never bearer tokens.
 - Backup, restore, upgrade/rollback, integrity checks, and write-contention
   behavior are documented in [`docs/operations.md`](docs/operations.md).
+- Webhook subscription setup, receiver verification, rotation/revocation, and the
+  webhook-specific backup/upgrade runbook are in
+  [`docs/operations.md`](docs/operations.md#webhooks-and-external-events).
 - Released images are multi-arch, cosign-signed, and carry SBOM + SLSA provenance
   attestations; see [deploying a published image](docs/operations.md#deploying-a-published-image)
   for digest pinning and signature verification.

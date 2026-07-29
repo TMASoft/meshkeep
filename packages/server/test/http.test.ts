@@ -60,6 +60,8 @@ describe("http: diagnostics", () => {
     // secrets are redacted: the raw password never appears, only a boolean
     expect(res.body.config).not.toHaveProperty("uiPassword");
     expect(res.body.config.uiPasswordSet).toBe(false);
+    expect(res.body.config).not.toHaveProperty("webhookMasterKey");
+    expect(res.body.config.webhookMasterKeySet).toBe(false);
     expect(res.body.diagnostics.server.version).toBe("test");
     expect(Array.isArray(res.body.logs)).toBe(true);
   });

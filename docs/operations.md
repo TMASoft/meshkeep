@@ -68,6 +68,12 @@ Keep secrets out of tracked files:
 - `MESHKEEP_UI_PASSWORD` gates the web UI and REST API; empty/unset = open (trusted
   LAN only). REST integrations should use scoped API tokens (Radio → API access),
   which are revocable and can be read-only.
+- `MESHKEEP_WEBHOOK_MASTER_KEY` is required before creating, rotating, or delivering
+  webhooks. It must be a standard-base64 encoding of exactly 32 random bytes. Generate
+  it once in a secret manager (or `openssl rand -base64 32`), store it outside Git and
+  the SQLite volume, and inject it through the deployment's secret facility. Losing or
+  replacing this key makes existing encrypted webhook signing keys unusable; MeshKeep
+  intentionally fails startup rather than silently replacing them.
 - For stronger handling, mount secrets as files via Docker/Swarm secrets or your
   orchestrator's secret store rather than passing them as environment variables.
 - The diagnostics support bundle redacts secrets: the UI password is reported only
@@ -182,6 +188,197 @@ on reconnect. Operators/users can requeue a failed send (`POST /api/v1/messages/
 or drop it (`POST /api/v1/messages/:id/cancel`); `GET /api/v1/messages/outbound` shows the
 current ledger. While the server radio is in **standby** (released to a browser session),
 the server rejects sends rather than queuing them — send from the browser session instead.
+
+## Webhooks and external events
+
+MeshKeep webhooks are an outbound, asynchronous projection of selected application events.
+They are not an inbound command API and they do not expose the database, radio control,
+diagnostics bundle, API tokens, channel secrets, raw radio frames, or browser sessions.
+
+### Before enabling webhooks
+
+1. Require a UI password and serve the instance behind HTTPS. Webhook administration is
+   browser-session-only, but an open MeshKeep instance has no meaningful administrative
+   boundary.
+2. Generate and deploy `MESHKEEP_WEBHOOK_MASTER_KEY` as a durable deployment secret:
+   ```sh
+   openssl rand -base64 32
+   ```
+   Keep the same value for every restart and preserve it with the database backup plan.
+   Do not put it in a tracked Compose file, browser configuration, API token, or support
+   bundle.
+3. In **Radio → API access → Webhook subscriptions**, select explicit event types and,
+   where needed, explicit stored radios. An empty radio filter means every radio. Wildcard
+   event filters are not supported. A subscription needs at least one event type.
+4. Use a public HTTPS receiver. MeshKeep accepts an HTTPS hostname on port 443 only;
+   destinations with credentials, fragments, an explicit port, or a literal IP address
+   are rejected. At delivery time it resolves the hostname and rejects loopback, private,
+   link-local, multicast, unspecified, carrier-grade NAT, and provider-metadata address
+   ranges. Redirects are not followed. This is intentional SSRF protection, not a proxy
+   configuration feature.
+
+At most 20 subscriptions can be active. A destination is limited to 2,048 bytes and a
+label to 100 characters. MeshKeep sends only its own fixed request headers; receivers
+that require a custom header, a private address, an HTTP endpoint, mutual TLS, or a proxy
+are not supported by v1.
+
+### Event contract and sensitive fields
+
+Every request is a JSON `POST` with this stable envelope shape:
+
+```json
+{
+  "id": "globally-unique-event-id",
+  "type": "message.created",
+  "eventVersion": 1,
+  "occurredAt": "2026-07-29T12:34:56.789Z",
+  "source": { "product": "meshkeep", "apiVersion": "v1", "radioId": 7 },
+  "data": {}
+}
+```
+
+`type` plus `eventVersion` selects the schema. V1 emits these explicit types:
+
+| Type | Data summary | Sensitive opt-in effect |
+| --- | --- | --- |
+| `message.created` | message metadata and delivery status | adds `data.message.text` |
+| `message.status_changed` | message ID and status | none |
+| `contact.updated` | contact identity/metadata | adds `data.contact.lat` and `lon` |
+| `contact.removed` | contact public key | none |
+| `telemetry.received` | battery millivolts and timestamp | none |
+| `telemetry.alert_triggered` | normalized persisted alert fields | none |
+| `radio.link_changed` | link state, transport, label, redacted error code | none |
+| `radio.status_changed` | compact radio state and counts | none |
+
+New event types require an explicit subscription update. Existing V1 schemas may gain
+optional fields or enum values; consumers must ignore fields they do not recognize. A
+removed field, changed JSON type, or changed meaning requires a new `eventVersion` for
+that event type. Do not deserialize MeshKeep payloads into a permissive internal model
+and assume event ordering represents causality.
+
+Message text and contact coordinates are sensitive. They are omitted by default and
+require the `includeSensitive` confirmation in the UI or `confirmSensitive: true` in a
+session-authenticated API request. Enabling it affects newly projected events only; a
+previously queued, signed payload is immutable. Delivery history, diagnostics, and logs
+remain redacted and do not expose bodies or signing secrets.
+
+### Subscription API and example
+
+All paths below are rooted at `/api/v1`. Creating, listing, editing, rotating, pausing,
+resuming, testing, and deleting subscriptions requires the browser session cookie. The
+only bearer scope for this feature is `events.read`, which can read the catalog and
+redacted delivery summaries but cannot manage subscriptions.
+
+```sh
+# Establish a browser-equivalent session. Keep the cookie jar private.
+curl -c meshkeep.cookies -X POST https://meshkeep.example/api/v1/auth/login \
+  -H 'content-type: application/json' \
+  --data '{"password":"replace-with-your-ui-password"}'
+
+# Create a minimal, non-sensitive subscription. The signingSecret is shown only here.
+curl -b meshkeep.cookies -X POST https://meshkeep.example/api/v1/webhooks \
+  -H 'content-type: application/json' \
+  --data '{
+    "label":"Home automation receiver",
+    "destination":"https://receiver.example/webhooks/meshkeep",
+    "eventTypes":["telemetry.alert_triggered","radio.link_changed"],
+    "radioIds":[7],
+    "includeSensitive":false
+  }'
+```
+
+Store `signingSecret` immediately in the receiver's secret store; it is base64url-encoded
+32 random bytes and is not returned by later `GET` responses. The management surface is:
+
+| Endpoint | Access | Purpose |
+| --- | --- | --- |
+| `GET /event-catalog` | session or `events.read` | available event type names |
+| `GET`, `POST /webhooks` | session | list/create subscriptions |
+| `GET`, `PATCH`, `DELETE /webhooks/:id` | session | inspect, edit/pause/resume, or revoke a subscription |
+| `POST /webhooks/:id/rotate-secret` | session | create and reveal a replacement secret once |
+| `POST /webhooks/:id/test` | session | validate the subscription command and return `202` |
+| `GET /webhooks/:id/deliveries?state=&before=&limit=` | session or `events.read` | redacted attempt history; `limit` is 1–100 (default 50) |
+
+The current test command returns `202 Accepted` but does not force an outbound HTTP
+request. Validate receiver connectivity by creating a scoped subscription and observing a
+real matching event in its delivery history.
+
+### Verify webhook signatures against raw bytes
+
+MeshKeep signs the exact UTF-8 JSON bytes it sends. Do not parse and re-serialize JSON
+before verification. Requests include these headers (HTTP header names are case-insensitive):
+
+```text
+MeshKeep-Event-Id: <envelope id>
+MeshKeep-Event-Type: <type>
+MeshKeep-Event-Version: 1
+MeshKeep-Delivery-Id: <attempt id>
+MeshKeep-Timestamp: <unix seconds>
+MeshKeep-Key-Id: <key id>
+MeshKeep-Signature: v1=<hex HMAC-SHA256(secret, timestamp + "." + rawBody)>
+```
+
+Example receiver logic in Python; obtain `raw_body` before any JSON middleware consumes
+or alters it:
+
+```python
+import hashlib
+import hmac
+import time
+
+def verify_meshkeep(headers: dict[str, str], raw_body: bytes, secret: bytes) -> None:
+    timestamp = int(headers["MeshKeep-Timestamp"])
+    if abs(time.time() - timestamp) > 300:
+        raise ValueError("stale webhook timestamp")
+    signed = str(timestamp).encode("ascii") + b"." + raw_body
+    expected = "v1=" + hmac.new(secret, signed, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(headers["MeshKeep-Signature"], expected):
+        raise ValueError("invalid webhook signature")
+```
+
+Then parse `raw_body`, validate `type` and `eventVersion`, and deduplicate on the
+subscription ID plus `MeshKeep-Event-Id`. Delivery is at least once: retries reuse the
+same immutable bytes and event ID, and events can arrive out of order across types. Keep
+deduplication state for at least the retry horizon plus one day.
+
+### Delivery policy and monitoring
+
+Success is any `2xx`. Network errors, timeouts, `408`, `429`, and `5xx` responses are
+retryable; other `4xx` responses are terminal. Retry timing uses full-jitter exponential
+backoff up to six hours and honors a valid, capped `Retry-After`. A delivery is bounded by
+10 attempts or 24 hours from its first attempt. A terminal policy failure disables the
+subscription and marks queued/leased deliveries as dropped; explicitly resume it only
+after correcting the receiver or destination.
+
+The queue is durable in SQLite and survives process restarts. It permits at most 10
+concurrent outbound requests, one per subscription, 100 new deliveries per subscription
+per minute, and 10,000 queued/leased deliveries globally. When an enqueue limit is hit,
+MeshKeep records a redacted `dropped` result rather than slowing radio/browser processing.
+Completed, failed, and dropped delivery records are retained for 30 days. Payloads and
+signing headers are never returned in delivery history.
+
+Monitor stdout and the UI's **Activity** view for the structured events
+`webhook.enqueued`, `webhook.delivered`, `webhook.retry_scheduled`, `webhook.failed`,
+`webhook.dropped`, and `webhook.subscription_disabled`. Investigate increasing queued age,
+retries, failures, or dropped records. Treat a sudden stream of `4xx`/terminal failures as
+an integration or credential incident, not a condition to blindly retry.
+
+### Rotation, backup, upgrade, rollback, and incident response
+
+- **Routine rotation:** use **Rotate secret**, store the newly displayed secret, and keep
+  the receiver able to validate delivery records that reference the prior key until their
+  history is terminal. New events use the new key. Do not log either secret.
+- **Immediate compromise or wrong destination:** delete the subscription. Deletion removes
+  queued deliveries and all signing keys. If continued delivery is needed, create a new
+  subscription with a new destination/secret after the incident is contained. Pausing is
+  not revocation: it preserves the configuration and can be resumed.
+- **Back up before upgrading:** use the SQLite online-backup procedure above and back up
+  the deployment's webhook master key through its secret manager. Webhook migrations are
+  forward-only; rollback means restore the pre-upgrade database backup *and* deploy the
+  matching saved master key. Never run an older binary against a forward-migrated database.
+- **Lost master key:** do not replace it in place and hope existing webhooks recover.
+  Restore the paired database/key backup, or treat the subscriptions as unrecoverable,
+  remove them under an authorized recovery process, and recreate them with new secrets.
 
 ## Integrity and recovery
 

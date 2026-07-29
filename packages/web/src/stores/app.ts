@@ -148,6 +148,9 @@ export const useAppStore = defineStore("app", {
     // Most-recent-first, capped so a noisy rule can't grow this unbounded for
     // the life of the tab; full history is available via GET /telemetry/alerts.
     alertHistory: [] as TelemetryAlertEvent[],
+    // Background-radio messages do not enter the selected radio's conversation
+    // state, so retain a bounded dedupe key for their global notifications.
+    backgroundMessageNotificationIds: [] as string[],
     // Live timeline entries from *any* radio, appended before the per-radio
     // event filter — the timeline view overlays several radios' histories, so
     // it must see events the conversation/contact state deliberately ignores.
@@ -707,6 +710,18 @@ export const useAppStore = defineStore("app", {
       }
     },
 
+    notifyBackgroundMessage(radioId: number, message: Message) {
+      const conversation = conversationForMessage(message);
+      if (!conversation || message.direction !== "in") return;
+      const notificationId = `${radioId}:${message.ingestionId ?? message.id}`;
+      if (this.backgroundMessageNotificationIds.includes(notificationId)) return;
+      this.backgroundMessageNotificationIds = [...this.backgroundMessageNotificationIds.slice(-199), notificationId];
+      // A background radio has no selected-radio conversation or mute state.
+      // Its notification is global by policy and cannot affect focused-radio
+      // unread or conversation display state.
+      notifyIncoming(message, { conversationActive: false, muted: false });
+    },
+
     updateMessageStatus(id: number, status: Message["status"]) {
       for (const list of Object.values(this.conversations)) {
         const message = list.find((m) => m.id === id);
@@ -768,10 +783,18 @@ export const useAppStore = defineStore("app", {
         this.timelineFeed = [...this.timelineFeed.slice(-199), timelineEvent];
         this.timelineSeq++;
       }
-      // Per-radio events carry a radioId; ignore those for a radio other than the
-      // one in view so a background radio's traffic never leaks into the display.
+      // Per-radio display state stays scoped to the radio in view. The explicit
+      // global policies for background messages and alerts are handled before
+      // returning so their history/browser notifications are never discarded.
       // (status.changed is global and has no radioId, so it always applies.)
-      if ("radioId" in event && this.effectiveRadioId !== null && event.radioId !== this.effectiveRadioId) {
+      const isBackgroundRadioEvent =
+        "radioId" in event && this.effectiveRadioId !== null && event.radioId !== this.effectiveRadioId;
+      if (isBackgroundRadioEvent) {
+        if (event.type === "message.new") this.notifyBackgroundMessage(event.radioId, event.message);
+        if (event.type === "telemetry.alert") {
+          this.alertHistory = [event.event, ...this.alertHistory].slice(0, 50);
+          notifyAlert(event.event);
+        }
         return;
       }
       switch (event.type) {

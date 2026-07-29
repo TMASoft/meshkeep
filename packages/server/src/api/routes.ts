@@ -1,3 +1,6 @@
+import { randomBytes, randomUUID } from "node:crypto";
+import { isIP } from "node:net";
+import { EXTERNAL_EVENT_TYPES, type ExternalEventType } from "@meshkeep/shared";
 import { Router, json, type Request, type Response } from "express";
 import { z } from "zod";
 import type { ConnectionManager } from "../radio/manager.js";
@@ -13,6 +16,7 @@ import {
   RadioUnavailableError,
 } from "../radio/manager.js";
 import { DuplicateProfileNameError } from "../db/store.js";
+import { createWebhookCrypto, type WebhookCrypto } from "../webhooks/crypto.js";
 import { listSerialPorts, scanBleRadios } from "../radio/detect.js";
 import type { MapCache } from "../map/cache.js";
 import type { Bus } from "../bus.js";
@@ -51,6 +55,10 @@ function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
       }
       if (error instanceof z.ZodError) {
         res.status(400).json({ error: "invalid request", details: error.issues });
+      } else if (error instanceof WebhookInputError) {
+        res.status(400).json({ error: error.message });
+      } else if (error instanceof WebhookUnavailableError) {
+        res.status(503).json({ error: error.message });
       } else if (error instanceof AmbiguousLinkError) {
         res.status(400).json({ error: error.message });
       } else if (error instanceof RadioUnavailableError) {
@@ -81,6 +89,45 @@ function handle(fn: (req: Request, res: Response) => Promise<void> | void) {
   };
 }
 
+class WebhookInputError extends Error {}
+class WebhookUnavailableError extends Error {}
+
+const webhookEventTypeSchema = z.enum(EXTERNAL_EVENT_TYPES);
+const webhookSubscriptionSchema = z.object({
+  label: z.string().trim().min(1).max(100),
+  destination: z.string().min(1).max(2048),
+  eventTypes: z.array(webhookEventTypeSchema).min(1).max(EXTERNAL_EVENT_TYPES.length).refine((types) => new Set(types).size === types.length, {
+    message: "eventTypes must not contain duplicates",
+  }),
+  radioIds: z.array(z.number().int().positive()).max(100).refine((ids) => new Set(ids).size === ids.length, {
+    message: "radioIds must not contain duplicates",
+  }).nullable().optional(),
+  includeSensitive: z.boolean().default(false),
+  confirmSensitive: z.literal(true).optional(),
+});
+const webhookPatchSchema = webhookSubscriptionSchema.partial().extend({ state: z.enum(["active", "paused"]).optional() });
+
+function normalizeWebhookDestination(value: string): string {
+  let destination: URL;
+  try {
+    destination = new URL(value);
+  } catch {
+    throw new WebhookInputError("destination must be an HTTPS URL");
+  }
+  if (
+    destination.protocol !== "https:" ||
+    destination.username ||
+    destination.password ||
+    destination.hash ||
+    destination.port ||
+    !destination.hostname ||
+    isIP(destination.hostname) !== 0
+  ) {
+    throw new WebhookInputError("destination must be an HTTPS hostname on port 443 without credentials or fragments");
+  }
+  return destination.toString();
+}
+
 export function buildApi(
   manager: ConnectionManager,
   mapCache: MapCache,
@@ -89,6 +136,10 @@ export function buildApi(
   deps: { db: Db; config: ServerConfig; version: string },
 ): Router {
   const api = Router();
+  const webhookCrypto: WebhookCrypto | null = deps.config.webhookMasterKey
+    ? createWebhookCrypto(deps.config.webhookMasterKey)
+    : null;
+  const webhookEventTypes: readonly ExternalEventType[] = EXTERNAL_EVENT_TYPES;
   api.use(json({ limit: "1mb" }));
   // cross-site mutation defense applies to every route, including login
   api.use(auth.originGuard);
@@ -1009,6 +1060,160 @@ export function buildApi(
     }),
   );
 
+  // ---- external event catalog and webhook management (issue #56) ----
+  const webhookId = (req: Request): number => z.coerce.number().int().positive().parse(req.params.id);
+  const validateRadioIds = (radioIds: number[] | null): void => {
+    if (radioIds?.some((id) => manager.store.getRadio(id) === null)) {
+      throw new WebhookInputError("radioIds must name existing stored radios");
+    }
+  };
+  const requireWebhookCrypto = (): WebhookCrypto => {
+    if (webhookCrypto === null) throw new WebhookUnavailableError("MESHKEEP_WEBHOOK_MASTER_KEY is required to create or rotate webhooks");
+    return webhookCrypto;
+  };
+
+  api.get(
+    "/event-catalog",
+    auth.eventsReadGuard,
+    handle((_req, res) => {
+      res.json({ eventTypes: webhookEventTypes });
+    }),
+  );
+  api.get(
+    "/webhooks",
+    auth.sessionGuard,
+    handle((_req, res) => {
+      res.json({ subscriptions: manager.store.listWebhookSubscriptions() });
+    }),
+  );
+  api.post(
+    "/webhooks",
+    auth.sessionGuard,
+    handle((req, res) => {
+      const body = webhookSubscriptionSchema.parse(req.body);
+      if (body.includeSensitive && body.confirmSensitive !== true) {
+        throw new WebhookInputError("includeSensitive requires confirmSensitive: true");
+      }
+      if (manager.store.listWebhookSubscriptions().filter((subscription) => subscription.state === "active").length >= 20) {
+        throw new WebhookInputError("at most 20 active webhook subscriptions are allowed");
+      }
+      const radioIds = body.radioIds ?? null;
+      validateRadioIds(radioIds);
+      const crypto = requireWebhookCrypto();
+      const subscription = manager.store.createWebhookSubscription({
+        label: body.label,
+        destination: normalizeWebhookDestination(body.destination),
+        eventTypes: body.eventTypes,
+        radioIds,
+        includeSensitive: body.includeSensitive,
+      });
+      const signingSecret = randomBytes(32);
+      manager.store.createWebhookSigningKey(subscription.id, randomUUID(), signingSecret, crypto);
+      res.status(201).json({
+        subscription: manager.store.getWebhookSubscription(subscription.id),
+        signingSecret: signingSecret.toString("base64url"),
+      });
+    }),
+  );
+  api.get(
+    "/webhooks/:id",
+    auth.sessionGuard,
+    handle((req, res) => {
+      const subscription = manager.store.getWebhookSubscription(webhookId(req));
+      if (!subscription) {
+        res.status(404).json({ error: "webhook subscription not found" });
+        return;
+      }
+      res.json({ subscription });
+    }),
+  );
+  api.patch(
+    "/webhooks/:id",
+    auth.sessionGuard,
+    handle((req, res) => {
+      const id = webhookId(req);
+      const existing = manager.store.getWebhookSubscription(id);
+      if (!existing) {
+        res.status(404).json({ error: "webhook subscription not found" });
+        return;
+      }
+      const body = webhookPatchSchema.parse(req.body);
+      const includeSensitive = body.includeSensitive ?? existing.includeSensitive;
+      if (!existing.includeSensitive && includeSensitive && body.confirmSensitive !== true) {
+        throw new WebhookInputError("includeSensitive requires confirmSensitive: true");
+      }
+      const radioIds = body.radioIds === undefined ? existing.radioIds : body.radioIds;
+      validateRadioIds(radioIds);
+      const subscription = manager.store.updateWebhookSubscription(id, {
+        label: body.label ?? existing.label,
+        destination: body.destination === undefined ? existing.destination : normalizeWebhookDestination(body.destination),
+        eventTypes: body.eventTypes ?? existing.eventTypes,
+        radioIds,
+        includeSensitive,
+        state: body.state ?? existing.state,
+      });
+      res.json({ subscription });
+    }),
+  );
+  api.delete(
+    "/webhooks/:id",
+    auth.sessionGuard,
+    handle((req, res) => {
+      if (!manager.store.deleteWebhookSubscription(webhookId(req))) {
+        res.status(404).json({ error: "webhook subscription not found" });
+        return;
+      }
+      res.json({ ok: true });
+    }),
+  );
+  api.post(
+    "/webhooks/:id/rotate-secret",
+    auth.sessionGuard,
+    handle((req, res) => {
+      const signingSecret = randomBytes(32);
+      if (!manager.store.rotateWebhookSigningKey(webhookId(req), randomUUID(), signingSecret, requireWebhookCrypto())) {
+        res.status(404).json({ error: "webhook subscription not found" });
+        return;
+      }
+      res.json({ signingSecret: signingSecret.toString("base64url") });
+    }),
+  );
+  api.post(
+    "/webhooks/:id/test",
+    auth.sessionGuard,
+    handle((req, res) => {
+      if (!manager.store.getWebhookSubscription(webhookId(req))) {
+        res.status(404).json({ error: "webhook subscription not found" });
+        return;
+      }
+      // Transport and queue ownership belong to the delivery worker card. This
+      // API command deliberately performs no outbound HTTP itself.
+      res.status(202).json({ accepted: true });
+    }),
+  );
+  api.get(
+    "/webhooks/:id/deliveries",
+    auth.eventsReadGuard,
+    handle((req, res) => {
+      const id = webhookId(req);
+      if (!manager.store.getWebhookSubscription(id)) {
+        res.status(404).json({ error: "webhook subscription not found" });
+        return;
+      }
+      const query = z
+        .object({
+          state: z.enum(["queued", "leased", "delivered", "failed", "dropped"]).optional(),
+          before: z.coerce.number().int().positive().optional(),
+          limit: z.coerce.number().int().min(1).max(100).default(50),
+        })
+        .parse(req.query);
+      const deliveries = manager.store
+        .listWebhookDeliveries({ subscriptionId: id, state: query.state, beforeId: query.before, limit: query.limit })
+        .map(({ subscriptionId: _subscriptionId, keyId: _keyId, leaseOwner: _leaseOwner, leaseExpiresAt: _leaseExpiresAt, ...delivery }) => delivery);
+      res.json({ deliveries });
+    }),
+  );
+
   // ---- API tokens (for the HLL plugin and other integrations) ----
   // Session-only: bearer tokens can never mint, rotate, list, or revoke tokens.
   api.get(
@@ -1026,7 +1231,7 @@ export function buildApi(
         .object({
           label: z.string().min(1).max(64),
           // integrations are read-only unless write access is requested explicitly
-          scope: z.enum(["read", "write"]).default("read"),
+          scope: z.enum(["read", "write", "events.read"]).default("read"),
           expiresInDays: z.number().int().min(1).max(3650).nullish(),
         })
         .parse(req.body);

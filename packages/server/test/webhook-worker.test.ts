@@ -1,0 +1,467 @@
+import { createHmac } from "node:crypto";
+import { afterEach, describe, expect, it } from "vitest";
+import { Bus } from "../src/bus.js";
+import { openDb } from "../src/db/index.js";
+import { Store } from "../src/db/store.js";
+import { clearLogs, recentLogs, setLogLevel } from "../src/logger.js";
+import { createWebhookCrypto } from "../src/webhooks/crypto.js";
+import {
+  isForbiddenAddress,
+  retryDelaySeconds,
+  validateWebhookDestination,
+  WebhookWorker,
+  webhookSignature,
+  type WebhookResolver,
+  type WebhookTransport,
+  type WebhookTransportResult,
+} from "../src/webhooks/worker.js";
+
+const masterKey = Buffer.alloc(32, 7);
+const signingSecret = Buffer.alloc(32, 9);
+const now = 1_700_000_000;
+type WebhookRequest = Parameters<WebhookTransport["post"]>[0];
+
+class FakeResolver implements WebhookResolver {
+  readonly hostnames: string[] = [];
+
+  constructor(private readonly answers: string[]) {}
+
+  async resolve(hostname: string): Promise<string[]> {
+    this.hostnames.push(hostname);
+    return this.answers;
+  }
+}
+
+class FakeTransport implements WebhookTransport {
+  readonly requests: WebhookRequest[] = [];
+
+  constructor(
+    private readonly outcomes: Array<WebhookTransportResult | Error> = [
+      { status: 204 },
+    ],
+  ) {}
+
+  async post(input: WebhookRequest): Promise<WebhookTransportResult> {
+    this.requests.push(input);
+    const outcome = this.outcomes.shift() ?? { status: 204 };
+    if (outcome instanceof Error) throw outcome;
+    return outcome;
+  }
+}
+
+function setup(destination = "https://hooks.example.test/meshkeep") {
+  const db = openDb(":memory:", masterKey);
+  const store = new Store(db);
+  const subscription = store.createWebhookSubscription({
+    label: "Home Assistant",
+    destination,
+    eventTypes: ["message.status_changed"],
+    radioIds: [1],
+    includeSensitive: false,
+  });
+  store.createWebhookSigningKey(
+    subscription.id,
+    "key-1",
+    signingSecret,
+    createWebhookCrypto(masterKey),
+  );
+  const bus = new Bus();
+  return { db, store, subscription, bus };
+}
+
+function publishDueEvent(bus: Bus): void {
+  bus.publish({ type: "message.status", radioId: 1, id: 42, status: "sent" });
+}
+
+afterEach(() => {
+  clearLogs();
+  setLogLevel("error");
+});
+
+describe("webhook delivery security primitives", () => {
+  it("rejects every forbidden literal destination class and accepts a public HTTPS endpoint", () => {
+    for (const destination of [
+      "http://public.example.test/hook",
+      "https://user:pass@public.example.test/hook",
+      "https://public.example.test:8443/hook",
+      "https://public.example.test/hook#fragment",
+      "https://127.0.0.1/hook",
+      "https://[::1]/hook",
+    ]) {
+      expect(() => validateWebhookDestination(destination)).toThrow();
+    }
+    expect(
+      validateWebhookDestination("https://hooks.example.test/meshkeep")
+        .hostname,
+    ).toBe("hooks.example.test");
+  });
+
+  it("rejects every local, metadata, documentation, multicast, and mapped-address SSRF class", () => {
+    for (const address of [
+      "0.0.0.0",
+      "127.0.0.1",
+      "10.0.0.1",
+      "169.254.169.254",
+      "100.64.0.1",
+      "172.16.0.1",
+      "192.0.0.1",
+      "192.168.0.1",
+      "198.18.0.1",
+      "198.51.100.1",
+      "203.0.113.1",
+      "224.0.0.1",
+      "::1",
+      "0:0:0:0:0:0:0:1",
+      "::ffff:7f00:1",
+      "::ffff:0a00:1",
+      "::ffff:a9fe:a9fe",
+      "fe80::1",
+      "fc00::1",
+      "ff02::1",
+    ]) {
+      expect(isForbiddenAddress(address), address).toBe(true);
+    }
+    expect(isForbiddenAddress("93.184.216.34")).toBe(false);
+    expect(isForbiddenAddress("2606:2800:220:1:248:1893:25c8:1946")).toBe(
+      false,
+    );
+  });
+
+  it("signs the exact immutable raw delivery bytes using the pinned DNS address", async () => {
+    const { db, store, bus } = setup();
+    const resolver: WebhookResolver = {
+      resolve: async () => ["93.184.216.34"],
+    };
+    const requests: WebhookRequest[] = [];
+    const transport: WebhookTransport = {
+      post: async (input) => (requests.push(input), { status: 204 }),
+    };
+    const worker = new WebhookWorker(
+      store,
+      bus,
+      masterKey,
+      resolver,
+      transport,
+      () => now,
+      () => 0.5,
+    );
+
+    publishDueEvent(bus);
+    await worker.drain();
+
+    expect(requests).toHaveLength(1);
+    const request = requests[0]!;
+    expect(request.address).toBe("93.184.216.34");
+    expect(request.headers["meshkeep-signature"]).toBe(
+      webhookSignature(signingSecret, now, request.body),
+    );
+    expect(request.headers["meshkeep-event-id"]).toBe(
+      JSON.parse(request.body.toString("utf8")).id,
+    );
+    expect(
+      store.listWebhookDeliveries({ subscriptionId: 1, limit: 10 })[0]?.state,
+    ).toBe("delivered");
+    worker.stop();
+    db.close();
+  });
+
+  it("terminates a DNS-rebinding-safe forbidden answer without invoking transport", async () => {
+    const { db, store, bus, subscription } = setup();
+    const resolver: WebhookResolver = {
+      resolve: async () => ["93.184.216.34", "::ffff:7f00:1"],
+    };
+    const transport: WebhookTransport = {
+      post: async () => {
+        throw new Error("must not connect");
+      },
+    };
+    const worker = new WebhookWorker(
+      store,
+      bus,
+      masterKey,
+      resolver,
+      transport,
+      () => now,
+    );
+
+    publishDueEvent(bus);
+    await worker.drain();
+
+    expect(store.getWebhookSubscription(subscription.id)?.state).toBe(
+      "disabled",
+    );
+    expect(
+      store.listWebhookDeliveries({
+        subscriptionId: subscription.id,
+        limit: 10,
+      })[0],
+    ).toMatchObject({ state: "failed", errorSummary: "destination_rejected" });
+    worker.stop();
+    db.close();
+  });
+
+  it("retries network failures with bounded jitter without leaking transport errors into records or logs", async () => {
+    const { db, store, bus, subscription } = setup();
+    const resolver: WebhookResolver = {
+      resolve: async () => ["93.184.216.34"],
+    };
+    const transport: WebhookTransport = {
+      post: async () => {
+        throw new Error("payload-super-secret");
+      },
+    };
+    const worker = new WebhookWorker(
+      store,
+      bus,
+      masterKey,
+      resolver,
+      transport,
+      () => now,
+      () => 0.5,
+    );
+
+    publishDueEvent(bus);
+    await worker.drain();
+
+    const delivery = store.listWebhookDeliveries({
+      subscriptionId: subscription.id,
+      limit: 10,
+    })[0]!;
+    expect(delivery).toMatchObject({
+      state: "queued",
+      attemptCount: 1,
+      errorSummary: "transport_failure",
+    });
+    expect(delivery.nextAttemptAt).toBe(now + 15);
+    expect(JSON.stringify(recentLogs())).not.toContain("payload-super-secret");
+    worker.stop();
+    db.close();
+  });
+
+  it("treats redirects as terminal rather than following them and caps Retry-After", async () => {
+    const { db, store, bus, subscription } = setup();
+    const resolver: WebhookResolver = {
+      resolve: async () => ["93.184.216.34"],
+    };
+    const redirectTransport: WebhookTransport = {
+      post: async () => ({
+        status: 302,
+        headers: { location: "https://elsewhere.example.test/" },
+      }),
+    };
+    const worker = new WebhookWorker(
+      store,
+      bus,
+      masterKey,
+      resolver,
+      redirectTransport,
+      () => now,
+    );
+    publishDueEvent(bus);
+    await worker.drain();
+    expect(store.getWebhookSubscription(subscription.id)?.state).toBe(
+      "disabled",
+    );
+    expect(
+      store.listWebhookDeliveries({
+        subscriptionId: subscription.id,
+        limit: 10,
+      })[0],
+    ).toMatchObject({ state: "failed", responseStatus: 302 });
+    worker.stop();
+    db.close();
+
+    const retry = setup();
+    const retryWorker = new WebhookWorker(
+      retry.store,
+      retry.bus,
+      masterKey,
+      resolver,
+      {
+        post: async () => ({
+          status: 429,
+          headers: { "retry-after": "999999" },
+        }),
+      },
+      () => now,
+    );
+    publishDueEvent(retry.bus);
+    await retryWorker.drain();
+    expect(
+      retry.store.listWebhookDeliveries({
+        subscriptionId: retry.subscription.id,
+        limit: 10,
+      })[0]?.nextAttemptAt,
+    ).toBe(now + 6 * 60 * 60);
+    retryWorker.stop();
+    retry.db.close();
+  });
+
+  it("calculates date-form Retry-After from the worker clock, not host wall time", async () => {
+    const { db, store, bus, subscription } = setup();
+    const worker = new WebhookWorker(
+      store,
+      bus,
+      masterKey,
+      { resolve: async () => ["93.184.216.34"] },
+      {
+        post: async () => ({
+          status: 503,
+          headers: {
+            "retry-after": new Date((now + 90) * 1_000).toUTCString(),
+          },
+        }),
+      },
+      () => now,
+    );
+
+    publishDueEvent(bus);
+    await worker.drain();
+
+    expect(
+      store.listWebhookDeliveries({ subscriptionId: subscription.id, limit: 10 })[0]
+        ?.nextAttemptAt,
+    ).toBe(now + 90);
+    worker.stop();
+    db.close();
+  });
+
+  it("uses full jitter bounded by exponential retry ceilings", () => {
+    expect(retryDelaySeconds(1, () => 0)).toBe(0);
+    expect(retryDelaySeconds(1, () => 0.999999)).toBeLessThanOrEqual(30);
+    expect(retryDelaySeconds(20, () => 0.999999)).toBeLessThanOrEqual(
+      6 * 60 * 60,
+    );
+  });
+
+  it("matches the documented v1 HMAC fixture", () => {
+    const body = Buffer.from('{"id":"evt-1","type":"message.created"}');
+    expect(webhookSignature(signingSecret, now, body)).toBe(
+      `v1=${createHmac("sha256", signingSecret).update(`${now}.`).update(body).digest("hex")}`,
+    );
+  });
+
+  it("retries an ambiguously delivered event with immutable bytes while allowing a newer event to arrive first", async () => {
+    const { db, store, bus } = setup();
+    let clock = now;
+    const resolver = new FakeResolver(["93.184.216.34"]);
+    const transport = new FakeTransport([
+      new Error("receiver disconnected after accepting sensitive bytes"),
+      { status: 204 },
+      { status: 204 },
+    ]);
+    const worker = new WebhookWorker(
+      store,
+      bus,
+      masterKey,
+      resolver,
+      transport,
+      () => clock,
+      () => 0.5,
+    );
+
+    publishDueEvent(bus);
+    await worker.drain();
+    const first = transport.requests[0]!;
+
+    clock = now + 5;
+    publishDueEvent(bus);
+    await worker.drain();
+    const newer = transport.requests[1]!;
+
+    clock = now + 15;
+    await worker.drain();
+    const retried = transport.requests[2]!;
+
+    expect(transport.requests).toHaveLength(3);
+    expect(newer.headers["meshkeep-event-id"]).not.toBe(
+      first.headers["meshkeep-event-id"],
+    );
+    expect(retried.headers["meshkeep-event-id"]).toBe(
+      first.headers["meshkeep-event-id"],
+    );
+    expect(retried.body.equals(first.body)).toBe(true);
+    expect(resolver.hostnames).toEqual([
+      "hooks.example.test",
+      "hooks.example.test",
+      "hooks.example.test",
+    ]);
+    worker.stop();
+    db.close();
+  });
+
+  it("caps repeated transport failures at ten attempts without creating retry-amplification deliveries", async () => {
+    const { db, store, bus, subscription } = setup();
+    const transport = new FakeTransport(
+      Array.from({ length: 10 }, () => new Error("receiver unavailable")),
+    );
+    const worker = new WebhookWorker(
+      store,
+      bus,
+      masterKey,
+      new FakeResolver(["93.184.216.34"]),
+      transport,
+      () => now,
+      () => 0,
+    );
+
+    publishDueEvent(bus);
+    for (let attempt = 0; attempt < 10; attempt++) await worker.drain();
+
+    expect(transport.requests).toHaveLength(10);
+    expect(
+      store.listWebhookDeliveries({ subscriptionId: subscription.id, limit: 10 }),
+    ).toEqual([
+      expect.objectContaining({
+        state: "failed",
+        attemptCount: 10,
+        errorSummary: "transport_failure",
+      }),
+    ]);
+    expect(
+      db.prepare("SELECT COUNT(*) AS count FROM webhook_events").get(),
+    ).toEqual({ count: 1 });
+    worker.stop();
+    db.close();
+  });
+
+  it("keeps signing secrets and immutable payload bytes out of webhook diagnostics records", async () => {
+    const { db, store, bus, subscription } = setup();
+    const payload = "webhook-private-payload";
+    const secretMarker = signingSecret.toString("hex");
+    store.queueWebhookEvent({
+      subscriptionId: subscription.id,
+      keyId: "key-1",
+      eventId: "event-private",
+      type: "message.created",
+      eventVersion: 1,
+      sourceRadioId: 1,
+      occurredAt: now,
+      body: Buffer.from(payload),
+      now,
+    });
+    const worker = new WebhookWorker(
+      store,
+      bus,
+      masterKey,
+      new FakeResolver(["93.184.216.34"]),
+      new FakeTransport([new Error("network down")]),
+      () => now,
+      () => 0.5,
+    );
+
+    await worker.drain();
+
+    const diagnostics = JSON.stringify({
+      logs: recentLogs(),
+      deliveries: store.listWebhookDeliveries({
+        subscriptionId: subscription.id,
+        limit: 10,
+      }),
+    });
+    expect(diagnostics).not.toContain(payload);
+    expect(diagnostics).not.toContain(secretMarker);
+    worker.stop();
+    db.close();
+  });
+});

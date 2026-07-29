@@ -13,6 +13,7 @@ import AppIcon from "../components/AppIcon.vue";
 import {
   AXIS_H,
   KIND_META,
+  LatestRequestGuard,
   MIN_LANE_H,
   centerOn,
   clusterEvents,
@@ -68,6 +69,7 @@ let drag: { startX: number; view: TimeWindow; moved: boolean } | null = null;
 // A click event still fires after a drag's pointerup; this suppresses it.
 let suppressNextClick = false;
 let fetchSeq = 0;
+const advertTelemetryRequest = new LatestRequestGuard();
 let scrubbing = false;
 // The overview covers all of time, so it only reloads on selection changes or
 // once new events have landed — never on a pan or zoom.
@@ -279,7 +281,7 @@ watch([() => view.value.start, () => view.value.end, showTelemetry], scheduleFet
 watch(
   selectedRadioIds,
   () => {
-    popover.value = null;
+    dismissPopover();
     scheduleFetch();
   },
   { deep: true },
@@ -379,7 +381,7 @@ function onKeydown(event: KeyboardEvent): void {
   else if (event.key === "ArrowRight") setView(panBy(view.value, span.value * 0.1, nowSecs()));
   else if (event.key === "Home" && overviewExtent.value) setView(centerOn(view.value, overviewExtent.value.from, nowSecs()));
   else if (event.key === "End") jumpToNow();
-  else if (event.key === "Escape") popover.value = null;
+  else if (event.key === "Escape") dismissPopover();
   else return;
   event.preventDefault();
 }
@@ -397,7 +399,7 @@ function onScrubDown(event: PointerEvent): void {
   if (event.button !== 0) return;
   scrubbing = true;
   (event.currentTarget as Element).setPointerCapture(event.pointerId);
-  popover.value = null;
+  dismissPopover();
   setView(centerOn(view.value, scrubTs(event), nowSecs()));
 }
 
@@ -412,6 +414,11 @@ function onScrubUp(): void {
 
 // ---- popover ----
 
+function dismissPopover(): void {
+  popover.value = null;
+  advertTelemetryRequest.invalidate();
+}
+
 function openPopover(cluster: TimelineCluster, laneIndex: number, radioId: number): void {
   if (suppressNextClick) {
     suppressNextClick = false;
@@ -421,6 +428,7 @@ function openPopover(cluster: TimelineCluster, laneIndex: number, radioId: numbe
   const anchorY = dotY(laneIndex, cluster.kind);
   // Flip above the dot in the lower part of the canvas so the card stays on screen.
   popover.value = { cluster, radioId, x: px, y: anchorY, above: anchorY > heightPx.value * 0.55 };
+  const request = advertTelemetryRequest.begin();
   advertTelemetry.value = null;
   const first = cluster.events[0];
   if (cluster.events.length === 1 && first.kind === "advert") {
@@ -428,6 +436,7 @@ function openPopover(cluster: TimelineCluster, laneIndex: number, radioId: numbe
       `/contacts/${first.advert.contactKey}/telemetry/history?hours=168${radioSuffix(radioId, "&")}`,
     )
       .then((res) => {
+        if (!advertTelemetryRequest.isCurrent(request)) return;
         advertTelemetry.value = res.points.length ? res.points[res.points.length - 1] : null;
       })
       .catch(() => {});
@@ -439,14 +448,14 @@ function zoomToCluster(cluster: TimelineCluster): void {
   const last = cluster.events[cluster.events.length - 1].ts;
   const extent = Math.max(last - first, 60);
   setView({ start: first - extent, end: last + extent });
-  popover.value = null;
+  dismissPopover();
 }
 
 function handleOutsidePointer(event: PointerEvent): void {
   if (!popover.value) return;
   const target = event.target as Element;
   if (target.closest(".event-popover") || target.closest(".event-dot")) return;
-  popover.value = null;
+  dismissPopover();
 }
 
 // ---- radio selection ----
@@ -733,7 +742,7 @@ onBeforeUnmount(() => {
             role="dialog"
             aria-label="Event details"
           >
-            <button type="button" class="popover-close" aria-label="Close" @click="popover = null">
+            <button type="button" class="popover-close" aria-label="Close" @click="dismissPopover">
               <AppIcon name="close" :size="13" />
             </button>
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { Message, TimelineEvent, WsEvent } from "@meshkeep/shared";
 import {
   AXIS_H,
+  LatestRequestGuard,
   MAX_SPAN,
   MIN_LANE_H,
   MIN_SPAN,
@@ -239,5 +240,36 @@ describe("clusterEvents", () => {
     const clusters = clusterEvents(events, view, 1000, 10);
     expect(clusters).toHaveLength(1);
     expect(clusters[0].events).toHaveLength(20);
+  });
+});
+
+describe("LatestRequestGuard", () => {
+  it("keeps the latest popover telemetry when requests resolve out of order", async () => {
+    const guard = new LatestRequestGuard();
+    let rendered: string | null = null;
+    let resolveFirst!: (value: string) => void;
+    let resolveSecond!: (value: string) => void;
+    const first = new Promise<string>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const second = new Promise<string>((resolve) => {
+      resolveSecond = resolve;
+    });
+
+    const firstRequest = guard.begin();
+    void first.then((value) => {
+      if (guard.isCurrent(firstRequest)) rendered = value;
+    });
+    const secondRequest = guard.begin();
+    void second.then((value) => {
+      if (guard.isCurrent(secondRequest)) rendered = value;
+    });
+
+    resolveSecond("B telemetry");
+    await second;
+    resolveFirst("A telemetry");
+    await first;
+
+    expect(rendered).toBe("B telemetry");
   });
 });

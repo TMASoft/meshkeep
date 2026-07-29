@@ -26,6 +26,10 @@ function csvField(value: string | number | null | undefined): string {
   return text;
 }
 
+function csvNumericField(value: number): string {
+  return String(value);
+}
+
 /** The CSV header line, terminated with CRLF, for streaming exports. */
 export function csvHeaderRow(): string {
   return `${CSV_COLUMNS.join(",")}\r\n`;
@@ -65,7 +69,7 @@ export function telemetryToCsvRow(row: TelemetryExportRow): string {
     csvField(row.contactName),
     csvField(row.metric),
     csvField(row.label),
-    csvField(row.value),
+    csvNumericField(row.value),
     csvField(row.unit),
   ].join(",")}\r\n`;
 }

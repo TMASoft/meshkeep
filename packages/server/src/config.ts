@@ -1,4 +1,5 @@
 import type { ConnectionTransport } from "@meshkeep/shared";
+import { parseWebhookMasterKey } from "./webhooks/crypto.js";
 
 export interface ServerConfig {
   port: number;
@@ -20,6 +21,8 @@ export interface ServerConfig {
   mapEnabled: boolean;
   mapTilesUrl: string | null;
   mapTilesAttribution: string | null;
+  /** Decoded deployment secret; never include it in logs or diagnostics. */
+  webhookMasterKey: Buffer | null;
 }
 
 function env(name: string): string | null {
@@ -88,5 +91,6 @@ export function loadConfig(): ServerConfig {
       env("MESHKEEP_MAP_TILES_ENABLED") === "false"
         ? null
         : (env("MESHKEEP_MAP_TILES_ATTRIBUTION") ?? "© OpenStreetMap contributors"),
+    webhookMasterKey: parseWebhookMasterKey(env("MESHKEEP_WEBHOOK_MASTER_KEY")),
   };
 }

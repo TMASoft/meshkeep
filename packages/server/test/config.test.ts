@@ -14,6 +14,14 @@ describe("configuration bounds", () => {
     expect(config.telemetryPollMinutes).toBe(5);
     expect(config.telemetryMonitorMinutes).toBe(30);
     expect(config.timelineRetentionDays).toBe(90);
+    expect(config.webhookMasterKey).toBeNull();
+  });
+
+  it("accepts only a base64 32-byte webhook master key", () => {
+    vi.stubEnv("MESHKEEP_WEBHOOK_MASTER_KEY", Buffer.alloc(32, 7).toString("base64"));
+    expect(loadConfig().webhookMasterKey?.equals(Buffer.alloc(32, 7))).toBe(true);
+    vi.stubEnv("MESHKEEP_WEBHOOK_MASTER_KEY", "not-a-32-byte-base64-key");
+    expect(() => loadConfig()).toThrow(/MESHKEEP_WEBHOOK_MASTER_KEY must be base64-encoded 32 bytes/);
   });
 
   it("rejects non-integer numeric values", () => {

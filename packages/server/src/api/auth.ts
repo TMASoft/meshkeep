@@ -12,7 +12,7 @@ const LAST_USED_THROTTLE_SECS = 5 * 60;
 
 const now = () => Math.floor(Date.now() / 1000);
 
-export type TokenScope = "read" | "write";
+export type TokenScope = "read" | "write" | "events.read";
 
 export interface TokenRow {
   id: number;
@@ -155,6 +155,17 @@ export class Auth {
     return this.hasValidSession(req) || this.tokenAuth(req) !== null;
   }
 
+  /**
+   * WS event-stream access. The live feed carries message content and contact
+   * data, so an events.read token (catalog + redacted delivery summaries only)
+   * must not open it.
+   */
+  wsAuthorized(req: Request): boolean {
+    if (!this.passwordRequired || this.hasValidSession(req)) return true;
+    const token = this.tokenAuth(req);
+    return token !== null && token.scope !== "events.read";
+  }
+
   /** Express middleware guarding /api routes; mutations need a write-capable principal. */
   guard = (req: Request, res: Response, next: NextFunction): void => {
     if (!this.passwordRequired || this.hasValidSession(req)) {
@@ -163,6 +174,11 @@ export class Auth {
     }
     const token = this.tokenAuth(req);
     if (token) {
+      const isEventReadRoute = req.method === "GET" && (req.path === "/event-catalog" || /^\/webhooks\/\d+\/deliveries$/.test(req.path));
+      if (token.scope === "events.read" && !isEventReadRoute) {
+        res.status(403).json({ error: "token lacks read scope" });
+        return;
+      }
       if (isMutation(req) && token.scope !== "write") {
         res.status(403).json({ error: "token lacks write scope" });
         return;
@@ -175,12 +191,33 @@ export class Auth {
 
   /** Token management is session-only: bearer tokens can never mint, list, or revoke tokens. */
   sessionGuard = (req: Request, res: Response, next: NextFunction): void => {
+    if (this.tokenAuth(req) !== null) {
+      res.status(403).json({ error: "session required" });
+      return;
+    }
     if (!this.passwordRequired || this.hasValidSession(req)) {
       next();
       return;
     }
-    const viaToken = this.tokenAuth(req) !== null;
-    res.status(viaToken ? 403 : 401).json({ error: viaToken ? "session required" : "unauthorized" });
+    res.status(401).json({ error: "unauthorized" });
+  };
+
+  /** Catalog and redacted delivery summaries accept an explicit events.read token or a browser session. */
+  eventsReadGuard = (req: Request, res: Response, next: NextFunction): void => {
+    if (this.hasValidSession(req)) {
+      next();
+      return;
+    }
+    const token = this.tokenAuth(req);
+    if (token?.scope === "events.read") {
+      next();
+      return;
+    }
+    if (!this.passwordRequired && token === null) {
+      next();
+      return;
+    }
+    res.status(token ? 403 : 401).json({ error: token ? "token lacks events.read scope" : "unauthorized" });
   };
 
   /**

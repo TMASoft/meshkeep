@@ -14,6 +14,7 @@ import { buildHealth } from "./api/health.js";
 import { attachWs } from "./api/ws.js";
 import { gracefulShutdown } from "./shutdown.js";
 import { logger } from "./logger.js";
+import { WebhookWorker, systemWebhookResolver, systemWebhookTransport } from "./webhooks/worker.js";
 
 const log = logger("meshkeep");
 
@@ -30,11 +31,14 @@ function appVersion(): string {
 
 const config = loadConfig();
 const version = appVersion();
-const db = openDb(resolve(config.dataDir, "meshkeep.db"));
+const db = openDb(resolve(config.dataDir, "meshkeep.db"), config.webhookMasterKey);
 const bus = new Bus();
 const manager = new ConnectionManager(config, db, bus, version);
 const mapCache = new MapCache(config, version);
 const auth = new Auth(db, config.uiPassword);
+const webhookWorker = config.webhookMasterKey
+  ? new WebhookWorker(manager.store, bus, config.webhookMasterKey, systemWebhookResolver, systemWebhookTransport)
+  : null;
 
 const app = express();
 app.disable("x-powered-by");
@@ -65,6 +69,7 @@ server.listen(config.port, () => {
 });
 
 void manager.start();
+webhookWorker?.start();
 
 let shuttingDown = false;
 async function shutdown(): Promise<void> {
@@ -74,6 +79,7 @@ async function shutdown(): Promise<void> {
   }
   shuttingDown = true;
   log.info("shutting down");
+  webhookWorker?.stop();
   const result = await gracefulShutdown({ manager, wss, server, db });
   process.exit(result === "clean" ? 0 : 1);
 }

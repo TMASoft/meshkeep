@@ -1,3 +1,5 @@
+import { z } from "zod";
+
 export type ConnectionTransport = "serial" | "tcp" | "ble" | "none";
 
 export type ConnectionState =
@@ -448,6 +450,317 @@ export type WsEvent =
   | { type: "telemetry"; radioId: number; batteryMilliVolts: number; ts: number }
   | { type: "telemetry.alert"; radioId: number; event: TelemetryAlertEvent }
   | { type: "timeline.event"; radioId: number; event: TimelineEvent };
+
+/** The explicit, signed v1 payload surface for external event integrations. */
+export const EXTERNAL_EVENT_TYPES = [
+  "message.created",
+  "message.status_changed",
+  "contact.updated",
+  "contact.removed",
+  "telemetry.received",
+  "telemetry.alert_triggered",
+  "radio.link_changed",
+  "radio.status_changed",
+] as const;
+export type ExternalEventType = (typeof EXTERNAL_EVENT_TYPES)[number];
+
+const externalEnvelopeFields = {
+  id: z.string().min(1),
+  eventVersion: z.literal(1),
+  occurredAt: z.string().datetime(),
+  source: z.object({
+    product: z.literal("meshkeep"),
+    apiVersion: z.literal("v1"),
+    radioId: z.number().int().nonnegative(),
+  }),
+};
+
+/** Stable projection of message metadata; text is only present with sensitive opt-in. */
+export const externalMessageSchema = z.object({
+  id: z.number().int().nonnegative(),
+  kind: z.enum(["dm", "channel"]),
+  direction: z.enum(["in", "out"]),
+  contactKey: z.string().nullable(),
+  contactName: z.string().nullable(),
+  channelIdx: z.number().int().nonnegative().nullable(),
+  channelName: z.string().nullable(),
+  senderTimestamp: z.number().int().nonnegative(),
+  status: z.enum(["pending", "sent", "delivered", "failed", "retrying"]),
+  createdAt: z.number().int().nonnegative(),
+  text: z.string().optional(),
+});
+
+/** Stable projection of contact metadata; coordinates are only present with sensitive opt-in. */
+export const externalContactSchema = z.object({
+  publicKey: z.string(),
+  name: z.string(),
+  type: z.enum(["chat", "repeater", "room", "none"]),
+  flags: z.number().int(),
+  outPathLen: z.number().int(),
+  lastAdvert: z.number().int().nonnegative(),
+  lastSeen: z.number().int().nonnegative().nullable(),
+  lat: z.number().min(-90).max(90).nullable().optional(),
+  lon: z.number().min(-180).max(180).nullable().optional(),
+});
+
+/** Persisted alert fields that are safe to expose to an external receiver. */
+export const externalAlertSchema = z.object({
+  id: z.number().int().nonnegative(),
+  ruleId: z.number().int().nonnegative(),
+  contactKey: z.string().nullable(),
+  contactName: z.string().nullable(),
+  metric: z.string(),
+  label: z.string(),
+  value: z.number(),
+  threshold: z.number(),
+  comparator: z.enum(["below", "above"]),
+  direction: z.enum(["breach", "recover"]),
+  ts: z.number().int().nonnegative(),
+});
+
+/** `type` and `eventVersion` select one of these stable external shapes. */
+export const externalMessageCreatedEventSchema = z.object({
+  ...externalEnvelopeFields,
+  type: z.literal("message.created"),
+  data: z.object({ message: externalMessageSchema }),
+});
+export const externalMessageStatusChangedEventSchema = z.object({
+  ...externalEnvelopeFields,
+  type: z.literal("message.status_changed"),
+  data: z.object({
+    messageId: z.number().int().nonnegative(),
+    status: z.enum(["pending", "sent", "delivered", "failed", "retrying"]),
+    previousStatus: z.enum(["pending", "sent", "delivered", "failed", "retrying"]).optional(),
+  }),
+});
+export const externalContactUpdatedEventSchema = z.object({
+  ...externalEnvelopeFields,
+  type: z.literal("contact.updated"),
+  data: z.object({ contact: externalContactSchema }),
+});
+export const externalContactRemovedEventSchema = z.object({
+  ...externalEnvelopeFields,
+  type: z.literal("contact.removed"),
+  data: z.object({ publicKey: z.string() }),
+});
+export const externalTelemetryReceivedEventSchema = z.object({
+  ...externalEnvelopeFields,
+  type: z.literal("telemetry.received"),
+  data: z.object({
+    telemetry: z.object({ batteryMilliVolts: z.number().int(), ts: z.number().int().nonnegative() }),
+  }),
+});
+export const externalTelemetryAlertTriggeredEventSchema = z.object({
+  ...externalEnvelopeFields,
+  type: z.literal("telemetry.alert_triggered"),
+  data: z.object({ alert: externalAlertSchema }),
+});
+export const externalRadioLinkChangedEventSchema = z.object({
+  ...externalEnvelopeFields,
+  type: z.literal("radio.link_changed"),
+  data: z.object({
+    radio: z.object({
+      state: z.enum(["connected", "disconnected"]),
+      transport: z.enum(["serial", "tcp", "ble", "none"]),
+      label: z.string(),
+      errorCode: z
+        .enum(["timeout", "disconnected", "authentication", "connection_failed", "unknown"])
+        .nullable(),
+    }),
+  }),
+});
+export const externalRadioStatusChangedEventSchema = z.object({
+  ...externalEnvelopeFields,
+  type: z.literal("radio.status_changed"),
+  data: z.object({
+    radio: z.object({
+      state: z.enum(["disconnected", "connecting", "syncing", "connected", "standby", "error"]),
+      transport: z.enum(["serial", "tcp", "ble", "none"]),
+      connectedAt: z.number().int().nonnegative().nullable(),
+      counts: z.object({
+        contacts: z.number().int().nonnegative(),
+        messages: z.number().int().nonnegative(),
+        unread: z.number().int().nonnegative(),
+      }),
+    }),
+  }),
+});
+export const externalEventEnvelopeSchema = z.discriminatedUnion("type", [
+  externalMessageCreatedEventSchema,
+  externalMessageStatusChangedEventSchema,
+  externalContactUpdatedEventSchema,
+  externalContactRemovedEventSchema,
+  externalTelemetryReceivedEventSchema,
+  externalTelemetryAlertTriggeredEventSchema,
+  externalRadioLinkChangedEventSchema,
+  externalRadioStatusChangedEventSchema,
+]);
+export type ExternalMessage = z.infer<typeof externalMessageSchema>;
+export type ExternalContact = z.infer<typeof externalContactSchema>;
+export type ExternalAlert = z.infer<typeof externalAlertSchema>;
+export type ExternalMessageCreatedEvent = z.infer<typeof externalMessageCreatedEventSchema>;
+export type ExternalMessageStatusChangedEvent = z.infer<typeof externalMessageStatusChangedEventSchema>;
+export type ExternalContactUpdatedEvent = z.infer<typeof externalContactUpdatedEventSchema>;
+export type ExternalContactRemovedEvent = z.infer<typeof externalContactRemovedEventSchema>;
+export type ExternalTelemetryReceivedEvent = z.infer<typeof externalTelemetryReceivedEventSchema>;
+export type ExternalTelemetryAlertTriggeredEvent = z.infer<typeof externalTelemetryAlertTriggeredEventSchema>;
+export type ExternalRadioLinkChangedEvent = z.infer<typeof externalRadioLinkChangedEventSchema>;
+export type ExternalRadioStatusChangedEvent = z.infer<typeof externalRadioStatusChangedEventSchema>;
+export type ExternalEventEnvelope = z.infer<typeof externalEventEnvelopeSchema>;
+
+export interface ExternalEventProjectionOptions {
+  /** Generated by the durable event owner; never derive this from a row id. */
+  id: string;
+  occurredAt?: string;
+  includeSensitive?: boolean;
+  /** Explicit allow-list only. Empty lists match nothing; wildcards are unsupported. */
+  eventTypes?: readonly ExternalEventType[];
+  /** Omit to match every radio; an empty list matches no radio. */
+  radioIds?: readonly number[];
+}
+
+/**
+ * Projects browser-oriented bus events into the deliberately small external
+ * contract. This is the only boundary where sensitive fields may be added;
+ * never persist or serialize a WsEvent or shared entity directly for delivery.
+ */
+export function projectWsEvent(
+  event: WsEvent,
+  options: ExternalEventProjectionOptions,
+): ExternalEventEnvelope | null {
+  const occurredAt = options.occurredAt ?? new Date().toISOString();
+  const allowed = (type: ExternalEventType, radioId: number): boolean =>
+    (options.eventTypes === undefined || options.eventTypes.includes(type)) &&
+    (options.radioIds === undefined || options.radioIds.includes(radioId));
+  const envelope = (
+    type: ExternalEventType,
+    radioId: number,
+    data: unknown,
+  ): ExternalEventEnvelope | null => {
+    if (!allowed(type, radioId)) return null;
+    return externalEventEnvelopeSchema.parse({
+      id: options.id,
+      type,
+      eventVersion: 1,
+      occurredAt,
+      source: { product: "meshkeep", apiVersion: "v1", radioId },
+      data,
+    });
+  };
+
+  switch (event.type) {
+    case "message.new": {
+      const {
+        id,
+        kind,
+        direction,
+        contactKey,
+        contactName,
+        channelIdx,
+        channelName,
+        senderTimestamp,
+        status,
+        createdAt,
+      } = event.message;
+      const message = {
+        id,
+        kind,
+        direction,
+        contactKey,
+        contactName: contactName ?? null,
+        channelIdx,
+        channelName: channelName ?? null,
+        senderTimestamp,
+        status,
+        createdAt,
+      };
+      return envelope("message.created", event.radioId, {
+        message: options.includeSensitive ? { ...message, text: event.message.text } : message,
+      });
+    }
+    case "message.status":
+      return envelope("message.status_changed", event.radioId, { messageId: event.id, status: event.status });
+    case "contact.updated": {
+      const { publicKey, name, type, flags, outPathLen, lastAdvert, lastSeen } = event.contact;
+      const contact = { publicKey, name, type, flags, outPathLen, lastAdvert, lastSeen };
+      return envelope("contact.updated", event.radioId, {
+        contact: options.includeSensitive
+          ? { ...contact, lat: event.contact.lat, lon: event.contact.lon }
+          : contact,
+      });
+    }
+    case "contact.removed":
+      return envelope("contact.removed", event.radioId, { publicKey: event.publicKey });
+    case "telemetry":
+      return envelope("telemetry.received", event.radioId, {
+        telemetry: { batteryMilliVolts: event.batteryMilliVolts, ts: event.ts },
+      });
+    case "telemetry.alert": {
+      const {
+        id,
+        ruleId,
+        contactKey,
+        contactName,
+        metric,
+        label,
+        value,
+        threshold,
+        comparator,
+        direction,
+        ts,
+      } = event.event;
+      return envelope("telemetry.alert_triggered", event.radioId, {
+        alert: {
+          id,
+          ruleId,
+          contactKey,
+          contactName,
+          metric,
+          label,
+          value,
+          threshold,
+          comparator,
+          direction,
+          ts,
+        },
+      });
+    }
+    case "timeline.event":
+      if (event.event.kind !== "link") return null;
+      return envelope("radio.link_changed", event.radioId, {
+        radio: {
+          state: event.event.link.state,
+          transport: event.event.link.transport,
+          label: event.event.link.label,
+          errorCode: connectionErrorCode(event.event.link.error),
+        },
+      });
+    case "status.changed":
+      if (event.status.activeRadioId === null) return null;
+      return envelope("radio.status_changed", event.status.activeRadioId, {
+        radio: {
+          state: event.status.connection.state,
+          transport: event.status.connection.transport,
+          connectedAt: event.status.connection.connectedAt,
+          counts: event.status.counts,
+        },
+      });
+    case "self.updated":
+      return null;
+  }
+}
+
+function connectionErrorCode(
+  error: string | null,
+): "timeout" | "disconnected" | "authentication" | "connection_failed" | "unknown" | null {
+  if (error === null) return null;
+  const normalized = error.toLowerCase();
+  if (normalized.includes("timeout")) return "timeout";
+  if (normalized.includes("disconnect") || normalized.includes("closed")) return "disconnected";
+  if (normalized.includes("auth") || normalized.includes("credential")) return "authentication";
+  if (normalized.includes("connect") || normalized.includes("refused")) return "connection_failed";
+  return "unknown";
+}
 
 export const CONTACT_TYPE_FROM_ADV: Record<number, ContactType> = {
   0: "none",

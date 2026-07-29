@@ -69,6 +69,13 @@ describe("websocket endpoint", () => {
     byToken.close();
   });
 
+  it("rejects events.read tokens — the live feed carries message content", async () => {
+    const ctx = await wsHarness("hunter2-swordfish");
+    server = ctx.server;
+    const token = ctx.harness.auth.createToken("events-only", "events.read").token;
+    await expect(connect(ctx.port, "/api/v1/ws", { Authorization: `Bearer ${token}` })).rejects.toThrow(/401/);
+  });
+
   it("enforces a same-origin policy on browser upgrades", async () => {
     const ctx = await wsHarness(null);
     server = ctx.server;

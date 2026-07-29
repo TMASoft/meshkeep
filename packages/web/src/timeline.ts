@@ -6,6 +6,24 @@ export interface TimeWindow {
   end: number;
 }
 
+/** Marks async work as stale whenever a newer request begins or is dismissed. */
+export class LatestRequestGuard {
+  private current = 0;
+
+  begin(): number {
+    this.current += 1;
+    return this.current;
+  }
+
+  invalidate(): void {
+    this.current += 1;
+  }
+
+  isCurrent(request: number): boolean {
+    return request === this.current;
+  }
+}
+
 /** Zoom bounds: 5 minutes fully zoomed in, 90 days fully zoomed out. */
 export const MIN_SPAN = 300;
 export const MAX_SPAN = 90 * 86_400;

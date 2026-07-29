@@ -27,6 +27,7 @@ import type {
   TimelineOverviewBucket,
 } from "@meshkeep/shared";
 import type { Db } from "./index.js";
+import type { WebhookCrypto } from "../webhooks/crypto.js";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -35,8 +36,15 @@ const now = () => Math.floor(Date.now() / 1000);
  * fragments are compile-time constants — only radio ids and bucket sizes are
  * ever bound as parameters.
  */
-const OVERVIEW_SOURCES: Record<TimelineEventKind, { table: string; tsCol: string; where: string }> = {
-  advert: { table: "timeline_events", tsCol: "ts", where: "AND kind = 'advert'" },
+const OVERVIEW_SOURCES: Record<
+  TimelineEventKind,
+  { table: string; tsCol: string; where: string }
+> = {
+  advert: {
+    table: "timeline_events",
+    tsCol: "ts",
+    where: "AND kind = 'advert'",
+  },
   link: { table: "timeline_events", tsCol: "ts", where: "AND kind = 'link'" },
   message: { table: "messages", tsCol: "created_at", where: "" },
   alert: { table: "telemetry_alert_events", tsCol: "ts", where: "" },
@@ -47,6 +55,108 @@ const OVERVIEW_SOURCES: Record<TimelineEventKind, { table: string; tsCol: string
 export interface OutboundEntry extends OutboundQueueEntry {
   radioId: number;
   cli: boolean;
+}
+
+export interface WebhookSubscription {
+  id: number;
+  label: string;
+  destination: string;
+  eventTypes: string[];
+  radioIds: number[] | null;
+  includeSensitive: boolean;
+  state: "active" | "paused" | "disabled";
+  activeKeyId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface WebhookDelivery {
+  id: number;
+  subscriptionId: number;
+  eventId: string;
+  keyId: string;
+  state: "queued" | "leased" | "delivered" | "failed" | "dropped";
+  attemptCount: number;
+  nextAttemptAt: number;
+  leaseOwner: string | null;
+  leaseExpiresAt: number | null;
+}
+
+export interface WebhookDeliverySummary extends WebhookDelivery {
+  responseStatus: number | null;
+  responseClass: string | null;
+  errorSummary: string | null;
+  completedAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface WebhookDeliveryJob extends WebhookDelivery {
+  destination: string;
+  subscriptionState: WebhookSubscription["state"];
+  type: string;
+  eventVersion: number;
+  body: Buffer;
+  firstAttemptAt: number | null;
+}
+
+interface WebhookSubscriptionRow {
+  id: number;
+  label: string;
+  destination: string;
+  event_types_json: string;
+  radio_ids_json: string | null;
+  include_sensitive: number;
+  state: WebhookSubscription["state"];
+  active_key_id: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+interface WebhookDeliveryRow {
+  id: number;
+  subscription_id: number;
+  event_id: string;
+  key_id: string;
+  state: WebhookDelivery["state"];
+  attempt_count: number;
+  next_attempt_at: number;
+  lease_owner: string | null;
+  lease_expires_at: number | null;
+}
+
+function rowToWebhookSubscription(
+  row: WebhookSubscriptionRow,
+): WebhookSubscription {
+  return {
+    id: row.id,
+    label: row.label,
+    destination: row.destination,
+    eventTypes: JSON.parse(row.event_types_json) as string[],
+    radioIds:
+      row.radio_ids_json === null
+        ? null
+        : (JSON.parse(row.radio_ids_json) as number[]),
+    includeSensitive: row.include_sensitive === 1,
+    state: row.state,
+    activeKeyId: row.active_key_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function rowToWebhookDelivery(row: WebhookDeliveryRow): WebhookDelivery {
+  return {
+    id: row.id,
+    subscriptionId: row.subscription_id,
+    eventId: row.event_id,
+    keyId: row.key_id,
+    state: row.state,
+    attemptCount: row.attempt_count,
+    nextAttemptAt: row.next_attempt_at,
+    leaseOwner: row.lease_owner,
+    leaseExpiresAt: row.lease_expires_at,
+  };
 }
 
 interface OutboundRow {
@@ -87,14 +197,25 @@ function rowToOutbound(row: OutboundRow): OutboundEntry {
 
 /** Connection fields of a profile; name required on create, defaults fill the rest. */
 export type RadioProfileInput = Pick<RadioProfile, "name" | "connection"> &
-  Partial<Pick<RadioProfile, "serialPort" | "serialBaud" | "tcpHost" | "tcpPort" | "bleAddress">>;
+  Partial<
+    Pick<
+      RadioProfile,
+      "serialPort" | "serialBaud" | "tcpHost" | "tcpPort" | "bleAddress"
+    >
+  >;
 
 /** A profile name is a user-facing unique handle; surfaced as a conflict, not an internal error. */
 export class DuplicateProfileNameError extends Error {}
 
 function translateProfileNameConflict(error: unknown, name: string): unknown {
-  if (error instanceof Error && "code" in error && error.code === "SQLITE_CONSTRAINT_UNIQUE") {
-    return new DuplicateProfileNameError(`a radio profile named "${name}" already exists`);
+  if (
+    error instanceof Error &&
+    "code" in error &&
+    error.code === "SQLITE_CONSTRAINT_UNIQUE"
+  ) {
+    return new DuplicateProfileNameError(
+      `a radio profile named "${name}" already exists`,
+    );
   }
   return error;
 }
@@ -255,7 +376,9 @@ export class Store {
       return existing.id;
     }
     const placeholder = this.db
-      .prepare("SELECT id FROM radios WHERE public_key IS NULL ORDER BY id LIMIT 1")
+      .prepare(
+        "SELECT id FROM radios WHERE public_key IS NULL ORDER BY id LIMIT 1",
+      )
       .get() as { id: number } | undefined;
     if (placeholder) {
       this.db
@@ -281,13 +404,17 @@ export class Store {
    */
   ensurePlaceholderRadio(): number {
     const existing = this.db
-      .prepare("SELECT id FROM radios WHERE public_key IS NULL ORDER BY id LIMIT 1")
+      .prepare(
+        "SELECT id FROM radios WHERE public_key IS NULL ORDER BY id LIMIT 1",
+      )
       .get() as { id: number } | undefined;
     if (existing) return existing.id;
     const ts = now();
     return Number(
       this.db
-        .prepare("INSERT INTO radios (public_key, name, first_seen, last_seen, updated_at) VALUES (NULL, NULL, ?, ?, ?)")
+        .prepare(
+          "INSERT INTO radios (public_key, name, first_seen, last_seen, updated_at) VALUES (NULL, NULL, ?, ?, ?)",
+        )
         .run(ts, ts, ts).lastInsertRowid,
     );
   }
@@ -306,9 +433,16 @@ export class Store {
   }
 
   getRadio(id: number): RadioSummary | null {
-    const row = this.db.prepare("SELECT * FROM radios WHERE id = ?").get(id) as RadioRow | undefined;
+    const row = this.db.prepare("SELECT * FROM radios WHERE id = ?").get(id) as
+      RadioRow | undefined;
     if (!row) return null;
-    return { id: row.id, publicKey: row.public_key, name: row.name, lastSeen: row.last_seen, isActive: false };
+    return {
+      id: row.id,
+      publicKey: row.public_key,
+      name: row.name,
+      lastSeen: row.last_seen,
+      isActive: false,
+    };
   }
 
   renameRadio(id: number, name: string): RadioSummary | null {
@@ -321,16 +455,24 @@ export class Store {
   /** Forget a radio and every row scoped to it. Returns false when the id is unknown. */
   deleteRadio(id: number): boolean {
     return this.db.transaction(() => {
-      const exists = this.db.prepare("SELECT 1 FROM radios WHERE id = ?").get(id);
+      const exists = this.db
+        .prepare("SELECT 1 FROM radios WHERE id = ?")
+        .get(id);
       if (!exists) return false;
       // Delete messages before the radios row so the FTS delete triggers fire and
       // the outbound_queue FK cascades; then the remaining per-radio tables.
       this.db.prepare("DELETE FROM messages WHERE radio_id = ?").run(id);
       this.db.prepare("DELETE FROM outbound_queue WHERE radio_id = ?").run(id);
       this.db.prepare("DELETE FROM telemetry WHERE radio_id = ?").run(id);
-      this.db.prepare("DELETE FROM telemetry_monitors WHERE radio_id = ?").run(id);
-      this.db.prepare("DELETE FROM telemetry_alert_rules WHERE radio_id = ?").run(id);
-      this.db.prepare("DELETE FROM telemetry_alert_events WHERE radio_id = ?").run(id);
+      this.db
+        .prepare("DELETE FROM telemetry_monitors WHERE radio_id = ?")
+        .run(id);
+      this.db
+        .prepare("DELETE FROM telemetry_alert_rules WHERE radio_id = ?")
+        .run(id);
+      this.db
+        .prepare("DELETE FROM telemetry_alert_events WHERE radio_id = ?")
+        .run(id);
       this.db.prepare("DELETE FROM timeline_events WHERE radio_id = ?").run(id);
       this.db.prepare("DELETE FROM channels WHERE radio_id = ?").run(id);
       this.db.prepare("DELETE FROM contacts WHERE radio_id = ?").run(id);
@@ -351,9 +493,9 @@ export class Store {
   }
 
   getSelf(radioId: number): SelfInfo | null {
-    const row = this.db.prepare("SELECT raw_json FROM self WHERE radio_id = ?").get(radioId) as
-      | { raw_json: string }
-      | undefined;
+    const row = this.db
+      .prepare("SELECT raw_json FROM self WHERE radio_id = ?")
+      .get(radioId) as { raw_json: string } | undefined;
     return row ? (JSON.parse(row.raw_json) as SelfInfo) : null;
   }
 
@@ -380,10 +522,16 @@ export class Store {
    */
   touchContactSeen(radioId: number, publicKey: string): Contact | null {
     const result = this.db
-      .prepare("UPDATE contacts SET last_seen = ?, updated_at = ? WHERE radio_id = ? AND public_key = ?")
+      .prepare(
+        "UPDATE contacts SET last_seen = ?, updated_at = ? WHERE radio_id = ? AND public_key = ?",
+      )
       .run(now(), now(), radioId, publicKey);
     if (result.changes === 0) return null;
-    return this.getContacts(radioId).find((contact) => contact.publicKey === publicKey) ?? null;
+    return (
+      this.getContacts(radioId).find(
+        (contact) => contact.publicKey === publicKey,
+      ) ?? null
+    );
   }
 
   /**
@@ -399,7 +547,9 @@ export class Store {
     this.db.transaction(() => {
       for (const contact of contacts) this.upsertContact(radioId, contact);
       for (const known of this.getContacts(radioId)) {
-        if (!contacts.some((contact) => contact.publicKey === known.publicKey)) {
+        if (
+          !contacts.some((contact) => contact.publicKey === known.publicKey)
+        ) {
           this.removeContact(radioId, known.publicKey);
           removed.push(known.publicKey);
         }
@@ -410,7 +560,9 @@ export class Store {
 
   getContacts(radioId: number): Contact[] {
     const rows = this.db
-      .prepare("SELECT * FROM contacts WHERE radio_id = ? ORDER BY last_advert DESC")
+      .prepare(
+        "SELECT * FROM contacts WHERE radio_id = ? ORDER BY last_advert DESC",
+      )
       .all(radioId) as Array<{
       public_key: string;
       name: string;
@@ -435,12 +587,20 @@ export class Store {
     }));
   }
 
-  findUniqueContactByPrefix(radioId: number, pubKeyPrefixHex: string): Contact | null {
-    const matches = this.getContacts(radioId).filter((c) => c.publicKey.startsWith(pubKeyPrefixHex));
+  findUniqueContactByPrefix(
+    radioId: number,
+    pubKeyPrefixHex: string,
+  ): Contact | null {
+    const matches = this.getContacts(radioId).filter((c) =>
+      c.publicKey.startsWith(pubKeyPrefixHex),
+    );
     return matches.length === 1 ? matches[0]! : null;
   }
 
-  private reconcileContactMessages(radioId: number, publicKey: string): string[] {
+  private reconcileContactMessages(
+    radioId: number,
+    publicKey: string,
+  ): string[] {
     const prefixes = this.db
       .prepare(
         `SELECT DISTINCT contact_prefix FROM messages
@@ -462,7 +622,9 @@ export class Store {
   }
 
   removeContact(radioId: number, publicKey: string): void {
-    this.db.prepare("DELETE FROM contacts WHERE radio_id = ? AND public_key = ?").run(radioId, publicKey);
+    this.db
+      .prepare("DELETE FROM contacts WHERE radio_id = ? AND public_key = ?")
+      .run(radioId, publicKey);
   }
 
   upsertChannel(radioId: number, channel: Channel): void {
@@ -475,18 +637,26 @@ export class Store {
   }
 
   deleteChannel(radioId: number, idx: number): void {
-    this.db.prepare("DELETE FROM channels WHERE radio_id = ? AND idx = ?").run(radioId, idx);
+    this.db
+      .prepare("DELETE FROM channels WHERE radio_id = ? AND idx = ?")
+      .run(radioId, idx);
   }
 
   getChannels(radioId: number): Channel[] {
     const rows = this.db
-      .prepare("SELECT idx, name, secret_hex FROM channels WHERE radio_id = ? ORDER BY idx")
+      .prepare(
+        "SELECT idx, name, secret_hex FROM channels WHERE radio_id = ? ORDER BY idx",
+      )
       .all(radioId) as Array<{
       idx: number;
       name: string;
       secret_hex: string;
     }>;
-    return rows.map((r) => ({ idx: r.idx, name: r.name, secret: r.secret_hex }));
+    return rows.map((r) => ({
+      idx: r.idx,
+      name: r.name,
+      secret: r.secret_hex,
+    }));
   }
 
   listRadioProfiles(): RadioProfile[] {
@@ -497,9 +667,9 @@ export class Store {
   }
 
   getRadioProfile(id: number): RadioProfile | null {
-    const row = this.db.prepare("SELECT * FROM radio_profiles WHERE id = ?").get(id) as
-      | RadioProfileRow
-      | undefined;
+    const row = this.db
+      .prepare("SELECT * FROM radio_profiles WHERE id = ?")
+      .get(id) as RadioProfileRow | undefined;
     return row ? rowToRadioProfile(row) : null;
   }
 
@@ -529,10 +699,15 @@ export class Store {
   }
 
   /** Apply a partial update; returns the updated profile or null when the id is unknown. */
-  updateRadioProfile(id: number, patch: Partial<RadioProfileInput>): RadioProfile | null {
+  updateRadioProfile(
+    id: number,
+    patch: Partial<RadioProfileInput>,
+  ): RadioProfile | null {
     const existing = this.getRadioProfile(id);
     if (!existing) return null;
-    const defined = Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined));
+    const defined = Object.fromEntries(
+      Object.entries(patch).filter(([, value]) => value !== undefined),
+    );
     const merged = { ...existing, ...defined };
     try {
       this.db
@@ -558,14 +733,19 @@ export class Store {
   }
 
   deleteRadioProfile(id: number): boolean {
-    return this.db.prepare("DELETE FROM radio_profiles WHERE id = ?").run(id).changes > 0;
+    return (
+      this.db.prepare("DELETE FROM radio_profiles WHERE id = ?").run(id)
+        .changes > 0
+    );
   }
 
   // ---- radio links (issue #53, Stage 3): which connections the server currently maintains ----
 
   listLinks(): RadioLinkRecord[] {
     const rows = this.db
-      .prepare("SELECT * FROM radio_links ORDER BY profile_id IS NOT NULL, profile_id")
+      .prepare(
+        "SELECT * FROM radio_links ORDER BY profile_id IS NOT NULL, profile_id",
+      )
       .all() as RadioLinkRow[];
     return rows.map(rowToRadioLinkRecord);
   }
@@ -584,7 +764,9 @@ export class Store {
 
   /** Idempotent — deactivating a profile that has no link is a no-op. */
   deactivateLink(profileId: number): void {
-    this.db.prepare("DELETE FROM radio_links WHERE profile_id = ?").run(profileId);
+    this.db
+      .prepare("DELETE FROM radio_links WHERE profile_id = ?")
+      .run(profileId);
   }
 
   /**
@@ -595,7 +777,9 @@ export class Store {
    * an already-enabled default link leaves its standby/last_radio_id intact.
    */
   setDefaultLinkEnabled(enabled: boolean): void {
-    const exists = this.db.prepare("SELECT 1 FROM radio_links WHERE profile_id IS NULL").get();
+    const exists = this.db
+      .prepare("SELECT 1 FROM radio_links WHERE profile_id IS NULL")
+      .get();
     if (enabled && !exists) {
       const ts = now();
       this.db
@@ -610,13 +794,17 @@ export class Store {
 
   setLinkStandby(profileId: number | null, standby: boolean): void {
     this.db
-      .prepare("UPDATE radio_links SET standby = ?, updated_at = ? WHERE profile_id IS ?")
+      .prepare(
+        "UPDATE radio_links SET standby = ?, updated_at = ? WHERE profile_id IS ?",
+      )
       .run(standby ? 1 : 0, now(), profileId);
   }
 
   setLinkLastRadio(profileId: number | null, radioId: number): void {
     this.db
-      .prepare("UPDATE radio_links SET last_radio_id = ?, updated_at = ? WHERE profile_id IS ?")
+      .prepare(
+        "UPDATE radio_links SET last_radio_id = ?, updated_at = ? WHERE profile_id IS ?",
+      )
       .run(radioId, now(), profileId);
   }
 
@@ -637,7 +825,16 @@ export class Store {
     text: string,
   ): string {
     return createHash("sha256")
-      .update(JSON.stringify([radioId, kind, conversationKey, senderTimestamp, authorPrefix, text]))
+      .update(
+        JSON.stringify([
+          radioId,
+          kind,
+          conversationKey,
+          senderTimestamp,
+          authorPrefix,
+          text,
+        ]),
+      )
       .digest("hex");
   }
 
@@ -660,27 +857,32 @@ export class Store {
     },
   ): Message | null {
     if (input.kind === "dm") {
-      if (input.channelIdx != null) throw new Error("dm messages cannot carry a channel index");
+      if (input.channelIdx != null)
+        throw new Error("dm messages cannot carry a channel index");
       if (!input.contactKey && !input.contactPrefix) {
         throw new Error("dm messages need a contact key or sender prefix");
       }
     } else {
-      if (input.channelIdx == null) throw new Error("channel messages need a channel index");
+      if (input.channelIdx == null)
+        throw new Error("channel messages need a channel index");
       if (input.contactKey || input.contactPrefix) {
         throw new Error("channel messages cannot carry a contact identity");
       }
     }
     const contactKey =
       input.kind === "dm" && !input.contactKey && input.contactPrefix
-        ? this.findUniqueContactByPrefix(radioId, input.contactPrefix)?.publicKey ?? null
-        : input.contactKey ?? null;
+        ? (this.findUniqueContactByPrefix(radioId, input.contactPrefix)
+            ?.publicKey ?? null)
+        : (input.contactKey ?? null);
     const ingestionId =
       input.ingestionId ??
       (input.direction === "in"
         ? this.inboundFrameId(
             radioId,
             input.kind,
-            input.kind === "dm" ? (input.contactPrefix ?? contactKey ?? "") : input.channelIdx!,
+            input.kind === "dm"
+              ? (input.contactPrefix ?? contactKey ?? "")
+              : input.channelIdx!,
             input.senderTimestamp,
             input.authorPrefix ?? null,
             input.text,
@@ -714,7 +916,8 @@ export class Store {
   }
 
   getMessage(id: number): Message | null {
-    const row = this.db.prepare(`${MESSAGE_SELECT} WHERE m.id = ?`).get(id) as MessageRow | undefined;
+    const row = this.db.prepare(`${MESSAGE_SELECT} WHERE m.id = ?`).get(id) as
+      MessageRow | undefined;
     return row ? rowToMessage(row) : null;
   }
 
@@ -724,15 +927,21 @@ export class Store {
     status: MessageStatus;
   }): Message | null {
     const row = this.db
-      .prepare("SELECT id FROM messages WHERE ingestion_id = ? AND status IN ('pending','sent')")
+      .prepare(
+        "SELECT id FROM messages WHERE ingestion_id = ? AND status IN ('pending','sent')",
+      )
       .get(input.ingestionId) as { id: number } | undefined;
     if (!row) return null;
-    this.db.prepare("UPDATE messages SET status = ? WHERE id = ?").run(input.status, row.id);
+    this.db
+      .prepare("UPDATE messages SET status = ? WHERE id = ?")
+      .run(input.status, row.id);
     return this.getMessage(row.id);
   }
 
   setMessageStatus(id: number, status: MessageStatus): void {
-    this.db.prepare("UPDATE messages SET status = ? WHERE id = ?").run(status, id);
+    this.db
+      .prepare("UPDATE messages SET status = ? WHERE id = ?")
+      .run(status, id);
   }
 
   // ---- outbound retry queue ----
@@ -797,7 +1006,9 @@ export class Store {
   /** The full ledger (pending/retrying/failed) for one radio, newest first, for the queue view. */
   listOutbound(radioId: number): OutboundEntry[] {
     const rows = this.db
-      .prepare("SELECT * FROM outbound_queue WHERE radio_id = ? ORDER BY created_at DESC, message_id DESC")
+      .prepare(
+        "SELECT * FROM outbound_queue WHERE radio_id = ? ORDER BY created_at DESC, message_id DESC",
+      )
       .all(radioId) as OutboundRow[];
     return rows.map(rowToOutbound);
   }
@@ -805,7 +1016,12 @@ export class Store {
   /** Persist the outcome of an attempt (new state + backoff + error). */
   markOutboundAttempt(
     messageId: number,
-    patch: { state: OutboundEntry["state"]; attempts: number; nextAttemptAt: number; lastError: string | null },
+    patch: {
+      state: OutboundEntry["state"];
+      attempts: number;
+      nextAttemptAt: number;
+      lastError: string | null;
+    },
   ): void {
     this.db
       .prepare(
@@ -829,7 +1045,9 @@ export class Store {
   }
 
   removeOutbound(messageId: number): void {
-    this.db.prepare("DELETE FROM outbound_queue WHERE message_id = ?").run(messageId);
+    this.db
+      .prepare("DELETE FROM outbound_queue WHERE message_id = ?")
+      .run(messageId);
   }
 
   /** Earliest scheduled attempt among one radio's still-eligible entries, or null when none remain. */
@@ -844,7 +1062,9 @@ export class Store {
 
   getRecentMessages(radioId: number, limit: number): Message[] {
     const rows = this.db
-      .prepare(`${MESSAGE_SELECT} WHERE m.radio_id = ? ORDER BY m.id DESC LIMIT ?`)
+      .prepare(
+        `${MESSAGE_SELECT} WHERE m.radio_id = ? ORDER BY m.id DESC LIMIT ?`,
+      )
       .all(radioId, Math.min(Math.max(limit, 1), 200)) as MessageRow[];
     return rows.map(rowToMessage);
   }
@@ -860,12 +1080,17 @@ export class Store {
     },
   ): Message[] {
     const clauses: string[] = ["m.radio_id = @radioId"];
-    const params: Record<string, unknown> = { radioId, limit: Math.min(Math.max(opts.limit, 1), 200) };
+    const params: Record<string, unknown> = {
+      radioId,
+      limit: Math.min(Math.max(opts.limit, 1), 200),
+    };
     if (opts.contactKey !== undefined) {
       clauses.push("m.kind = 'dm' AND m.contact_key = @contactKey");
       params.contactKey = opts.contactKey;
     } else if (opts.contactPrefix !== undefined) {
-      clauses.push("m.kind = 'dm' AND m.contact_key IS NULL AND m.contact_prefix = @contactPrefix");
+      clauses.push(
+        "m.kind = 'dm' AND m.contact_key IS NULL AND m.contact_prefix = @contactPrefix",
+      );
       params.contactPrefix = opts.contactPrefix;
     } else if (opts.channelIdx !== undefined) {
       clauses.push("m.kind = 'channel' AND m.channel_idx = @channelIdx");
@@ -876,7 +1101,9 @@ export class Store {
       params.beforeId = opts.beforeId;
     }
     const rows = this.db
-      .prepare(`${MESSAGE_SELECT} WHERE ${clauses.join(" AND ")} ORDER BY m.id DESC LIMIT @limit`)
+      .prepare(
+        `${MESSAGE_SELECT} WHERE ${clauses.join(" AND ")} ORDER BY m.id DESC LIMIT @limit`,
+      )
       .all(params) as MessageRow[];
     return rows.map(rowToMessage).reverse();
   }
@@ -899,14 +1126,28 @@ export class Store {
   ): MessageSearchResult[] {
     const terms = opts.query.trim().split(/\s+/).filter(Boolean);
     if (!terms.length) return [];
-    const match = terms.map((term, i) => `"${term.replace(/"/g, '""')}"${i === terms.length - 1 ? "*" : ""}`).join(" ");
-    const clauses: string[] = ["messages_fts MATCH @match", "m.radio_id = @radioId"];
-    const params: Record<string, unknown> = { match, radioId, limit: Math.min(Math.max(opts.limit, 1), 100) };
+    const match = terms
+      .map(
+        (term, i) =>
+          `"${term.replace(/"/g, '""')}"${i === terms.length - 1 ? "*" : ""}`,
+      )
+      .join(" ");
+    const clauses: string[] = [
+      "messages_fts MATCH @match",
+      "m.radio_id = @radioId",
+    ];
+    const params: Record<string, unknown> = {
+      match,
+      radioId,
+      limit: Math.min(Math.max(opts.limit, 1), 100),
+    };
     if (opts.contactKey !== undefined) {
       clauses.push("m.kind = 'dm' AND m.contact_key = @contactKey");
       params.contactKey = opts.contactKey;
     } else if (opts.contactPrefix !== undefined) {
-      clauses.push("m.kind = 'dm' AND m.contact_key IS NULL AND m.contact_prefix = @contactPrefix");
+      clauses.push(
+        "m.kind = 'dm' AND m.contact_key IS NULL AND m.contact_prefix = @contactPrefix",
+      );
       params.contactPrefix = opts.contactPrefix;
     } else if (opts.channelIdx !== undefined) {
       clauses.push("m.kind = 'channel' AND m.channel_idx = @channelIdx");
@@ -931,7 +1172,11 @@ export class Store {
   /** Every message of a conversation (or the whole radio), oldest first, for export. */
   getMessagesForExport(
     radioId: number,
-    opts: { contactKey?: string; contactPrefix?: string; channelIdx?: number } = {},
+    opts: {
+      contactKey?: string;
+      contactPrefix?: string;
+      channelIdx?: number;
+    } = {},
   ): Message[] {
     return [...this.iterateMessagesForExport(radioId, opts)];
   }
@@ -945,7 +1190,11 @@ export class Store {
    */
   *iterateMessagesForExport(
     radioId: number,
-    opts: { contactKey?: string; contactPrefix?: string; channelIdx?: number } = {},
+    opts: {
+      contactKey?: string;
+      contactPrefix?: string;
+      channelIdx?: number;
+    } = {},
   ): Generator<Message> {
     const clauses: string[] = ["m.radio_id = @radioId"];
     const params: Record<string, unknown> = { radioId };
@@ -953,13 +1202,17 @@ export class Store {
       clauses.push("m.kind = 'dm' AND m.contact_key = @contactKey");
       params.contactKey = opts.contactKey;
     } else if (opts.contactPrefix !== undefined) {
-      clauses.push("m.kind = 'dm' AND m.contact_key IS NULL AND m.contact_prefix = @contactPrefix");
+      clauses.push(
+        "m.kind = 'dm' AND m.contact_key IS NULL AND m.contact_prefix = @contactPrefix",
+      );
       params.contactPrefix = opts.contactPrefix;
     } else if (opts.channelIdx !== undefined) {
       clauses.push("m.kind = 'channel' AND m.channel_idx = @channelIdx");
       params.channelIdx = opts.channelIdx;
     }
-    const stmt = this.db.prepare(`${MESSAGE_SELECT} WHERE ${clauses.join(" AND ")} ORDER BY m.id ASC`);
+    const stmt = this.db.prepare(
+      `${MESSAGE_SELECT} WHERE ${clauses.join(" AND ")} ORDER BY m.id ASC`,
+    );
     for (const row of stmt.iterate(params) as IterableIterator<MessageRow>) {
       yield rowToMessage(row);
     }
@@ -1070,19 +1323,37 @@ export class Store {
     }));
   }
 
-  counts(radioId: number): { contacts: number; messages: number; unread: number } {
-    const one = (sql: string) => (this.db.prepare(sql).get(radioId) as { n: number }).n;
+  counts(radioId: number): {
+    contacts: number;
+    messages: number;
+    unread: number;
+  } {
+    const one = (sql: string) =>
+      (this.db.prepare(sql).get(radioId) as { n: number }).n;
     return {
       contacts: one("SELECT COUNT(*) AS n FROM contacts WHERE radio_id = ?"),
       messages: one("SELECT COUNT(*) AS n FROM messages WHERE radio_id = ?"),
-      unread: one("SELECT COUNT(*) AS n FROM messages WHERE radio_id = ? AND direction = 'in' AND read = 0"),
+      unread: one(
+        "SELECT COUNT(*) AS n FROM messages WHERE radio_id = ? AND direction = 'in' AND read = 0",
+      ),
     };
   }
 
-  recordTelemetry(radioId: number, batteryMv: number | null, raw?: unknown): void {
+  recordTelemetry(
+    radioId: number,
+    batteryMv: number | null,
+    raw?: unknown,
+  ): void {
     this.db
-      .prepare("INSERT INTO telemetry (radio_id, ts, battery_mv, raw_json) VALUES (?, ?, ?, ?)")
-      .run(radioId, now(), batteryMv, raw === undefined ? null : JSON.stringify(raw));
+      .prepare(
+        "INSERT INTO telemetry (radio_id, ts, battery_mv, raw_json) VALUES (?, ?, ?, ?)",
+      )
+      .run(
+        radioId,
+        now(),
+        batteryMv,
+        raw === undefined ? null : JSON.stringify(raw),
+      );
   }
 
   getTelemetry(radioId: number, sinceTs: number): TelemetryPoint[] {
@@ -1090,31 +1361,53 @@ export class Store {
       .prepare(
         "SELECT ts, battery_mv FROM telemetry WHERE radio_id = ? AND contact_key IS NULL AND ts >= ? ORDER BY ts ASC",
       )
-      .all(radioId, sinceTs) as Array<{ ts: number; battery_mv: number | null }>;
+      .all(radioId, sinceTs) as Array<{
+      ts: number;
+      battery_mv: number | null;
+    }>;
     return rows.map((r) => ({ ts: r.ts, batteryMv: r.battery_mv }));
   }
 
   /** Persist one successful remote telemetry response for a contact. */
-  recordContactTelemetry(radioId: number, contactKey: string, readings: SensorReading[]): void {
+  recordContactTelemetry(
+    radioId: number,
+    contactKey: string,
+    readings: SensorReading[],
+  ): void {
     this.db
-      .prepare("INSERT INTO telemetry (radio_id, ts, battery_mv, raw_json, contact_key) VALUES (?, ?, NULL, ?, ?)")
+      .prepare(
+        "INSERT INTO telemetry (radio_id, ts, battery_mv, raw_json, contact_key) VALUES (?, ?, NULL, ?, ?)",
+      )
       .run(radioId, now(), JSON.stringify(readings), contactKey);
   }
 
-  getContactTelemetry(radioId: number, contactKey: string, sinceTs: number): ContactTelemetryPoint[] {
+  getContactTelemetry(
+    radioId: number,
+    contactKey: string,
+    sinceTs: number,
+  ): ContactTelemetryPoint[] {
     const rows = this.db
       .prepare(
         "SELECT ts, raw_json FROM telemetry WHERE radio_id = ? AND contact_key = ? AND ts >= ? ORDER BY ts ASC",
       )
-      .all(radioId, contactKey, sinceTs) as Array<{ ts: number; raw_json: string | null }>;
-    return rows.map((row) => ({ ts: row.ts, readings: row.raw_json ? (JSON.parse(row.raw_json) as SensorReading[]) : [] }));
+      .all(radioId, contactKey, sinceTs) as Array<{
+      ts: number;
+      raw_json: string | null;
+    }>;
+    return rows.map((row) => ({
+      ts: row.ts,
+      readings: row.raw_json
+        ? (JSON.parse(row.raw_json) as SensorReading[])
+        : [],
+    }));
   }
 
   /** Delete telemetry rows older than the retention window (all radios). Returns rows removed. */
   trimTelemetry(retentionDays: number): number {
     if (!Number.isFinite(retentionDays) || retentionDays <= 0) return 0;
     const cutoff = now() - Math.floor(retentionDays * 86_400);
-    return this.db.prepare("DELETE FROM telemetry WHERE ts < ?").run(cutoff).changes;
+    return this.db.prepare("DELETE FROM telemetry WHERE ts < ?").run(cutoff)
+      .changes;
   }
 
   latestBatteryMv(radioId: number): number | null {
@@ -1132,7 +1425,11 @@ export class Store {
    * readings (e.g. GPS) are skipped — same choice the web sensor sparklines
    * already make.
    */
-  exportTelemetry(radioId: number, sinceTs: number, contactKey?: string): TelemetryExportRow[] {
+  exportTelemetry(
+    radioId: number,
+    sinceTs: number,
+    contactKey?: string,
+  ): TelemetryExportRow[] {
     const rows = (
       contactKey
         ? this.db
@@ -1205,14 +1502,23 @@ export class Store {
   }
 
   removeMonitor(radioId: number, contactKey: string): void {
-    this.db.prepare("DELETE FROM telemetry_monitors WHERE radio_id = ? AND contact_key = ?").run(radioId, contactKey);
+    this.db
+      .prepare(
+        "DELETE FROM telemetry_monitors WHERE radio_id = ? AND contact_key = ?",
+      )
+      .run(radioId, contactKey);
   }
 
   listMonitors(radioId: number): TelemetryMonitor[] {
     const rows = this.db
-      .prepare("SELECT contact_key, created_at FROM telemetry_monitors WHERE radio_id = ? ORDER BY created_at ASC")
+      .prepare(
+        "SELECT contact_key, created_at FROM telemetry_monitors WHERE radio_id = ? ORDER BY created_at ASC",
+      )
       .all(radioId) as Array<{ contact_key: string; created_at: number }>;
-    return rows.map((r) => ({ contactKey: r.contact_key, createdAt: r.created_at }));
+    return rows.map((r) => ({
+      contactKey: r.contact_key,
+      createdAt: r.created_at,
+    }));
   }
 
   /**
@@ -1249,13 +1555,25 @@ export class Store {
 
   addAlertRule(
     radioId: number,
-    rule: { contactKey: string | null; metric: string; comparator: AlertComparator; threshold: number },
+    rule: {
+      contactKey: string | null;
+      metric: string;
+      comparator: AlertComparator;
+      threshold: number;
+    },
   ): TelemetryAlertRule {
     const info = this.db
       .prepare(
         "INSERT INTO telemetry_alert_rules (radio_id, contact_key, metric, comparator, threshold, last_state, created_at) VALUES (?, ?, ?, ?, ?, 'ok', ?)",
       )
-      .run(radioId, rule.contactKey, rule.metric, rule.comparator, rule.threshold, now());
+      .run(
+        radioId,
+        rule.contactKey,
+        rule.metric,
+        rule.comparator,
+        rule.threshold,
+        now(),
+      );
     return {
       id: Number(info.lastInsertRowid),
       contactKey: rule.contactKey,
@@ -1267,7 +1585,11 @@ export class Store {
   }
 
   removeAlertRule(radioId: number, ruleId: number): void {
-    this.db.prepare("DELETE FROM telemetry_alert_rules WHERE radio_id = ? AND id = ?").run(radioId, ruleId);
+    this.db
+      .prepare(
+        "DELETE FROM telemetry_alert_rules WHERE radio_id = ? AND id = ?",
+      )
+      .run(radioId, ruleId);
   }
 
   listAlertEvents(radioId: number, sinceTs: number): TelemetryAlertEvent[] {
@@ -1299,9 +1621,11 @@ export class Store {
     if (!samples.length) return [];
     const fired: TelemetryAlertEvent[] = [];
     const contactRow = contactKey
-      ? (this.db.prepare("SELECT name FROM contacts WHERE radio_id = ? AND public_key = ?").get(radioId, contactKey) as
-          | { name: string }
-          | undefined)
+      ? (this.db
+          .prepare(
+            "SELECT name FROM contacts WHERE radio_id = ? AND public_key = ?",
+          )
+          .get(radioId, contactKey) as { name: string } | undefined)
       : undefined;
     const contactName = contactRow?.name ?? null;
     for (const sample of samples) {
@@ -1311,10 +1635,17 @@ export class Store {
         )
         .all(radioId, contactKey, sample.metric) as AlertRuleRow[];
       for (const rule of rules) {
-        const breached = rule.comparator === "below" ? sample.value < rule.threshold : sample.value > rule.threshold;
+        const breached =
+          rule.comparator === "below"
+            ? sample.value < rule.threshold
+            : sample.value > rule.threshold;
         const newState: "ok" | "breached" = breached ? "breached" : "ok";
         if (newState === rule.last_state) continue;
-        this.db.prepare("UPDATE telemetry_alert_rules SET last_state = ? WHERE id = ?").run(newState, rule.id);
+        this.db
+          .prepare(
+            "UPDATE telemetry_alert_rules SET last_state = ? WHERE id = ?",
+          )
+          .run(newState, rule.id);
         const ts = now();
         const direction: "breach" | "recover" = breached ? "breach" : "recover";
         const info = this.db
@@ -1358,7 +1689,11 @@ export class Store {
    * (an advert row keeps the name the node advertised then, not whatever the
    * contact is renamed to later).
    */
-  recordAdvert(radioId: number, contact: Contact, observed: "new" | "seen"): TimelineEvent {
+  recordAdvert(
+    radioId: number,
+    contact: Contact,
+    observed: "new" | "seen",
+  ): TimelineEvent {
     const payload: TimelineAdvertPayload = {
       contactKey: contact.publicKey,
       name: contact.name,
@@ -1371,17 +1706,33 @@ export class Store {
     };
     const ts = now();
     const info = this.db
-      .prepare("INSERT INTO timeline_events (radio_id, kind, ts, contact_key, payload_json) VALUES (?, 'advert', ?, ?, ?)")
+      .prepare(
+        "INSERT INTO timeline_events (radio_id, kind, ts, contact_key, payload_json) VALUES (?, 'advert', ?, ?, ?)",
+      )
       .run(radioId, ts, contact.publicKey, JSON.stringify(payload));
-    return { id: `adv:${info.lastInsertRowid}`, radioId, ts, kind: "advert", advert: payload };
+    return {
+      id: `adv:${info.lastInsertRowid}`,
+      radioId,
+      ts,
+      kind: "advert",
+      advert: payload,
+    };
   }
 
   recordLinkEvent(radioId: number, link: TimelineLinkPayload): TimelineEvent {
     const ts = now();
     const info = this.db
-      .prepare("INSERT INTO timeline_events (radio_id, kind, ts, contact_key, payload_json) VALUES (?, 'link', ?, NULL, ?)")
+      .prepare(
+        "INSERT INTO timeline_events (radio_id, kind, ts, contact_key, payload_json) VALUES (?, 'link', ?, NULL, ?)",
+      )
       .run(radioId, ts, JSON.stringify(link));
-    return { id: `lnk:${info.lastInsertRowid}`, radioId, ts, kind: "link", link };
+    return {
+      id: `lnk:${info.lastInsertRowid}`,
+      radioId,
+      ts,
+      kind: "link",
+      link,
+    };
   }
 
   /**
@@ -1401,7 +1752,9 @@ export class Store {
     const merged: TimelineEvent[] = [];
     const fetch = limit + 1;
     for (const radioId of radioIds) {
-      const stored = (["advert", "link"] as const).filter((kind) => kinds.includes(kind));
+      const stored = (["advert", "link"] as const).filter((kind) =>
+        kinds.includes(kind),
+      );
       if (stored.length > 0) {
         const rows = this.db
           .prepare(
@@ -1418,8 +1771,20 @@ export class Store {
         for (const row of rows) {
           merged.push(
             row.kind === "advert"
-              ? { id: `adv:${row.id}`, radioId, ts: row.ts, kind: "advert", advert: JSON.parse(row.payload_json) as TimelineAdvertPayload }
-              : { id: `lnk:${row.id}`, radioId, ts: row.ts, kind: "link", link: JSON.parse(row.payload_json) as TimelineLinkPayload },
+              ? {
+                  id: `adv:${row.id}`,
+                  radioId,
+                  ts: row.ts,
+                  kind: "advert",
+                  advert: JSON.parse(row.payload_json) as TimelineAdvertPayload,
+                }
+              : {
+                  id: `lnk:${row.id}`,
+                  radioId,
+                  ts: row.ts,
+                  kind: "link",
+                  link: JSON.parse(row.payload_json) as TimelineLinkPayload,
+                },
           );
         }
       }
@@ -1481,7 +1846,13 @@ export class Store {
           )
           .all(radioId, fromTs, toTs, fetch) as AlertEventRow[];
         for (const row of rows) {
-          merged.push({ id: `alr:${row.id}`, radioId, ts: row.ts, kind: "alert", alert: rowToAlertEvent(row) });
+          merged.push({
+            id: `alr:${row.id}`,
+            radioId,
+            ts: row.ts,
+            kind: "alert",
+            alert: rowToAlertEvent(row),
+          });
         }
       }
       if (kinds.includes("telemetry")) {
@@ -1511,13 +1882,18 @@ export class Store {
               contactKey: row.contact_key,
               contactName: row.contact_name,
               batteryMv: row.battery_mv,
-              readings: row.contact_key && row.raw_json ? (JSON.parse(row.raw_json) as SensorReading[]) : [],
+              readings:
+                row.contact_key && row.raw_json
+                  ? (JSON.parse(row.raw_json) as SensorReading[])
+                  : [],
             },
           });
         }
       }
     }
-    merged.sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    merged.sort(
+      (a, b) => a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    );
     const truncated = merged.length > limit;
     return { events: truncated ? merged.slice(0, limit) : merged, truncated };
   }
@@ -1528,8 +1904,18 @@ export class Store {
    * client can show every event that exists without fetching them all.
    * `from`/`to` are the real extent of the matching rows.
    */
-  getTimelineOverview(radioIds: number[], kinds: TimelineEventKind[], bucketCount: number): TimelineOverview {
-    const empty: TimelineOverview = { from: 0, to: 0, bucketSecs: 0, buckets: [], total: 0 };
+  getTimelineOverview(
+    radioIds: number[],
+    kinds: TimelineEventKind[],
+    bucketCount: number,
+  ): TimelineOverview {
+    const empty: TimelineOverview = {
+      from: 0,
+      to: 0,
+      bucketSecs: 0,
+      buckets: [],
+      total: 0,
+    };
     if (radioIds.length === 0 || kinds.length === 0) return empty;
     const idList = radioIds.map(() => "?").join(", ");
 
@@ -1549,7 +1935,10 @@ export class Store {
     if (!Number.isFinite(from)) return empty;
 
     // A history spanning a single instant still needs a positive width to bucket over.
-    const bucketSecs = Math.max(1, Math.ceil(Math.max(to - from, 1) / Math.max(bucketCount, 1)));
+    const bucketSecs = Math.max(
+      1,
+      Math.ceil(Math.max(to - from, 1) / Math.max(bucketCount, 1)),
+    );
     const byTs = new Map<number, TimelineOverviewBucket>();
     let total = 0;
     for (const kind of kinds) {
@@ -1562,7 +1951,10 @@ export class Store {
            WHERE radio_id IN (${idList}) ${source.where}
            GROUP BY bucket`,
         )
-        .all(from, bucketSecs, ...radioIds) as Array<{ bucket: number; n: number }>;
+        .all(from, bucketSecs, ...radioIds) as Array<{
+        bucket: number;
+        n: number;
+      }>;
       for (const row of rows) {
         const ts = from + row.bucket * bucketSecs;
         let bucket = byTs.get(ts);
@@ -1574,14 +1966,600 @@ export class Store {
         total += row.n;
       }
     }
-    return { from, to, bucketSecs, buckets: [...byTs.values()].sort((a, b) => a.ts - b.ts), total };
+    return {
+      from,
+      to,
+      bucketSecs,
+      buckets: [...byTs.values()].sort((a, b) => a.ts - b.ts),
+      total,
+    };
+  }
+
+  // ---- durable webhook storage (issue #56; no transport or API policy here) ----
+
+  createWebhookSubscription(input: {
+    label: string;
+    destination: string;
+    eventTypes: string[];
+    radioIds: number[] | null;
+    includeSensitive: boolean;
+  }): WebhookSubscription {
+    const ts = now();
+    const info = this.db
+      .prepare(
+        `INSERT INTO webhook_subscriptions
+         (label, destination, event_types_json, radio_ids_json, include_sensitive, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`,
+      )
+      .run(
+        input.label,
+        input.destination,
+        JSON.stringify(input.eventTypes),
+        input.radioIds === null ? null : JSON.stringify(input.radioIds),
+        input.includeSensitive ? 1 : 0,
+        ts,
+        ts,
+      );
+    return this.getWebhookSubscription(Number(info.lastInsertRowid))!;
+  }
+
+  getWebhookSubscription(subscriptionId: number): WebhookSubscription | null {
+    const row = this.db
+      .prepare("SELECT * FROM webhook_subscriptions WHERE id = ?")
+      .get(subscriptionId) as WebhookSubscriptionRow | undefined;
+    return row ? rowToWebhookSubscription(row) : null;
+  }
+
+  listWebhookSubscriptions(): WebhookSubscription[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM webhook_subscriptions ORDER BY id ASC")
+        .all() as WebhookSubscriptionRow[]
+    ).map(rowToWebhookSubscription);
+  }
+
+  updateWebhookSubscription(
+    subscriptionId: number,
+    input: Pick<
+      WebhookSubscription,
+      | "label"
+      | "destination"
+      | "eventTypes"
+      | "radioIds"
+      | "includeSensitive"
+      | "state"
+    >,
+  ): WebhookSubscription | null {
+    const changed = this.db
+      .prepare(
+        `UPDATE webhook_subscriptions SET label = ?, destination = ?, event_types_json = ?, radio_ids_json = ?,
+         include_sensitive = ?, state = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(
+        input.label,
+        input.destination,
+        JSON.stringify(input.eventTypes),
+        input.radioIds === null ? null : JSON.stringify(input.radioIds),
+        input.includeSensitive ? 1 : 0,
+        input.state,
+        now(),
+        subscriptionId,
+      ).changes;
+    return changed > 0 ? this.getWebhookSubscription(subscriptionId) : null;
+  }
+
+  deleteWebhookSubscription(subscriptionId: number): boolean {
+    return (
+      this.db
+        .prepare("DELETE FROM webhook_subscriptions WHERE id = ?")
+        .run(subscriptionId).changes > 0
+    );
+  }
+
+  listActiveWebhookSubscriptions(): WebhookSubscription[] {
+    return (
+      this.db
+        .prepare(
+          "SELECT * FROM webhook_subscriptions WHERE state = 'active' AND active_key_id IS NOT NULL ORDER BY id",
+        )
+        .all() as WebhookSubscriptionRow[]
+    ).map(rowToWebhookSubscription);
+  }
+
+  /**
+   * A terminal policy failure is a hard stop: no queued or leased row may be
+   * retried after the subscription is disabled. Marking them terminal also
+   * keeps retention bounded rather than leaving an undrainable queue behind.
+   */
+  disableWebhookSubscription(subscriptionId: number, reason: string): number {
+    const ts = now();
+    const summary = reason.slice(0, 256);
+    return this.db.transaction(() => {
+      this.db
+        .prepare(
+          "UPDATE webhook_subscriptions SET state = 'disabled', last_failure_summary = ?, updated_at = ? WHERE id = ?",
+        )
+        .run(summary, ts, subscriptionId);
+      return this.db
+        .prepare(
+          `UPDATE webhook_deliveries
+           SET state = 'dropped', completed_at = ?, response_status = NULL,
+               response_class = NULL, error_summary = ?, lease_owner = NULL,
+               lease_expires_at = NULL, updated_at = ?
+           WHERE subscription_id = ? AND state IN ('queued', 'leased')`,
+        )
+        .run(ts, summary, ts, subscriptionId).changes;
+    })();
+  }
+
+  createWebhookSigningKey(
+    subscriptionId: number,
+    keyId: string,
+    secret: Buffer,
+    crypto: WebhookCrypto,
+  ): void {
+    const encrypted = crypto.encrypt(secret);
+    const ts = now();
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO webhook_keys
+           (subscription_id, key_id, secret_ciphertext, secret_nonce, secret_auth_tag, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          subscriptionId,
+          keyId,
+          encrypted.ciphertext,
+          encrypted.nonce,
+          encrypted.authTag,
+          ts,
+        );
+      this.db
+        .prepare(
+          "UPDATE webhook_subscriptions SET active_key_id = ?, updated_at = ? WHERE id = ?",
+        )
+        .run(keyId, ts, subscriptionId);
+    })();
+  }
+
+  rotateWebhookSigningKey(
+    subscriptionId: number,
+    keyId: string,
+    secret: Buffer,
+    crypto: WebhookCrypto,
+  ): boolean {
+    const encrypted = crypto.encrypt(secret);
+    const ts = now();
+    return this.db.transaction(() => {
+      const subscription = this.getWebhookSubscription(subscriptionId);
+      if (!subscription) return false;
+      if (subscription.activeKeyId !== null) {
+        this.db
+          .prepare(
+            "UPDATE webhook_keys SET retire_at = ? WHERE subscription_id = ? AND key_id = ? AND deleted_at IS NULL",
+          )
+          .run(ts + 86_400, subscriptionId, subscription.activeKeyId);
+      }
+      this.db
+        .prepare(
+          `INSERT INTO webhook_keys
+           (subscription_id, key_id, secret_ciphertext, secret_nonce, secret_auth_tag, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          subscriptionId,
+          keyId,
+          encrypted.ciphertext,
+          encrypted.nonce,
+          encrypted.authTag,
+          ts,
+        );
+      this.db
+        .prepare(
+          "UPDATE webhook_subscriptions SET active_key_id = ?, updated_at = ? WHERE id = ?",
+        )
+        .run(keyId, ts, subscriptionId);
+      return true;
+    })();
+  }
+
+  getWebhookSigningKey(
+    subscriptionId: number,
+    keyId: string,
+    crypto: WebhookCrypto,
+  ): Buffer | null {
+    const row = this.db
+      .prepare(
+        "SELECT secret_ciphertext, secret_nonce, secret_auth_tag FROM webhook_keys WHERE subscription_id = ? AND key_id = ? AND deleted_at IS NULL",
+      )
+      .get(subscriptionId, keyId) as
+      | {
+          secret_ciphertext: Buffer;
+          secret_nonce: Buffer;
+          secret_auth_tag: Buffer;
+        }
+      | undefined;
+    return row
+      ? crypto.decrypt({
+          ciphertext: row.secret_ciphertext,
+          nonce: row.secret_nonce,
+          authTag: row.secret_auth_tag,
+        })
+      : null;
+  }
+
+  recordWebhookEvent(input: {
+    eventId: string;
+    type: string;
+    eventVersion: number;
+    sourceRadioId: number | null;
+    occurredAt: number;
+    body: Buffer;
+  }): void {
+    this.db
+      .prepare(
+        "INSERT INTO webhook_events (event_id, type, event_version, source_radio_id, occurred_at, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        input.eventId,
+        input.type,
+        input.eventVersion,
+        input.sourceRadioId,
+        input.occurredAt,
+        input.body,
+        now(),
+      );
+  }
+
+  enqueueWebhookDelivery(input: {
+    subscriptionId: number;
+    eventId: string;
+    keyId: string;
+    nextAttemptAt: number;
+  }): WebhookDelivery {
+    const ts = now();
+    const info = this.db
+      .prepare(
+        `INSERT INTO webhook_deliveries
+         (subscription_id, event_id, key_id, state, attempt_count, next_attempt_at, created_at, updated_at)
+         VALUES (?, ?, ?, 'queued', 0, ?, ?, ?)`,
+      )
+      .run(
+        input.subscriptionId,
+        input.eventId,
+        input.keyId,
+        input.nextAttemptAt,
+        ts,
+        ts,
+      );
+    return this.getWebhookDelivery(Number(info.lastInsertRowid))!;
+  }
+
+  /** Atomically persist a filtered snapshot and bounded delivery state. */
+  queueWebhookEvent(input: {
+    subscriptionId: number;
+    keyId: string;
+    eventId: string;
+    type: string;
+    eventVersion: number;
+    sourceRadioId: number | null;
+    occurredAt: number;
+    body: Buffer;
+    now: number;
+  }):
+    | "queued"
+    | "subscription_not_active"
+    | "subscription_rate_limit"
+    | "global_queue_limit" {
+    return this.db.transaction(() => {
+      const subscription = this.db
+        .prepare(
+          "SELECT active_key_id FROM webhook_subscriptions WHERE id = ? AND state = 'active'",
+        )
+        .get(input.subscriptionId) as { active_key_id: string | null } | undefined;
+      // The caller may have read this subscription just before a pause, disable,
+      // or key rotation. Re-check inside this transaction so no stale projection
+      // creates a new immutable snapshot after that state transition.
+      if (!subscription || subscription.active_key_id !== input.keyId)
+        return "subscription_not_active";
+      const globalQueued = (
+        this.db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM webhook_deliveries WHERE state IN ('queued', 'leased')",
+          )
+          .get() as { count: number }
+      ).count;
+      const recentForSubscription = (
+        this.db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM webhook_deliveries WHERE subscription_id = ? AND created_at >= ?",
+          )
+          .get(input.subscriptionId, input.now - 60) as { count: number }
+      ).count;
+      const dropped =
+        globalQueued >= 10_000
+          ? "global_queue_limit"
+          : recentForSubscription >= 100
+            ? "subscription_rate_limit"
+            : null;
+      this.db
+        .prepare(
+          "INSERT INTO webhook_events (event_id, type, event_version, source_radio_id, occurred_at, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          input.eventId,
+          input.type,
+          input.eventVersion,
+          input.sourceRadioId,
+          input.occurredAt,
+          input.body,
+          input.now,
+        );
+      if (dropped) {
+        this.db
+          .prepare(
+            "INSERT INTO webhook_deliveries (subscription_id, event_id, key_id, state, attempt_count, next_attempt_at, error_summary, completed_at, created_at, updated_at) VALUES (?, ?, ?, 'dropped', 0, ?, ?, ?, ?, ?)",
+          )
+          .run(
+            input.subscriptionId,
+            input.eventId,
+            input.keyId,
+            input.now,
+            dropped,
+            input.now,
+            input.now,
+            input.now,
+          );
+        return dropped;
+      }
+      this.db
+        .prepare(
+          "INSERT INTO webhook_deliveries (subscription_id, event_id, key_id, state, attempt_count, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, 'queued', 0, ?, ?, ?)",
+        )
+        .run(
+          input.subscriptionId,
+          input.eventId,
+          input.keyId,
+          input.now,
+          input.now,
+          input.now,
+        );
+      return "queued";
+    })();
+  }
+
+  getWebhookDelivery(deliveryId: number): WebhookDelivery | null {
+    const row = this.db
+      .prepare("SELECT * FROM webhook_deliveries WHERE id = ?")
+      .get(deliveryId) as WebhookDeliveryRow | undefined;
+    return row ? rowToWebhookDelivery(row) : null;
+  }
+
+  listWebhookDeliveries(input: {
+    subscriptionId: number;
+    state?: WebhookDelivery["state"];
+    beforeId?: number;
+    limit: number;
+  }): WebhookDeliverySummary[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, subscription_id, event_id, key_id, state, attempt_count, next_attempt_at, lease_owner, lease_expires_at,
+                response_status, response_class, error_summary, completed_at, created_at, updated_at
+         FROM webhook_deliveries
+         WHERE subscription_id = @subscriptionId AND (@state IS NULL OR state = @state)
+           AND (@beforeId IS NULL OR id < @beforeId)
+         ORDER BY id DESC LIMIT @limit`,
+      )
+      .all({
+        ...input,
+        state: input.state ?? null,
+        beforeId: input.beforeId ?? null,
+      }) as Array<
+      WebhookDeliveryRow & {
+        response_status: number | null;
+        response_class: string | null;
+        error_summary: string | null;
+        completed_at: number | null;
+        created_at: number;
+        updated_at: number;
+      }
+    >;
+    return rows.map((row) => ({
+      ...rowToWebhookDelivery(row),
+      responseStatus: row.response_status,
+      responseClass: row.response_class,
+      errorSummary: row.error_summary,
+      completedAt: row.completed_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  getWebhookDeliveryJob(deliveryId: number): WebhookDeliveryJob | null {
+    const row = this.db
+      .prepare(
+        `SELECT d.*, s.destination, s.state AS subscription_state, e.type, e.event_version, e.body
+         FROM webhook_deliveries d
+         JOIN webhook_subscriptions s ON s.id = d.subscription_id
+         JOIN webhook_events e ON e.event_id = d.event_id
+         WHERE d.id = ?`,
+      )
+      .get(deliveryId) as
+      | (WebhookDeliveryRow & {
+          destination: string;
+          subscription_state: WebhookSubscription["state"];
+          type: string;
+          event_version: number;
+          body: Buffer;
+          first_attempt_at: number | null;
+        })
+      | undefined;
+    if (!row) return null;
+    return {
+      ...rowToWebhookDelivery(row),
+      destination: row.destination,
+      subscriptionState: row.subscription_state,
+      type: row.type,
+      eventVersion: row.event_version,
+      body: row.body,
+      firstAttemptAt: row.first_attempt_at,
+    };
+  }
+
+  /** A single short write transaction prevents two workers from owning one row. */
+  claimDueWebhookDeliveries(
+    owner: string,
+    atTs: number,
+    leaseSeconds: number,
+    limit: number,
+  ): WebhookDelivery[] {
+    return this.db.transaction(() => {
+      this.db
+        .prepare(
+          "UPDATE webhook_deliveries SET state = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE state = 'leased' AND lease_expires_at <= ?",
+        )
+        .run(atTs, atTs);
+      const activeLeases = (
+        this.db
+          .prepare(
+            "SELECT COUNT(*) AS count FROM webhook_deliveries WHERE state = 'leased' AND lease_expires_at > ?",
+          )
+          .get(atTs) as { count: number }
+      ).count;
+      const capacity = Math.max(0, limit - activeLeases);
+      if (capacity === 0) return [];
+      const rows = this.db
+        .prepare(
+          `WITH due AS (
+             SELECT webhook_deliveries.id AS delivery_id,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY webhook_deliveries.subscription_id
+                      ORDER BY webhook_deliveries.next_attempt_at ASC, webhook_deliveries.id ASC
+                    ) AS rank
+             FROM webhook_deliveries
+             JOIN webhook_subscriptions ON webhook_subscriptions.id = webhook_deliveries.subscription_id
+             WHERE webhook_deliveries.state = 'queued' AND webhook_deliveries.next_attempt_at <= ?
+               AND webhook_subscriptions.state = 'active'
+               AND NOT EXISTS (
+                 SELECT 1 FROM webhook_deliveries AS leased
+                 WHERE leased.subscription_id = webhook_deliveries.subscription_id
+                   AND leased.state = 'leased' AND leased.lease_expires_at > ?
+               )
+           )
+           UPDATE webhook_deliveries
+           SET state = 'leased', lease_owner = ?, lease_expires_at = ?, attempt_count = attempt_count + 1,
+               first_attempt_at = COALESCE(first_attempt_at, ?), updated_at = ?
+           WHERE webhook_deliveries.id IN (
+             SELECT delivery_id FROM due WHERE rank = 1 LIMIT ?
+           )
+           RETURNING *`,
+        )
+        .all(
+          atTs,
+          atTs,
+          owner,
+          atTs + leaseSeconds,
+          atTs,
+          atTs,
+          capacity,
+        ) as WebhookDeliveryRow[];
+      return rows.map(rowToWebhookDelivery);
+    })();
+  }
+
+  finishWebhookDelivery(
+    deliveryId: number,
+    outcome: {
+      state: "delivered" | "failed" | "dropped";
+      completedAt: number;
+      responseStatus: number | null;
+      responseClass: string | null;
+      errorSummary?: string | null;
+      leaseOwner?: string | null;
+    },
+  ): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE webhook_deliveries
+         SET state = @state, completed_at = @completedAt, response_status = @responseStatus, response_class = @responseClass,
+             error_summary = @errorSummary, lease_owner = NULL, lease_expires_at = NULL, updated_at = @completedAt
+         WHERE id = @deliveryId AND (@leaseOwner IS NULL OR (state = 'leased' AND lease_owner = @leaseOwner))`,
+        )
+        .run({
+          ...outcome,
+          errorSummary: outcome.errorSummary ?? null,
+          leaseOwner: outcome.leaseOwner ?? null,
+          deliveryId,
+        }).changes > 0
+    );
+  }
+
+  retryWebhookDelivery(
+    deliveryId: number,
+    nextAttemptAt: number,
+    responseStatus: number | null,
+    responseClass: string | null,
+    errorSummary: string,
+    leaseOwner: string | null = null,
+  ): boolean {
+    return (
+      this.db
+        .prepare(
+          `UPDATE webhook_deliveries
+         SET state = 'queued', next_attempt_at = ?, response_status = ?, response_class = ?, error_summary = ?,
+             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND state = 'leased' AND (? IS NULL OR lease_owner = ?)`,
+        )
+        .run(
+          nextAttemptAt,
+          responseStatus,
+          responseClass,
+          errorSummary.slice(0, 256),
+          now(),
+          deliveryId,
+          leaseOwner,
+          leaseOwner,
+        ).changes > 0
+    );
+  }
+
+  /** Retention is bounded so startup/daily pruning cannot monopolize SQLite's writer lock. */
+  pruneWebhookRetention(
+    cutoffTs: number,
+    limit: number,
+  ): { deliveries: number; events: number } {
+    return this.db.transaction(() => {
+      const deliveries = this.db
+        .prepare(
+          `DELETE FROM webhook_deliveries WHERE id IN (
+             SELECT id FROM webhook_deliveries
+             WHERE state IN ('delivered', 'failed', 'dropped') AND completed_at < ?
+             ORDER BY completed_at ASC LIMIT ?
+           )`,
+        )
+        .run(cutoffTs, Math.max(1, limit)).changes;
+      const events = this.db
+        .prepare(
+          `DELETE FROM webhook_events WHERE event_id IN (
+             SELECT event_id FROM webhook_events
+             WHERE NOT EXISTS (SELECT 1 FROM webhook_deliveries WHERE event_id = webhook_events.event_id)
+             ORDER BY created_at ASC LIMIT ?
+           )`,
+        )
+        .run(Math.max(1, limit)).changes;
+      return { deliveries, events };
+    })();
   }
 
   /** Delete timeline rows older than the retention window (all radios). Returns rows removed. */
   trimTimeline(retentionDays: number): number {
     if (!Number.isFinite(retentionDays) || retentionDays <= 0) return 0;
     const cutoff = now() - Math.floor(retentionDays * 86_400);
-    return this.db.prepare("DELETE FROM timeline_events WHERE ts < ?").run(cutoff).changes;
+    return this.db
+      .prepare("DELETE FROM timeline_events WHERE ts < ?")
+      .run(cutoff).changes;
   }
 }
 

@@ -12,6 +12,31 @@ export function notificationsSupported(): boolean {
   return typeof Notification !== "undefined" && window.isSecureContext;
 }
 
+/**
+ * Deliberately narrow service-worker fallback prototype. It is only reached
+ * when a page-owned Notification cannot be constructed (notably some Android
+ * Chromium configurations). It does not add offline caching or Push support.
+ */
+async function showViaServiceWorker(title: string, options: NotificationOptions): Promise<void> {
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    const registration = await navigator.serviceWorker.register("/notification-sw.js");
+    await registration.showNotification(title, options);
+  } catch {
+    // Registration is best-effort. The caller already treats notifications as
+    // unavailable rather than making a received message path fail.
+  }
+}
+
+function showNotification(title: string, options: NotificationOptions, onClick?: () => void): void {
+  try {
+    const notification = new Notification(title, options);
+    notification.onclick = onClick ?? null;
+  } catch {
+    void showViaServiceWorker(title, options);
+  }
+}
+
 export function savedNotifyPref(): NotifyPref {
   try {
     const value = localStorage.getItem(STORAGE_KEY);
@@ -59,7 +84,10 @@ export function clearNotificationNavigator(): void {
  * isn't the active one. Messages arriving in the active, visible conversation
  * never notify (they're already on screen — mirrors the unread accounting).
  */
-export function notifyIncoming(message: Message, opts: { conversationActive: boolean; muted?: boolean }): void {
+export function notifyIncoming(
+  message: Message,
+  opts: { conversationActive: boolean; muted?: boolean },
+): void {
   const pref = savedNotifyPref();
   if (pref === "off") return;
   if (message.direction !== "in") return;
@@ -78,23 +106,19 @@ export function notifyIncoming(message: Message, opts: { conversationActive: boo
   // displayMessage is the same helper the chat thread uses for this split (issue #22).
   const display = displayMessage(message);
   const sender =
-    display.sender ?? message.contactName ?? message.authorName ?? shortKey(message.contactKey ?? message.contactPrefix);
+    display.sender ??
+    message.contactName ??
+    message.authorName ??
+    shortKey(message.contactKey ?? message.contactPrefix);
   const title =
     message.kind === "dm" ? sender : `${message.channelName ?? `channel ${message.channelIdx}`} · ${sender}`;
   const body = display.text.length > 140 ? `${display.text.slice(0, 139)}…` : display.text;
 
-  try {
-    // one notification per conversation: newer messages replace older ones
-    const notification = new Notification(title, { body, tag: `meshkeep-${conversationTag(id)}` });
-    notification.onclick = () => {
-      window.focus();
-      navigate?.(id);
-      notification.close();
-    };
-  } catch {
-    // some platforms (e.g. Android Chrome) only allow Notification via a
-    // service worker — treat as unsupported rather than erroring the app
-  }
+  // one notification per conversation: newer messages replace older ones
+  showNotification(title, { body, tag: `meshkeep-${conversationTag(id)}` }, () => {
+    window.focus();
+    navigate?.(id);
+  });
 }
 
 /**
@@ -108,19 +132,17 @@ export function notifyAlert(event: TelemetryAlertEvent): void {
 
   const subject = event.contactName ?? (event.contactKey ? shortKey(event.contactKey) : "This radio");
   const comparison = event.comparator === "below" ? "below" : "above";
-  const title = event.direction === "breach" ? `${subject}: ${event.label} alert` : `${subject}: ${event.label} recovered`;
+  const title =
+    event.direction === "breach"
+      ? `${subject}: ${event.label} alert`
+      : `${subject}: ${event.label} recovered`;
   const body =
     event.direction === "breach"
       ? `${event.label} is ${event.value} (${comparison} ${event.threshold})`
       : `${event.label} is back to ${event.value}`;
 
-  try {
-    // one notification per rule: a later transition replaces the earlier one
-    new Notification(title, { body, tag: `meshkeep-alert-${event.ruleId}` });
-  } catch {
-    // some platforms (e.g. Android Chrome) only allow Notification via a
-    // service worker — treat as unsupported rather than erroring the app
-  }
+  // one notification per rule: a later transition replaces the earlier one
+  showNotification(title, { body, tag: `meshkeep-alert-${event.ruleId}` });
 }
 
 function conversationTag(id: ConversationId): string {

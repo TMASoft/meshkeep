@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import type { Message, MessageSearchResult, WsEvent } from "@meshkeep/shared";
+import type { Message, MessageSearchResult, TelemetryAlertEvent, WsEvent } from "@meshkeep/shared";
 
 const apiMock = vi.hoisted(() => vi.fn());
 const connectEventsMock = vi.hoisted(() => vi.fn(() => () => {}));
@@ -24,9 +24,11 @@ vi.mock("../src/api/client", () => ({
 }));
 
 const notifyIncomingMock = vi.hoisted(() => vi.fn());
+const notifyAlertMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../src/notifications", () => ({
   notifyIncoming: notifyIncomingMock,
+  notifyAlert: notifyAlertMock,
 }));
 
 vi.mock("../src/sources/browser-radio", () => ({
@@ -75,11 +77,29 @@ function message(overrides: Partial<Message> = {}): Message {
   };
 }
 
+function alertEvent(overrides: Partial<TelemetryAlertEvent> = {}): TelemetryAlertEvent {
+  return {
+    id: 1,
+    ruleId: 1,
+    contactKey: null,
+    contactName: null,
+    metric: "battery_mv",
+    label: "Battery",
+    value: 3200,
+    threshold: 3300,
+    comparator: "below",
+    direction: "breach",
+    ts: 1_784_000_000,
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   setActivePinia(createPinia());
   apiMock.mockReset();
   connectEventsMock.mockClear();
   notifyIncomingMock.mockClear();
+  notifyAlertMock.mockClear();
   browserRadioMock.start.mockReset();
   browserRadioMock.stop.mockReset();
   browserRadioMock.start.mockResolvedValue();
@@ -749,6 +769,39 @@ describe("radio switching (issue #53)", () => {
     // the viewed radio's traffic is applied
     store.onEvent({ type: "message.new", radioId: 1, message: message({ id: 11, text: "this radio" }) });
     expect(store.recent.map((m) => m.text)).toEqual(["this radio"]);
+  });
+
+  it("keeps selected-radio message state local while notifying for messages from both radios", () => {
+    const store = useAppStore();
+    store.status = { activeRadioId: 1, radios } as typeof store.status;
+    const selectedMessage = message({ id: 9, text: "this radio" });
+    const backgroundMessage = message({ id: 10, text: "other radio" });
+
+    store.onEvent({ type: "message.new", radioId: 1, message: selectedMessage });
+    store.onEvent({ type: "message.new", radioId: 2, message: backgroundMessage });
+
+    expect(store.recent).toEqual([selectedMessage]);
+    expect(store.conversations[conversationKey({ kind: "dm", contactKey: KEY_A })]).toEqual([selectedMessage]);
+    expect(store.unread[conversationKey({ kind: "dm", contactKey: KEY_A })]).toBe(1);
+    expect(notifyIncomingMock).toHaveBeenCalledWith(selectedMessage, { conversationActive: false, muted: false });
+    expect(notifyIncomingMock).toHaveBeenCalledWith(backgroundMessage, { conversationActive: false, muted: false });
+    expect(notifyIncomingMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("records and notifies for alerts from both radios without changing selected-radio message state", () => {
+    const store = useAppStore();
+    store.status = { activeRadioId: 1, radios } as typeof store.status;
+    const selectedAlert = alertEvent({ id: 9 });
+    const backgroundAlert = alertEvent({ id: 10 });
+
+    store.onEvent({ type: "telemetry.alert", radioId: 1, event: selectedAlert });
+    store.onEvent({ type: "telemetry.alert", radioId: 2, event: backgroundAlert });
+
+    expect(store.alertHistory).toEqual([backgroundAlert, selectedAlert]);
+    expect(notifyAlertMock).toHaveBeenCalledWith(selectedAlert);
+    expect(notifyAlertMock).toHaveBeenCalledWith(backgroundAlert);
+    expect(notifyAlertMock).toHaveBeenCalledTimes(2);
+    expect(store.recent).toHaveLength(0);
   });
 
   it("switchRadio pins the radio, resets the view, and scopes reads to it", async () => {

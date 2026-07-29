@@ -90,10 +90,10 @@ export function recentDiagnosticLogs(): DiagnosticLogEntry[] {
   return sanitizeLogs(recentLogs());
 }
 
-/** Effective config for the bundle with the UI password replaced by a boolean. */
+/** Effective config for the bundle with each secret replaced by a boolean. */
 function redactedConfig(config: ServerConfig): Record<string, unknown> {
-  const { uiPassword, ...rest } = config;
-  return { ...rest, uiPasswordSet: uiPassword !== null };
+  const { uiPassword, webhookMasterKey, ...rest } = config;
+  return { ...rest, uiPasswordSet: uiPassword !== null, webhookMasterKeySet: webhookMasterKey !== null };
 }
 
 /**

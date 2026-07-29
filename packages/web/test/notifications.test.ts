@@ -7,8 +7,12 @@ import {
   savedNotifyPref,
 } from "../src/notifications";
 
-const constructed: { title: string; options: NotificationOptions; onclick: (() => void) | null; close: () => void }[] =
-  [];
+const constructed: {
+  title: string;
+  options: NotificationOptions;
+  onclick: (() => void) | null;
+  close: () => void;
+}[] = [];
 
 class FakeNotification {
   static permission = "granted";
@@ -83,7 +87,12 @@ describe("notifyIncoming", () => {
 
   it("skips channel messages on the dms preference but notifies on all", () => {
     pref = "dms";
-    const channelMessage = message({ kind: "channel", channelIdx: 3, channelName: "#test", contactKey: null });
+    const channelMessage = message({
+      kind: "channel",
+      channelIdx: 3,
+      channelName: "#test",
+      contactKey: null,
+    });
     notifyIncoming(channelMessage, { conversationActive: false });
     expect(constructed).toHaveLength(0);
     pref = "all";
@@ -137,6 +146,24 @@ describe("notifyIncoming", () => {
     FakeNotification.permission = "denied";
     notifyIncoming(message(), { conversationActive: false });
     expect(constructed).toHaveLength(0);
+  });
+
+  it("uses the narrow service-worker fallback if page notifications throw", async () => {
+    pref = "dms";
+    class ThrowingNotification {
+      static permission = "granted";
+      constructor() {
+        throw new Error("Use ServiceWorkerRegistration.showNotification() instead");
+      }
+    }
+    const showNotification = vi.fn().mockResolvedValue(undefined);
+    const register = vi.fn().mockResolvedValue({ showNotification });
+    vi.stubGlobal("Notification", ThrowingNotification);
+    vi.stubGlobal("navigator", { serviceWorker: { register } });
+
+    notifyIncoming(message(), { conversationActive: false });
+    await vi.waitFor(() => expect(showNotification).toHaveBeenCalledWith("Alice", expect.any(Object)));
+    expect(register).toHaveBeenCalledWith("/notification-sw.js");
   });
 
   it("click focuses the window and navigates to the conversation", () => {

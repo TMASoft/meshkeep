@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { DatabaseDiagnostics } from "@meshkeep/shared";
+import { verifyStoredWebhookKeys } from "../webhooks/crypto.js";
 
 /**
  * Ordered schema migrations; index N upgrades a database from user_version N to
@@ -408,11 +409,98 @@ export const MIGRATIONS: string[] = [
 
   CREATE INDEX idx_messages_radio_time ON messages (radio_id, created_at);
   `,
+  // 15: durable external webhook projection (issue #56). These tables only
+  // store delivery state and encrypted signing material; routes, bus projection,
+  // and HTTP delivery are deliberately separate concerns. This is forward-only:
+  // rolling back requires restoring a SQLite backup made before this migration.
+  `
+  CREATE TABLE webhook_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL,
+    destination TEXT NOT NULL,
+    event_types_json TEXT NOT NULL,
+    radio_ids_json TEXT,
+    include_sensitive INTEGER NOT NULL DEFAULT 0 CHECK (include_sensitive IN (0, 1)),
+    state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'paused', 'disabled')),
+    active_key_id TEXT,
+    last_failure_summary TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE webhook_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id INTEGER NOT NULL REFERENCES webhook_subscriptions(id) ON DELETE CASCADE,
+    key_id TEXT NOT NULL,
+    secret_ciphertext BLOB NOT NULL,
+    secret_nonce BLOB NOT NULL,
+    secret_auth_tag BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    retire_at INTEGER,
+    deleted_at INTEGER,
+    UNIQUE (subscription_id, key_id)
+  );
+
+  CREATE TABLE webhook_events (
+    event_id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    event_version INTEGER NOT NULL,
+    source_radio_id INTEGER,
+    occurred_at INTEGER NOT NULL,
+    body BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TRIGGER webhook_events_immutable_bu BEFORE UPDATE ON webhook_events BEGIN
+    SELECT RAISE(ABORT, 'webhook event snapshots are immutable');
+  END;
+
+  CREATE TABLE webhook_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id INTEGER NOT NULL REFERENCES webhook_subscriptions(id) ON DELETE CASCADE,
+    event_id TEXT NOT NULL REFERENCES webhook_events(event_id) ON DELETE CASCADE,
+    key_id TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'leased', 'delivered', 'failed', 'dropped')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    first_attempt_at INTEGER,
+    next_attempt_at INTEGER NOT NULL,
+    lease_owner TEXT,
+    lease_expires_at INTEGER,
+    response_status INTEGER,
+    response_class TEXT,
+    error_summary TEXT,
+    completed_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (subscription_id, event_id),
+    FOREIGN KEY (subscription_id, key_id) REFERENCES webhook_keys(subscription_id, key_id)
+  );
+  CREATE INDEX idx_webhook_deliveries_due ON webhook_deliveries (state, next_attempt_at, lease_expires_at);
+  CREATE INDEX idx_webhook_deliveries_subscription_history ON webhook_deliveries (subscription_id, created_at DESC);
+  CREATE INDEX idx_webhook_deliveries_retention ON webhook_deliveries (completed_at) WHERE state IN ('delivered', 'failed', 'dropped');
+  CREATE INDEX idx_webhook_events_retention ON webhook_events (created_at);
+  `,
+  // 16: add an explicit read-only scope for external event catalogs and
+  // delivery summaries without broadening existing read/write tokens.
+  `
+  CREATE TABLE api_tokens_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_used_at INTEGER,
+    scope TEXT NOT NULL DEFAULT 'read' CHECK (scope IN ('read','write','events.read')),
+    expires_at INTEGER
+  );
+  INSERT INTO api_tokens_new (id, token_hash, label, created_at, last_used_at, scope, expires_at)
+    SELECT id, token_hash, label, created_at, last_used_at, scope, expires_at FROM api_tokens;
+  DROP TABLE api_tokens;
+  ALTER TABLE api_tokens_new RENAME TO api_tokens;
+  `,
 ];
 
 export type Db = Database.Database;
 
-export function openDb(path: string): Db {
+export function openDb(path: string, webhookMasterKey: Buffer | null = null): Db {
   if (path !== ":memory:") {
     mkdirSync(dirname(path), { recursive: true });
   }
@@ -424,8 +512,14 @@ export function openDb(path: string): Db {
   // only arises from an external reader (a backup, the sqlite3 CLI) briefly
   // holding the database. WAL keeps readers from blocking the writer.
   db.pragma("busy_timeout = 5000");
-  migrate(db);
-  return db;
+  try {
+    migrate(db);
+    verifyStoredWebhookKeys(db, webhookMasterKey);
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 }
 
 /**

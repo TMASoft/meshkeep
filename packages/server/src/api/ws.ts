@@ -40,7 +40,7 @@ export function attachWs(server: Server, bus: Bus, auth: Auth, options: WsOption
         return;
       }
     }
-    if (!auth.isAuthorized(req as never)) {
+    if (!auth.wsAuthorized(req as never)) {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       socket.destroy();
       return;
