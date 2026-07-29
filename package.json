@@ -26,9 +26,9 @@
   "devDependencies": {
     "eslint": "^9.30.0",
     "eslint-config-prettier": "^10.1.0",
-    "eslint-plugin-vue": "^10.3.0",
-    "prettier": "^3.6.0",
-    "typescript-eslint": "^8.35.0",
+    "eslint-plugin-vue": "^10.10.0",
+    "prettier": "^3.9.6",
+    "typescript-eslint": "^8.65.0",
     "vue-eslint-parser": "^10.2.0"
   },
   "allowScripts": {
