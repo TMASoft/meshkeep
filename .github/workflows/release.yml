@@ -60,7 +60,7 @@ jobs:
           sbom: true
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3.10.1
+        uses: sigstore/cosign-installer@v4.1.2
 
       # keyless signature bound to this workflow's OIDC identity; verify with
       # cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com
