@@ -496,6 +496,13 @@ export const MIGRATIONS: string[] = [
   DROP TABLE api_tokens;
   ALTER TABLE api_tokens_new RENAME TO api_tokens;
   `,
+  // 17: consecutive terminal-failure streak per subscription (issue #90). A
+  // single non-retryable HTTP response used to disable a subscription outright;
+  // the streak lets the worker pause only after a configurable burst, which is
+  // recoverable (the operator resumes and the queued backlog drains).
+  `
+  ALTER TABLE webhook_subscriptions ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0;
+  `,
 ];
 
 export type Db = Database.Database;

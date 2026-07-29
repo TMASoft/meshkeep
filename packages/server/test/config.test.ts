@@ -43,6 +43,8 @@ describe("configuration bounds", () => {
     ["MESHKEEP_TELEMETRY_MONITOR_MINUTES", "99999"],
     ["MESHKEEP_TIMELINE_RETENTION_DAYS", "0"],
     ["MESHKEEP_TIMELINE_RETENTION_DAYS", "4000"],
+    ["MESHKEEP_WEBHOOK_FAILURE_BURST", "0"],
+    ["MESHKEEP_WEBHOOK_FAILURE_BURST", "101"],
   ];
 
   for (const [name, value] of outOfRange) {

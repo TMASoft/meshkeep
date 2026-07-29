@@ -476,6 +476,185 @@ describe("webhook store", () => {
     db.close();
   });
 
+  it("pauses on a terminal-failure burst without dropping the backlog, and resets the streak on resume", () => {
+    const db = openDb(":memory:", masterKey);
+    const store = new Store(db);
+    const crypto = createWebhookCrypto(masterKey);
+    const subscription = store.createWebhookSubscription(subscriptionInput());
+    store.createWebhookSigningKey(subscription.id, "key-1", signingSecret, crypto);
+    store.recordWebhookEvent({
+      eventId: "event-backlog",
+      type: "message.created",
+      eventVersion: 1,
+      sourceRadioId: null,
+      occurredAt: 1,
+      body: Buffer.from("{}"),
+    });
+    store.enqueueWebhookDelivery({
+      subscriptionId: subscription.id,
+      eventId: "event-backlog",
+      keyId: "key-1",
+      nextAttemptAt: 1,
+    });
+
+    expect(
+      store.recordWebhookTerminalFailure(subscription.id, "HTTP 404", 3),
+    ).toEqual({ consecutiveFailures: 1, paused: false });
+    expect(
+      store.recordWebhookTerminalFailure(subscription.id, "HTTP 404", 3),
+    ).toEqual({ consecutiveFailures: 2, paused: false });
+    expect(store.getWebhookSubscription(subscription.id)?.state).toBe("active");
+
+    expect(
+      store.recordWebhookTerminalFailure(subscription.id, "HTTP 404", 3),
+    ).toEqual({ consecutiveFailures: 3, paused: true });
+    expect(store.getWebhookSubscription(subscription.id)).toMatchObject({
+      state: "paused",
+      consecutiveFailures: 3,
+      lastFailureSummary: "HTTP 404",
+    });
+
+    // The backlog survives the pause but is not claimable while paused, and no
+    // new event may be enqueued against a paused subscription.
+    expect(
+      store.listWebhookDeliveries({ subscriptionId: subscription.id, limit: 10 })[0]
+        ?.state,
+    ).toBe("queued");
+    expect(store.claimDueWebhookDeliveries("worker-a", 2, 60, 10)).toEqual([]);
+    expect(
+      store.queueWebhookEvent({
+        subscriptionId: subscription.id,
+        keyId: "key-1",
+        eventId: "event-while-paused",
+        type: "message.created",
+        eventVersion: 1,
+        sourceRadioId: null,
+        occurredAt: 2,
+        body: Buffer.from("{}"),
+        now: 2,
+      }),
+    ).toBe("subscription_not_active");
+    // A paused subscription must also stop matching new bus projections.
+    expect(
+      store
+        .listActiveWebhookSubscriptions()
+        .map((entry) => entry.id),
+    ).not.toContain(subscription.id);
+
+    store.updateWebhookSubscription(subscription.id, {
+      label: subscription.label,
+      destination: subscription.destination,
+      eventTypes: subscription.eventTypes,
+      radioIds: subscription.radioIds,
+      includeSensitive: subscription.includeSensitive,
+      state: "active",
+    });
+    expect(store.getWebhookSubscription(subscription.id)).toMatchObject({
+      state: "active",
+      consecutiveFailures: 0,
+      lastFailureSummary: null,
+    });
+    expect(store.claimDueWebhookDeliveries("worker-a", 3, 60, 10)).toHaveLength(1);
+    db.close();
+  });
+
+  it("stops signing with a rotated key past its 24-hour window and prunes unreferenced retired keys", () => {
+    const db = openDb(":memory:", masterKey);
+    const store = new Store(db);
+    const crypto = createWebhookCrypto(masterKey);
+    const subscription = store.createWebhookSubscription(subscriptionInput());
+    store.createWebhookSigningKey(subscription.id, "key-1", signingSecret, crypto);
+    store.rotateWebhookSigningKey(subscription.id, "key-2", Buffer.alloc(32, 3), crypto);
+
+    const retireAt = db
+      .prepare("SELECT retire_at FROM webhook_keys WHERE key_id = 'key-1'")
+      .get() as { retire_at: number };
+
+    // Inside the retention window the old key still signs queued deliveries.
+    expect(
+      store
+        .getWebhookSigningKey(subscription.id, "key-1", crypto, retireAt.retire_at - 1)
+        ?.equals(signingSecret),
+    ).toBe(true);
+    // Past it the promise in the UI ("stops working after 24 hours") is enforced.
+    expect(
+      store.getWebhookSigningKey(subscription.id, "key-1", crypto, retireAt.retire_at + 1),
+    ).toBeNull();
+    // The active key is unaffected.
+    expect(
+      store.getWebhookSigningKey(subscription.id, "key-2", crypto, retireAt.retire_at + 1),
+    ).not.toBeNull();
+
+    // A retired key still referenced by delivery history is kept.
+    store.recordWebhookEvent({
+      eventId: "evt-old-key",
+      type: "message.created",
+      eventVersion: 1,
+      sourceRadioId: null,
+      occurredAt: 1,
+      body: Buffer.from("{}"),
+    });
+    store.enqueueWebhookDelivery({
+      subscriptionId: subscription.id,
+      eventId: "evt-old-key",
+      keyId: "key-1",
+      nextAttemptAt: 1,
+    });
+    expect(store.pruneRetiredWebhookKeys(retireAt.retire_at + 1, 10)).toBe(0);
+
+    // Once history is gone the row is hard-deleted, bounding repeated rotation.
+    db.prepare("DELETE FROM webhook_deliveries WHERE event_id = 'evt-old-key'").run();
+    expect(store.pruneRetiredWebhookKeys(retireAt.retire_at + 1, 10)).toBe(1);
+    expect(
+      db.prepare("SELECT key_id FROM webhook_keys WHERE subscription_id = ?").all(subscription.id),
+    ).toEqual([{ key_id: "key-2" }]);
+    db.close();
+  });
+
+  it("expires only queued deliveries past the delivery window, in bounded batches", () => {
+    const db = openDb(":memory:", masterKey);
+    const store = new Store(db);
+    const crypto = createWebhookCrypto(masterKey);
+    const subscription = store.createWebhookSubscription(subscriptionInput());
+    store.createWebhookSigningKey(subscription.id, "key-1", signingSecret, crypto);
+    for (const eventId of ["stale-a", "stale-b", "fresh"]) {
+      store.recordWebhookEvent({
+        eventId,
+        type: "message.created",
+        eventVersion: 1,
+        sourceRadioId: null,
+        occurredAt: 1,
+        body: Buffer.from("{}"),
+      });
+      store.enqueueWebhookDelivery({
+        subscriptionId: subscription.id,
+        eventId,
+        keyId: "key-1",
+        nextAttemptAt: 1,
+      });
+    }
+    db.prepare(
+      "UPDATE webhook_deliveries SET created_at = 100 WHERE event_id IN ('stale-a', 'stale-b')",
+    ).run();
+    db.prepare(
+      "UPDATE webhook_deliveries SET created_at = 900 WHERE event_id = 'fresh'",
+    ).run();
+
+    expect(store.expireStaleWebhookDeliveries(500, 1)).toBe(1);
+    expect(store.expireStaleWebhookDeliveries(500, 10)).toBe(1);
+    expect(store.expireStaleWebhookDeliveries(500, 10)).toBe(0);
+    expect(
+      store
+        .listWebhookDeliveries({ subscriptionId: subscription.id, limit: 10 })
+        .map((delivery) => [delivery.state, delivery.errorSummary]),
+    ).toEqual([
+      ["queued", null],
+      ["failed", "expired"],
+      ["failed", "expired"],
+    ]);
+    db.close();
+  });
+
   it("fails closed at startup when stored webhook keys cannot be decrypted", () => {
     const directory = mkdtempSync(join(tmpdir(), "meshkeep-webhook-key-"));
     const path = join(directory, "meshkeep.db");

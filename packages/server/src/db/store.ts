@@ -26,6 +26,7 @@ import type {
   TimelineOverview,
   TimelineOverviewBucket,
 } from "@meshkeep/shared";
+import { WEBHOOK_TEST_EVENT_TYPE } from "@meshkeep/shared";
 import type { Db } from "./index.js";
 import type { WebhookCrypto } from "../webhooks/crypto.js";
 
@@ -66,6 +67,10 @@ export interface WebhookSubscription {
   includeSensitive: boolean;
   state: "active" | "paused" | "disabled";
   activeKeyId: string | null;
+  /** Redacted operator-visible reason for the last pause/disable, if any. */
+  lastFailureSummary: string | null;
+  /** Terminal delivery failures since the last success; drives the pause burst. */
+  consecutiveFailures: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -109,6 +114,8 @@ interface WebhookSubscriptionRow {
   include_sensitive: number;
   state: WebhookSubscription["state"];
   active_key_id: string | null;
+  last_failure_summary: string | null;
+  consecutive_failures: number;
   created_at: number;
   updated_at: number;
 }
@@ -140,6 +147,8 @@ function rowToWebhookSubscription(
     includeSensitive: row.include_sensitive === 1,
     state: row.state,
     activeKeyId: row.active_key_id,
+    lastFailureSummary: row.last_failure_summary,
+    consecutiveFailures: row.consecutive_failures,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -2030,10 +2039,15 @@ export class Store {
       | "state"
     >,
   ): WebhookSubscription | null {
+    // Resuming is the operator saying "the receiver is fixed": clear the burst
+    // streak and its reason so one more stale failure cannot re-pause instantly.
     const changed = this.db
       .prepare(
         `UPDATE webhook_subscriptions SET label = ?, destination = ?, event_types_json = ?, radio_ids_json = ?,
-         include_sensitive = ?, state = ?, updated_at = ? WHERE id = ?`,
+         include_sensitive = ?, state = ?, updated_at = ?,
+         consecutive_failures = CASE WHEN ? = 'active' AND state != 'active' THEN 0 ELSE consecutive_failures END,
+         last_failure_summary = CASE WHEN ? = 'active' AND state != 'active' THEN NULL ELSE last_failure_summary END
+         WHERE id = ?`,
       )
       .run(
         input.label,
@@ -2043,6 +2057,8 @@ export class Store {
         input.includeSensitive ? 1 : 0,
         input.state,
         now(),
+        input.state,
+        input.state,
         subscriptionId,
       ).changes;
     return changed > 0 ? this.getWebhookSubscription(subscriptionId) : null;
@@ -2090,6 +2106,55 @@ export class Store {
         )
         .run(ts, summary, ts, subscriptionId).changes;
     })();
+  }
+
+  /**
+   * Count one terminal delivery failure against the subscription and pause it
+   * once the burst threshold is reached. Unlike {@link disableWebhookSubscription}
+   * this keeps the queued backlog intact: `claimDueWebhookDeliveries` and
+   * `queueWebhookEvent` both ignore non-active subscriptions, so a pause stops
+   * scheduled delivery and new enqueueing while leaving the queue to drain on
+   * resume. Reserved for recoverable receiver faults (a 4xx burst, or repeated
+   * deliveries exhausting their retries); SSRF and signing failures still disable.
+   */
+  recordWebhookTerminalFailure(
+    subscriptionId: number,
+    reason: string,
+    threshold: number,
+  ): { consecutiveFailures: number; paused: boolean } {
+    const ts = now();
+    const summary = reason.slice(0, 256);
+    return this.db.transaction(() => {
+      const row = this.db
+        .prepare(
+          `UPDATE webhook_subscriptions
+           SET consecutive_failures = consecutive_failures + 1, last_failure_summary = ?, updated_at = ?
+           WHERE id = ? AND state = 'active'
+           RETURNING consecutive_failures`,
+        )
+        .get(summary, ts, subscriptionId) as
+        | { consecutive_failures: number }
+        | undefined;
+      if (!row) return { consecutiveFailures: 0, paused: false };
+      const paused = row.consecutive_failures >= Math.max(1, threshold);
+      if (paused) {
+        this.db
+          .prepare(
+            "UPDATE webhook_subscriptions SET state = 'paused', updated_at = ? WHERE id = ?",
+          )
+          .run(ts, subscriptionId);
+      }
+      return { consecutiveFailures: row.consecutive_failures, paused };
+    })();
+  }
+
+  /** A delivered event proves the receiver is healthy, so the burst restarts. */
+  clearWebhookFailureStreak(subscriptionId: number): void {
+    this.db
+      .prepare(
+        "UPDATE webhook_subscriptions SET consecutive_failures = 0, updated_at = ? WHERE id = ? AND consecutive_failures > 0",
+      )
+      .run(now(), subscriptionId);
   }
 
   createWebhookSigningKey(
@@ -2164,16 +2229,26 @@ export class Store {
     })();
   }
 
+  /**
+   * Rotation retains the previous key for 24 hours to finish already-queued
+   * deliveries, so `retire_at` is enforced here rather than only recorded: past
+   * that window the old secret stops signing, which is what the UI promises.
+   * Deliveries cannot outlive the window either — {@link expireStaleWebhookDeliveries}
+   * terminates queued rows at 24 hours, so a retired key never strands one.
+   */
   getWebhookSigningKey(
     subscriptionId: number,
     keyId: string,
     crypto: WebhookCrypto,
+    atTs: number = now(),
   ): Buffer | null {
     const row = this.db
       .prepare(
-        "SELECT secret_ciphertext, secret_nonce, secret_auth_tag FROM webhook_keys WHERE subscription_id = ? AND key_id = ? AND deleted_at IS NULL",
+        `SELECT secret_ciphertext, secret_nonce, secret_auth_tag FROM webhook_keys
+         WHERE subscription_id = ? AND key_id = ? AND deleted_at IS NULL
+           AND (retire_at IS NULL OR retire_at > ?)`,
       )
-      .get(subscriptionId, keyId) as
+      .get(subscriptionId, keyId, atTs) as
       | {
           secret_ciphertext: Buffer;
           secret_nonce: Buffer;
@@ -2523,6 +2598,64 @@ export class Store {
           leaseOwner,
         ).changes > 0
     );
+  }
+
+  /**
+   * Terminate queued deliveries older than the documented 24-hour delivery
+   * window. A paused subscription keeps its backlog (see
+   * {@link recordWebhookTerminalFailure}), so without this sweep an unattended
+   * pause would hold rows in the queue forever and consume the global queue
+   * budget. Bounded like the retention prune to keep the write transaction short.
+   */
+  expireStaleWebhookDeliveries(cutoffTs: number, limit: number): number {
+    const ts = now();
+    return this.db
+      .prepare(
+        `UPDATE webhook_deliveries
+         SET state = 'failed', completed_at = ?, error_summary = 'expired',
+             lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE id IN (
+           SELECT id FROM webhook_deliveries
+           WHERE state = 'queued' AND created_at < ?
+           ORDER BY created_at ASC LIMIT ?
+         )`,
+      )
+      .run(ts, ts, cutoffTs, Math.max(1, limit)).changes;
+  }
+
+  /**
+   * Hard-delete signing keys retired before `cutoffTs` so repeated rotation
+   * cannot grow `webhook_keys` without bound. Keys still referenced by a
+   * delivery row are kept: the foreign key would reject the delete, and the
+   * retained history should stay readable until retention prunes it.
+   */
+  pruneRetiredWebhookKeys(cutoffTs: number, limit: number): number {
+    return this.db
+      .prepare(
+        `DELETE FROM webhook_keys WHERE id IN (
+           SELECT id FROM webhook_keys
+           WHERE retire_at IS NOT NULL AND retire_at < ?
+             AND NOT EXISTS (
+               SELECT 1 FROM webhook_deliveries
+               WHERE webhook_deliveries.subscription_id = webhook_keys.subscription_id
+                 AND webhook_deliveries.key_id = webhook_keys.key_id
+             )
+           ORDER BY retire_at ASC LIMIT ?
+         )`,
+      )
+      .run(cutoffTs, Math.max(1, limit)).changes;
+  }
+
+  /** Newest test delivery for a subscription, for the one-per-minute test limit. */
+  lastWebhookTestAt(subscriptionId: number): number | null {
+    const row = this.db
+      .prepare(
+        `SELECT MAX(d.created_at) AS ts FROM webhook_deliveries d
+         JOIN webhook_events e ON e.event_id = d.event_id
+         WHERE d.subscription_id = ? AND e.type = ?`,
+      )
+      .get(subscriptionId, WEBHOOK_TEST_EVENT_TYPE) as { ts: number | null };
+    return row.ts;
   }
 
   /** Retention is bounded so startup/daily pruning cannot monopolize SQLite's writer lock. */

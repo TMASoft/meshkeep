@@ -37,7 +37,14 @@ const manager = new ConnectionManager(config, db, bus, version);
 const mapCache = new MapCache(config, version);
 const auth = new Auth(db, config.uiPassword);
 const webhookWorker = config.webhookMasterKey
-  ? new WebhookWorker(manager.store, bus, config.webhookMasterKey, systemWebhookResolver, systemWebhookTransport)
+  ? new WebhookWorker(
+      manager.store,
+      bus,
+      config.webhookMasterKey,
+      systemWebhookResolver,
+      systemWebhookTransport,
+      { failureBurst: config.webhookFailureBurst },
+    )
   : null;
 
 const app = express();

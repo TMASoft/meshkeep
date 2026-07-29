@@ -115,4 +115,40 @@ describe("webhook management API", () => {
     await request(app).delete(`/api/v1/webhooks/${id}`).set("Cookie", cookie).expect(200);
     expect(db.prepare("SELECT COUNT(*) AS count FROM webhook_keys WHERE subscription_id = ?").get(id)).toEqual({ count: 0 });
   });
+
+  it("enqueues a real signed test delivery, once per minute, only while active", async () => {
+    const { app, manager } = buildWebhookHarness();
+    const cookie = await sessionCookie(app);
+    const created = await request(app)
+      .post("/api/v1/webhooks")
+      .set("Cookie", cookie)
+      .send({ label: "Receiver", destination: "https://hooks.example.test/events", eventTypes: ["message.created"] })
+      .expect(201);
+    const id = created.body.subscription.id as number;
+
+    const sent = await request(app).post(`/api/v1/webhooks/${id}/test`).set("Cookie", cookie).send({}).expect(202);
+    expect(sent.body).toMatchObject({ accepted: true, eventId: expect.any(String) });
+
+    // The worker now has a real queued delivery signed with the active key.
+    const queued = manager.store.listWebhookDeliveries({ subscriptionId: id, limit: 10 });
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ state: "queued", keyId: created.body.subscription.activeKeyId });
+    const envelope = JSON.parse(
+      manager.store.getWebhookDeliveryJob(queued[0]!.id)!.body.toString("utf8"),
+    );
+    expect(envelope).toMatchObject({
+      id: sent.body.eventId,
+      type: "webhook.test",
+      eventVersion: 1,
+      source: { product: "meshkeep", apiVersion: "v1" },
+      data: { test: true, subscriptionId: id, label: "Receiver" },
+    });
+
+    // One test per subscription per minute.
+    await request(app).post(`/api/v1/webhooks/${id}/test`).set("Cookie", cookie).send({}).expect(429);
+
+    // A paused subscription cannot be probed at all.
+    await request(app).patch(`/api/v1/webhooks/${id}`).set("Cookie", cookie).send({ state: "paused" }).expect(200);
+    await request(app).post(`/api/v1/webhooks/${id}/test`).set("Cookie", cookie).send({}).expect(409);
+  });
 });

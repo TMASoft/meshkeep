@@ -33,6 +33,15 @@ const deliveryHealth = computed(() => {
   return deliveries.value.length ? `${failures} terminal failures in ${deliveries.value.length} redacted deliveries` : "Load delivery history for redacted health state";
 });
 
+/** Why delivery stopped, for a subscription the worker paused or disabled itself. */
+function failureNotice(subscription: WebhookSubscription): string | null {
+  if (subscription.state === "active" || !subscription.lastFailureSummary) return null;
+  const count = subscription.consecutiveFailures;
+  return subscription.state === "paused"
+    ? `Auto-paused after ${count} consecutive delivery ${count === 1 ? "failure" : "failures"} (${subscription.lastFailureSummary}). Queued events are retained — Resume to drain them.`
+    : `Disabled (${subscription.lastFailureSummary}). Queued events were dropped.`;
+}
+
 function clearForm() {
   editingId.value = null;
   form.label = "";
@@ -152,6 +161,8 @@ async function sendTest(subscription: WebhookSubscription) {
   errorText.value = null;
   try {
     await webhookApi.test(subscription.id);
+    // The worker delivers it like any event, so show Activity for the outcome.
+    await loadDeliveries(subscription);
   } catch (error) {
     errorText.value = error instanceof Error ? error.message : "Unable to queue test delivery";
   } finally {
@@ -230,7 +241,7 @@ onMounted(load);
 
     <div v-if="state === 'ready'" class="subscription-list" aria-label="Webhook subscriptions">
       <article v-for="subscription in subscriptions" :key="subscription.id" class="subscription">
-        <div class="subscription-summary"><strong>{{ subscription.label }}</strong><span>{{ subscription.destination }}</span><small>{{ subscription.state }} · {{ subscription.eventTypes.length }} event filters · {{ subscription.radioIds?.length ?? "all" }} radios · {{ subscription.includeSensitive ? "sensitive confirmed" : "standard content" }}</small></div>
+        <div class="subscription-summary"><strong>{{ subscription.label }}</strong><span>{{ subscription.destination }}</span><small>{{ subscription.state }} · {{ subscription.eventTypes.length }} event filters · {{ subscription.radioIds?.length ?? "all" }} radios · {{ subscription.includeSensitive ? "sensitive confirmed" : "standard content" }}</small><small v-if="failureNotice(subscription)" class="failure">{{ failureNotice(subscription) }}</small></div>
         <div class="actions">
           <button type="button" @click="edit(subscription)">Edit</button>
           <button v-if="subscription.state !== 'disabled'" type="button" :disabled="busy === `state-${subscription.id}`" @click="changeState(subscription, subscription.state === 'active' ? 'paused' : 'active')">{{ subscription.state === "active" ? "Pause" : "Resume" }}</button>

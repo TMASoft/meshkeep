@@ -181,8 +181,20 @@ MeshKeep-Signature: v1=<hex(HMAC-SHA256(secret, timestamp + "." + rawBody))>
 Receivers verify the raw body with a constant-time HMAC comparison and reject a
 timestamp outside five minutes. Rotation creates a new active key and retains
 the old key only for 24 hours to finish already queued deliveries; new events
-use the new key. Revocation/deletion removes every key immediately. Key IDs and
-ciphertexts are safe metadata; plaintext secrets are not.
+use the new key. The 24-hour window is enforced at signing time, not merely
+recorded: past `retire_at` the old secret signs nothing. Retired keys are
+hard-deleted once they are 30 days past retirement and no delivery row still
+references them, so repeated rotation cannot grow the key table without bound.
+Revocation/deletion removes every key immediately. Key IDs and ciphertexts are
+safe metadata; plaintext secrets are not.
+
+`POST /webhooks/:id/test` enqueues a real `webhook.test` envelope through the
+normal durable queue, signed with the subscription's active key, so the operator
+verifies connectivity and the shared secret end to end and sees the outcome in
+the delivery history. It carries no mesh data. `webhook.test` is deliberately
+absent from the subscribable event catalog — it is never matched by filters and
+arrives only when an operator asks for it. Tests are limited to one per
+subscription per minute and are refused for a paused or disabled subscription.
 
 ## Destination and SSRF controls
 
@@ -236,7 +248,8 @@ The delivery list never returns body bytes or signing headers.
 
 The server emits structured, secret-redacted logs: `webhook.enqueued`,
 `webhook.delivered`, `webhook.retry_scheduled`, `webhook.failed`,
-`webhook.dropped`, `webhook.subscription_disabled`. Diagnostics expose counts by
+`webhook.dropped`, `webhook.expired`, `webhook.subscription_paused`,
+`webhook.subscription_disabled`. Diagnostics expose counts by
 state, oldest queued age, last success/failure timestamp per subscription, and
 the active master-key configuration state (never its value). The admin UI shows
 this state and lets a session user pause, resume, rotate, test, and inspect
@@ -244,7 +257,25 @@ redacted attempt history.
 
 A permanent destination validation failure or a configurable burst of terminal
 failures automatically pauses a subscription and records an operator-visible
-reason. Authentication failures are never logged with response bodies. Metrics
+reason. The two are handled differently, because only one of them is
+recoverable:
+
+* **Destination validation and signing failures** (`destination_rejected`,
+  `signing_key_unavailable`) are subscription-level faults that no later event
+  can survive. They **disable** the subscription immediately and drop its
+  queued backlog, since replaying it would only re-fail against a bad target.
+* **Receiver-side terminal failures** — a non-retryable `4xx`, or a delivery
+  that exhausted its retry budget — are counted as a consecutive-failure streak
+  per subscription. Reaching `MESHKEEP_WEBHOOK_FAILURE_BURST` (default 5)
+  **pauses** the subscription. A pause stops new enqueueing and scheduled
+  delivery but **retains** the queued backlog, so resuming from the admin UI
+  drains it. A successful delivery resets the streak, as does resuming.
+
+Queued deliveries that go unattended past the 24-hour delivery window are swept
+to a terminal `expired` state in bounded batches, so an unattended pause cannot
+hold rows in the queue indefinitely or consume the global queue budget.
+
+Authentication failures are never logged with response bodies. Metrics
 and logs omit destination query strings unless an operator deliberately views
 the subscription configuration in the session-only UI.
 

@@ -74,6 +74,11 @@ Keep secrets out of tracked files:
   the SQLite volume, and inject it through the deployment's secret facility. Losing or
   replacing this key makes existing encrypted webhook signing keys unusable; MeshKeep
   intentionally fails startup rather than silently replacing them.
+- `MESHKEEP_WEBHOOK_FAILURE_BURST` (default 5) is how many consecutive terminal
+  delivery failures a subscription tolerates before the worker auto-pauses it.
+  A pause keeps the queued backlog, so once the receiver is healthy again press
+  **Resume** in Radio → Webhook subscriptions and the backlog drains. Lower it if
+  you want a broken receiver quarantined sooner; raise it for flaky receivers.
 - For stronger handling, mount secrets as files via Docker/Swarm secrets or your
   orchestrator's secret store rather than passing them as environment variables.
 - The diagnostics support bundle redacts secrets: the UI password is reported only

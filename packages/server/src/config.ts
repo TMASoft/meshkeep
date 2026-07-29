@@ -23,6 +23,8 @@ export interface ServerConfig {
   mapTilesAttribution: string | null;
   /** Decoded deployment secret; never include it in logs or diagnostics. */
   webhookMasterKey: Buffer | null;
+  /** Consecutive terminal delivery failures before a subscription auto-pauses. */
+  webhookFailureBurst: number;
 }
 
 function env(name: string): string | null {
@@ -92,5 +94,6 @@ export function loadConfig(): ServerConfig {
         ? null
         : (env("MESHKEEP_MAP_TILES_ATTRIBUTION") ?? "© OpenStreetMap contributors"),
     webhookMasterKey: parseWebhookMasterKey(env("MESHKEEP_WEBHOOK_MASTER_KEY")),
+    webhookFailureBurst: envInt("MESHKEEP_WEBHOOK_FAILURE_BURST", 5, 1, 100),
   };
 }

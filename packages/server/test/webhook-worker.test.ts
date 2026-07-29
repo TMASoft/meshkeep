@@ -142,8 +142,7 @@ describe("webhook delivery security primitives", () => {
       masterKey,
       resolver,
       transport,
-      () => now,
-      () => 0.5,
+      { clock: () => now, random: () => 0.5 },
     );
 
     publishDueEvent(bus);
@@ -181,7 +180,7 @@ describe("webhook delivery security primitives", () => {
       masterKey,
       resolver,
       transport,
-      () => now,
+      { clock: () => now },
     );
 
     publishDueEvent(bus);
@@ -216,8 +215,7 @@ describe("webhook delivery security primitives", () => {
       masterKey,
       resolver,
       transport,
-      () => now,
-      () => 0.5,
+      { clock: () => now, random: () => 0.5 },
     );
 
     publishDueEvent(bus);
@@ -255,13 +253,16 @@ describe("webhook delivery security primitives", () => {
       masterKey,
       resolver,
       redirectTransport,
-      () => now,
+      { clock: () => now },
     );
     publishDueEvent(bus);
     await worker.drain();
-    expect(store.getWebhookSubscription(subscription.id)?.state).toBe(
-      "disabled",
-    );
+    // Terminal for this delivery, but one redirect is not a subscription fault:
+    // it counts toward the burst and leaves the subscription serving.
+    expect(store.getWebhookSubscription(subscription.id)).toMatchObject({
+      state: "active",
+      consecutiveFailures: 1,
+    });
     expect(
       store.listWebhookDeliveries({
         subscriptionId: subscription.id,
@@ -283,7 +284,7 @@ describe("webhook delivery security primitives", () => {
           headers: { "retry-after": "999999" },
         }),
       },
-      () => now,
+      { clock: () => now },
     );
     publishDueEvent(retry.bus);
     await retryWorker.drain();
@@ -312,7 +313,7 @@ describe("webhook delivery security primitives", () => {
           },
         }),
       },
-      () => now,
+      { clock: () => now },
     );
 
     publishDueEvent(bus);
@@ -356,8 +357,7 @@ describe("webhook delivery security primitives", () => {
       masterKey,
       resolver,
       transport,
-      () => clock,
-      () => 0.5,
+      { clock: () => clock, random: () => 0.5 },
     );
 
     publishDueEvent(bus);
@@ -401,8 +401,7 @@ describe("webhook delivery security primitives", () => {
       masterKey,
       new FakeResolver(["93.184.216.34"]),
       transport,
-      () => now,
-      () => 0,
+      { clock: () => now, random: () => 0 },
     );
 
     publishDueEvent(bus);
@@ -421,6 +420,212 @@ describe("webhook delivery security primitives", () => {
     expect(
       db.prepare("SELECT COUNT(*) AS count FROM webhook_events").get(),
     ).toEqual({ count: 1 });
+    worker.stop();
+    db.close();
+  });
+
+  it("keeps a subscription serving through a 4xx burst below the threshold and preserves its backlog on pause", async () => {
+    const { db, store, bus, subscription } = setup();
+    let clock = now;
+    const worker = new WebhookWorker(
+      store,
+      bus,
+      masterKey,
+      new FakeResolver(["93.184.216.34"]),
+      new FakeTransport(Array.from({ length: 8 }, () => ({ status: 404 }))),
+      { clock: () => clock, random: () => 0, failureBurst: 3 },
+    );
+
+    // One delivery is claimed per subscription per drain, so each pass is one
+    // terminal failure. The first two leave the subscription serving.
+    for (let i = 0; i < 2; i++) {
+      publishDueEvent(bus);
+      await worker.drain();
+      clock += 1;
+    }
+    expect(store.getWebhookSubscription(subscription.id)).toMatchObject({
+      state: "active",
+      consecutiveFailures: 2,
+    });
+
+    // A third publish enqueues normally, then its failure trips the burst.
+    publishDueEvent(bus);
+    const queuedBefore = store.listWebhookDeliveries({
+      subscriptionId: subscription.id,
+      state: "queued",
+      limit: 10,
+    }).length;
+    expect(queuedBefore).toBe(1);
+    await worker.drain();
+    clock += 1;
+
+    expect(store.getWebhookSubscription(subscription.id)).toMatchObject({
+      state: "paused",
+      consecutiveFailures: 3,
+      lastFailureSummary: "HTTP 404",
+    });
+
+    // A pause stops new enqueueing and scheduled delivery without dropping the
+    // queue: a fourth event is refused, and a drain claims nothing.
+    publishDueEvent(bus);
+    await worker.drain();
+    expect(
+      store.listWebhookDeliveries({ subscriptionId: subscription.id, limit: 20 }),
+    ).toHaveLength(3);
+    expect(
+      store
+        .listWebhookDeliveries({ subscriptionId: subscription.id, limit: 20 })
+        .filter((delivery) => delivery.state === "dropped"),
+    ).toHaveLength(0);
+    worker.stop();
+    db.close();
+  });
+
+  it("resumes a paused subscription, drains the retained backlog, and resets the streak on success", async () => {
+    const { db, store, bus, subscription } = setup();
+    let clock = now;
+    const transport = new FakeTransport([
+      { status: 404 },
+      { status: 404 },
+      { status: 204 },
+    ]);
+    const worker = new WebhookWorker(
+      store,
+      bus,
+      masterKey,
+      new FakeResolver(["93.184.216.34"]),
+      transport,
+      { clock: () => clock, random: () => 0, failureBurst: 2 },
+    );
+
+    // Three events arrive in a burst while the subscription is still active; a
+    // drain claims one per subscription, so the third is still queued when the
+    // second failure trips the threshold.
+    for (let i = 0; i < 3; i++) publishDueEvent(bus);
+    await worker.drain();
+    clock += 1;
+    await worker.drain();
+    clock += 1;
+    expect(store.getWebhookSubscription(subscription.id)?.state).toBe("paused");
+
+    // The operator fixes the receiver and resumes. The retained queued delivery
+    // is claimable again, and delivering it clears the streak and the reason.
+    const retained = store.listWebhookDeliveries({
+      subscriptionId: subscription.id,
+      state: "queued",
+      limit: 10,
+    });
+    expect(retained).toHaveLength(1);
+
+    const existing = store.getWebhookSubscription(subscription.id)!;
+    store.updateWebhookSubscription(subscription.id, {
+      label: existing.label,
+      destination: existing.destination,
+      eventTypes: existing.eventTypes,
+      radioIds: existing.radioIds,
+      includeSensitive: existing.includeSensitive,
+      state: "active",
+    });
+    expect(store.getWebhookSubscription(subscription.id)).toMatchObject({
+      consecutiveFailures: 0,
+      lastFailureSummary: null,
+    });
+
+    await worker.drain();
+    expect(transport.requests).toHaveLength(3);
+    expect(
+      store.getWebhookDelivery(retained[0]!.id),
+    ).toMatchObject({ state: "delivered" });
+    expect(store.getWebhookSubscription(subscription.id)).toMatchObject({
+      state: "active",
+      consecutiveFailures: 0,
+    });
+    worker.stop();
+    db.close();
+  });
+
+  it("still disables immediately, dropping the backlog, when the signing key is gone", async () => {
+    const { db, store, bus, subscription } = setup();
+    const worker = new WebhookWorker(
+      store,
+      bus,
+      masterKey,
+      new FakeResolver(["93.184.216.34"]),
+      new FakeTransport([]),
+      { clock: () => now, failureBurst: 5 },
+    );
+    // Two queued deliveries, so the drop of the untried backlog is observable.
+    publishDueEvent(bus);
+    publishDueEvent(bus);
+    // Soft-delete rather than DELETE: live deliveries still reference the key row.
+    db.prepare("UPDATE webhook_keys SET deleted_at = ? WHERE subscription_id = ?").run(
+      now,
+      subscription.id,
+    );
+
+    await worker.drain();
+
+    expect(store.getWebhookSubscription(subscription.id)).toMatchObject({
+      state: "disabled",
+      lastFailureSummary: "signing_key_unavailable",
+    });
+    const deliveries = store.listWebhookDeliveries({
+      subscriptionId: subscription.id,
+      limit: 10,
+    });
+    expect(deliveries.filter((delivery) => delivery.state === "failed")).toHaveLength(1);
+    expect(deliveries.filter((delivery) => delivery.state === "dropped")).toHaveLength(1);
+    worker.stop();
+    db.close();
+  });
+
+  it("expires a paused subscription's backlog past the 24-hour delivery window", async () => {
+    const { db, store, bus, subscription } = setup();
+    let clock = now;
+    const worker = new WebhookWorker(
+      store,
+      bus,
+      masterKey,
+      new FakeResolver(["93.184.216.34"]),
+      new FakeTransport([{ status: 404 }]),
+      { clock: () => clock, random: () => 0, failureBurst: 1 },
+    );
+
+    publishDueEvent(bus);
+    await worker.drain();
+    clock += 1;
+    expect(store.getWebhookSubscription(subscription.id)?.state).toBe("paused");
+
+    // Backlog queued before the pause, then left unattended past the window.
+    store.recordWebhookEvent({
+      eventId: "event-stale",
+      type: "message.created",
+      eventVersion: 1,
+      sourceRadioId: 1,
+      occurredAt: clock,
+      body: Buffer.from("{}"),
+    });
+    store.enqueueWebhookDelivery({
+      subscriptionId: subscription.id,
+      eventId: "event-stale",
+      keyId: "key-1",
+      nextAttemptAt: clock,
+    });
+    db.prepare(
+      "UPDATE webhook_deliveries SET created_at = ? WHERE event_id = 'event-stale'",
+    ).run(clock);
+
+    clock += 24 * 60 * 60 + 1;
+    await worker.drain();
+
+    expect(
+      store.listWebhookDeliveries({
+        subscriptionId: subscription.id,
+        limit: 10,
+      }),
+    ).toContainEqual(
+      expect.objectContaining({ state: "failed", errorSummary: "expired" }),
+    );
     worker.stop();
     db.close();
   });
@@ -446,8 +651,7 @@ describe("webhook delivery security primitives", () => {
       masterKey,
       new FakeResolver(["93.184.216.34"]),
       new FakeTransport([new Error("network down")]),
-      () => now,
-      () => 0.5,
+      { clock: () => now, random: () => 0.5 },
     );
 
     await worker.drain();

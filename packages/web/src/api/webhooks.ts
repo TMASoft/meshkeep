@@ -11,6 +11,9 @@ export interface WebhookSubscription {
   radioIds: number[] | null;
   includeSensitive: boolean;
   state: WebhookState;
+  /** Redacted reason recorded when delivery failures paused or disabled this. */
+  lastFailureSummary: string | null;
+  consecutiveFailures: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -54,7 +57,7 @@ export const webhookApi = {
     api<{ subscription: WebhookSubscription }>(`/webhooks/${id}`, { method: "PATCH", body: JSON.stringify(input) }),
   remove: (id: number) => api<{ ok: true }>(`/webhooks/${id}`, { method: "DELETE" }),
   rotate: (id: number) => api<{ signingSecret: string }>(`/webhooks/${id}/rotate-secret`, { method: "POST" }),
-  test: (id: number) => api<{ accepted: true }>(`/webhooks/${id}/test`, { method: "POST" }),
+  test: (id: number) => api<{ accepted: true; eventId: string }>(`/webhooks/${id}/test`, { method: "POST" }),
   deliveries: async (id: number, state?: WebhookDeliveryState) => {
     const query = state ? `?state=${encodeURIComponent(state)}` : "";
     const { deliveries } = await api<{ deliveries: Record<string, unknown>[] }>(`/webhooks/${id}/deliveries${query}`);

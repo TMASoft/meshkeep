@@ -123,6 +123,7 @@ a BLE radio near your _browsing_ device is often better served by browser-direct
 | `MESHKEEP_MAP_TILES_ATTRIBUTION`          | `© OpenStreetMap contributors`                   | visible attribution for the configured tile provider                                                 |
 | `MESHKEEP_LOG_LEVEL`                      | `info`                                           | stdout log verbosity: `debug`, `info`, `warn`, `error`                                               |
 | `MESHKEEP_WEBHOOK_MASTER_KEY`              | unset                                            | base64-encoded 32-byte deployment secret required to create, rotate, or deliver webhooks             |
+| `MESHKEEP_WEBHOOK_FAILURE_BURST`          | `5`                                              | consecutive terminal delivery failures before a webhook subscription auto-pauses (1–100)             |
 
 Connection settings can also be changed at runtime from Radio → Connection; a saved
 override wins over the environment until you reset it. Settings can also be saved as

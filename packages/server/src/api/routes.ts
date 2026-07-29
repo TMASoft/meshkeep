@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { isIP } from "node:net";
-import { EXTERNAL_EVENT_TYPES, type ExternalEventType } from "@meshkeep/shared";
+import { EXTERNAL_EVENT_TYPES, buildWebhookTestEvent, type ExternalEventType } from "@meshkeep/shared";
 import { Router, json, type Request, type Response } from "express";
 import { z } from "zod";
 import type { ConnectionManager } from "../radio/manager.js";
@@ -1182,13 +1182,41 @@ export function buildApi(
     "/webhooks/:id/test",
     auth.sessionGuard,
     handle((req, res) => {
-      if (!manager.store.getWebhookSubscription(webhookId(req))) {
+      const id = webhookId(req);
+      const subscription = manager.store.getWebhookSubscription(id);
+      if (!subscription) {
         res.status(404).json({ error: "webhook subscription not found" });
         return;
       }
-      // Transport and queue ownership belong to the delivery worker card. This
-      // API command deliberately performs no outbound HTTP itself.
-      res.status(202).json({ accepted: true });
+      if (subscription.state !== "active" || subscription.activeKeyId === null) {
+        res.status(409).json({ error: "webhook subscription is not active" });
+        return;
+      }
+      const nowTs = Math.floor(Date.now() / 1000);
+      const lastTestAt = manager.store.lastWebhookTestAt(id);
+      if (lastTestAt !== null && nowTs - lastTestAt < 60) {
+        res.status(429).json({ error: "one test delivery per subscription per minute" });
+        return;
+      }
+      // The route only enqueues; transport and retry ownership stay with the
+      // delivery worker, so the test shows up in Activity like any delivery.
+      const envelope = buildWebhookTestEvent({ id: randomUUID(), subscriptionId: id, label: subscription.label });
+      const result = manager.store.queueWebhookEvent({
+        subscriptionId: id,
+        keyId: subscription.activeKeyId,
+        eventId: envelope.id,
+        type: envelope.type,
+        eventVersion: envelope.eventVersion,
+        sourceRadioId: null,
+        occurredAt: Math.floor(Date.parse(envelope.occurredAt) / 1000),
+        body: Buffer.from(JSON.stringify(envelope), "utf8"),
+        now: nowTs,
+      });
+      if (result !== "queued") {
+        res.status(429).json({ error: result });
+        return;
+      }
+      res.status(202).json({ accepted: true, eventId: envelope.id });
     }),
   );
   api.get(

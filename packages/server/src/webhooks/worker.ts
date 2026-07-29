@@ -13,7 +13,14 @@ const MAX_ATTEMPTS = 10;
 const MAX_AGE_SECONDS = 24 * 60 * 60;
 const RETRY_AFTER_CAP_SECONDS = 6 * 60 * 60;
 const RETENTION_SECONDS = 30 * 24 * 60 * 60;
+export const DEFAULT_FAILURE_BURST = 5;
 
+/**
+ * A fault of the subscription itself rather than of one delivery: the
+ * destination failed SSRF revalidation, or its signing key is gone. Neither can
+ * improve by retrying another event, so these disable immediately instead of
+ * counting toward the recoverable failure burst.
+ */
 class WebhookPermanentFailure extends Error {
   constructor(
     readonly code: "destination_rejected" | "signing_key_unavailable",
@@ -241,8 +248,20 @@ function retryAfterSeconds(
     : null;
 }
 
+export interface WebhookWorkerOptions {
+  /** Seam for deterministic tests; defaults to the wall clock in seconds. */
+  clock?: () => number;
+  /** Seam for deterministic retry jitter in tests. */
+  random?: () => number;
+  /** Consecutive terminal failures tolerated before the subscription pauses. */
+  failureBurst?: number;
+}
+
 export class WebhookWorker {
   private readonly crypto: WebhookCrypto;
+  private readonly clock: () => number;
+  private readonly random: () => number;
+  private readonly failureBurst: number;
   private unsubscribe: (() => void) | null = null;
   private timer: NodeJS.Timeout | null = null;
   private running = false;
@@ -253,9 +272,11 @@ export class WebhookWorker {
     masterKey: Buffer | null,
     private readonly resolver: WebhookResolver,
     private readonly transport: WebhookTransport,
-    private readonly clock: () => number = () => Math.floor(Date.now() / 1000),
-    private readonly random: () => number = Math.random,
+    options: WebhookWorkerOptions = {},
   ) {
+    this.clock = options.clock ?? (() => Math.floor(Date.now() / 1000));
+    this.random = options.random ?? Math.random;
+    this.failureBurst = options.failureBurst ?? DEFAULT_FAILURE_BURST;
     if (masterKey === null)
       throw new Error(
         "MESHKEEP_WEBHOOK_MASTER_KEY is required for webhook delivery",
@@ -322,6 +343,12 @@ export class WebhookWorker {
     try {
       const now = this.clock();
       this.store.pruneWebhookRetention(now - RETENTION_SECONDS, 100);
+      this.store.pruneRetiredWebhookKeys(now - RETENTION_SECONDS, 100);
+      const expired = this.store.expireStaleWebhookDeliveries(
+        now - MAX_AGE_SECONDS,
+        100,
+      );
+      if (expired > 0) log.warn("webhook.expired", { deliveries: expired });
       const deliveries = this.store.claimDueWebhookDeliveries(
         `webhook-${process.pid}`,
         now,
@@ -350,6 +377,7 @@ export class WebhookWorker {
         job.subscriptionId,
         job.keyId,
         this.crypto,
+        now,
       );
       if (!secret) throw new WebhookPermanentFailure("signing_key_unavailable");
       const timestamp = now;
@@ -379,6 +407,7 @@ export class WebhookWorker {
             leaseOwner: job.leaseOwner,
           })
         ) {
+          this.store.clearWebhookFailureStreak(job.subscriptionId);
           log.info("webhook.delivered", {
             subscriptionId: job.subscriptionId,
             eventId: job.eventId,
@@ -453,17 +482,40 @@ export class WebhookWorker {
         leaseOwner: job.leaseOwner,
       });
       if (!finished) return;
-      if (!retryable) {
+      const reason = detail ?? `HTTP ${status}`;
+      if (
+        detail === "destination_rejected" ||
+        detail === "signing_key_unavailable"
+      ) {
+        // Subscription-level fault: no future event can succeed, so stop hard
+        // and drop the backlog rather than replaying it against a bad target.
         const dropped = this.store.disableWebhookSubscription(
           job.subscriptionId,
-          "terminal delivery failure",
+          reason,
         );
         log.warn("webhook.subscription_disabled", {
           subscriptionId: job.subscriptionId,
           deliveryId,
-          reason: detail ?? "terminal",
+          reason,
           droppedDeliveries: dropped,
         });
+      } else {
+        // A receiver-side fault (4xx burst, or a delivery that exhausted its
+        // retries) is recoverable: pause after the burst threshold and keep the
+        // queue so a resume drains it.
+        const streak = this.store.recordWebhookTerminalFailure(
+          job.subscriptionId,
+          reason,
+          this.failureBurst,
+        );
+        if (streak.paused) {
+          log.warn("webhook.subscription_paused", {
+            subscriptionId: job.subscriptionId,
+            deliveryId,
+            reason,
+            consecutiveFailures: streak.consecutiveFailures,
+          });
+        }
       }
       log.warn("webhook.failed", {
         subscriptionId: job.subscriptionId,
