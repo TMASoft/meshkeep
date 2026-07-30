@@ -105,6 +105,39 @@ export interface WebhookDeliveryJob extends WebhookDelivery {
   firstAttemptAt: number | null;
 }
 
+/** A browser's Web Push endpoint (issue #76 prototype), bound to the session that created it. */
+export interface PushSubscription {
+  id: number;
+  sessionTokenHash: string;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  createdAt: number;
+  consecutiveFailures: number;
+}
+
+interface PushSubscriptionRow {
+  id: number;
+  session_token_hash: string;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  created_at: number;
+  consecutive_failures: number;
+}
+
+function rowToPushSubscription(row: PushSubscriptionRow): PushSubscription {
+  return {
+    id: row.id,
+    sessionTokenHash: row.session_token_hash,
+    endpoint: row.endpoint,
+    p256dh: row.p256dh,
+    auth: row.auth,
+    createdAt: row.created_at,
+    consecutiveFailures: row.consecutive_failures,
+  };
+}
+
 interface WebhookSubscriptionRow {
   id: number;
   label: string;
@@ -2693,6 +2726,85 @@ export class Store {
     return this.db
       .prepare("DELETE FROM timeline_events WHERE ts < ?")
       .run(cutoff).changes;
+  }
+
+  // ---- Web Push subscription storage (issue #76 prototype; best-effort, no durable delivery queue) ----
+
+  /** Re-subscribing (e.g. a rotated browser endpoint) replaces the prior row for that endpoint and clears its failure streak. */
+  upsertPushSubscription(input: {
+    sessionTokenHash: string;
+    endpoint: string;
+    p256dh: string;
+    auth: string;
+  }): PushSubscription {
+    this.db
+      .prepare(
+        `INSERT INTO push_subscriptions (session_token_hash, endpoint, p256dh, auth, created_at, consecutive_failures)
+         VALUES (@sessionTokenHash, @endpoint, @p256dh, @auth, @now, 0)
+         ON CONFLICT(endpoint) DO UPDATE SET
+           session_token_hash = excluded.session_token_hash,
+           p256dh = excluded.p256dh,
+           auth = excluded.auth,
+           consecutive_failures = 0`,
+      )
+      .run({ ...input, now: now() });
+    return this.getPushSubscription(input.endpoint)!;
+  }
+
+  getPushSubscription(endpoint: string): PushSubscription | null {
+    const row = this.db
+      .prepare("SELECT * FROM push_subscriptions WHERE endpoint = ?")
+      .get(endpoint) as PushSubscriptionRow | undefined;
+    return row ? rowToPushSubscription(row) : null;
+  }
+
+  listPushSubscriptions(): PushSubscription[] {
+    return (
+      this.db.prepare("SELECT * FROM push_subscriptions ORDER BY id ASC").all() as PushSubscriptionRow[]
+    ).map(rowToPushSubscription);
+  }
+
+  /** Explicit unsubscribe: only the session that created the subscription may remove it. */
+  deletePushSubscriptionForSession(endpoint: string, sessionTokenHash: string): boolean {
+    return (
+      this.db
+        .prepare("DELETE FROM push_subscriptions WHERE endpoint = ? AND session_token_hash = ?")
+        .run(endpoint, sessionTokenHash).changes > 0
+    );
+  }
+
+  /** Logout hygiene (api/auth.ts): a subscription must not survive its session. */
+  deletePushSubscriptionsForSession(sessionTokenHash: string): number {
+    return this.db.prepare("DELETE FROM push_subscriptions WHERE session_token_hash = ?").run(sessionTokenHash)
+      .changes;
+  }
+
+  /** Worker-side dead-endpoint cleanup (no session context available there). */
+  deletePushSubscription(endpoint: string): boolean {
+    return this.db.prepare("DELETE FROM push_subscriptions WHERE endpoint = ?").run(endpoint).changes > 0;
+  }
+
+  clearPushFailureStreak(endpoint: string): void {
+    this.db.prepare("UPDATE push_subscriptions SET consecutive_failures = 0 WHERE endpoint = ?").run(endpoint);
+  }
+
+  /**
+   * Count one delivery failure and remove the endpoint once `threshold`
+   * consecutive failures accumulate. Unlike a webhook, a dead push endpoint
+   * has no operator to resume it, so removal (not a pause) is the terminal state.
+   */
+  recordPushFailure(endpoint: string, threshold: number): { consecutiveFailures: number; removed: boolean } {
+    const row = this.db
+      .prepare(
+        "UPDATE push_subscriptions SET consecutive_failures = consecutive_failures + 1 WHERE endpoint = ? RETURNING consecutive_failures",
+      )
+      .get(endpoint) as { consecutive_failures: number } | undefined;
+    if (!row) return { consecutiveFailures: 0, removed: false };
+    if (row.consecutive_failures >= threshold) {
+      this.deletePushSubscription(endpoint);
+      return { consecutiveFailures: row.consecutive_failures, removed: true };
+    }
+    return { consecutiveFailures: row.consecutive_failures, removed: false };
   }
 }
 

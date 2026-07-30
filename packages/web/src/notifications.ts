@@ -6,6 +6,7 @@ import type { ConversationId } from "./stores/app";
 export type NotifyPref = "off" | "dms" | "all";
 
 const STORAGE_KEY = "meshkeep-notify";
+const DETAILS_STORAGE_KEY = "meshkeep-notify-details";
 
 /** Notification API needs a secure context — same constraint as browser-direct (docs/https.md). */
 export function notificationsSupported(): boolean {
@@ -13,18 +14,21 @@ export function notificationsSupported(): boolean {
 }
 
 /**
- * Deliberately narrow service-worker fallback prototype. It is only reached
- * when a page-owned Notification cannot be constructed (notably some Android
- * Chromium configurations). It does not add offline caching or Push support.
+ * Fallback prototype for notification display only, reached when a
+ * page-owned Notification cannot be constructed (notably some Android
+ * Chromium configurations). This does not register the worker — main.ts
+ * registers it eagerly and unconditionally at startup as the versioned
+ * static-asset cache worker (#74); this just reuses that same registration.
  */
 async function showViaServiceWorker(title: string, options: NotificationOptions): Promise<void> {
   if (!("serviceWorker" in navigator)) return;
   try {
-    const registration = await navigator.serviceWorker.register("/notification-sw.js");
+    const registration = await navigator.serviceWorker.getRegistration();
+    if (!registration) return;
     await registration.showNotification(title, options);
   } catch {
-    // Registration is best-effort. The caller already treats notifications as
-    // unavailable rather than making a received message path fail.
+    // Best-effort. The caller already treats notifications as unavailable
+    // rather than making a received message path fail.
   }
 }
 
@@ -54,6 +58,46 @@ export function saveNotifyPref(pref: NotifyPref): void {
   }
 }
 
+/** Local-data reset (#74): drop the saved preference so notifications default back to off. */
+export function clearNotifyPref(): void {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // nothing persisted to clear
+  }
+}
+
+/**
+ * The "Show notification details" opt-in (#75, docs/pwa-feasibility.md). Off
+ * by default: sender, channel, message text, location, identifiers,
+ * measurements, and rule thresholds are sensitive lock-screen content and
+ * require this separate, explicit consent.
+ */
+export function savedNotifyDetails(): boolean {
+  try {
+    return localStorage.getItem(DETAILS_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+export function saveNotifyDetails(enabled: boolean): void {
+  try {
+    localStorage.setItem(DETAILS_STORAGE_KEY, String(enabled));
+  } catch {
+    // preference still applies for this session
+  }
+}
+
+/** Reset on logout and local-data reset (#75) — never carries over to a new session. */
+export function clearNotifyDetails(): void {
+  try {
+    localStorage.removeItem(DETAILS_STORAGE_KEY);
+  } catch {
+    // nothing persisted to clear
+  }
+}
+
 /** Request permission when turning notifications on. Returns whether usable. */
 export async function requestNotifyPermission(): Promise<boolean> {
   if (!notificationsSupported()) return false;
@@ -79,6 +123,56 @@ export function clearNotificationNavigator(): void {
   navigate = null;
 }
 
+export interface NotificationContent {
+  title: string;
+  body: string;
+}
+
+/**
+ * Sender, channel, message text, identifiers, and other conversation content
+ * are sensitive lock-screen content (docs/pwa-feasibility.md) and only appear
+ * when the user has separately opted into "Show notification details". The
+ * default is a generic notification that reveals nothing about the message.
+ */
+export function messageNotificationContent(message: Message, showDetails: boolean): NotificationContent {
+  if (!showDetails) {
+    return { title: "New MeshKeep message", body: "Open MeshKeep to view." };
+  }
+  // channel texts carry their sender inline as "name: msg" (group-text convention);
+  // displayMessage is the same helper the chat thread uses for this split (issue #22).
+  const display = displayMessage(message);
+  const sender =
+    display.sender ??
+    message.contactName ??
+    message.authorName ??
+    shortKey(message.contactKey ?? message.contactPrefix);
+  const title =
+    message.kind === "dm" ? sender : `${message.channelName ?? `channel ${message.channelIdx}`} · ${sender}`;
+  const body = display.text.length > 140 ? `${display.text.slice(0, 139)}…` : display.text;
+  return { title, body };
+}
+
+/** Same privacy gating as messageNotificationContent, for a telemetry alert (issue #52). */
+export function alertNotificationContent(event: TelemetryAlertEvent, showDetails: boolean): NotificationContent {
+  if (!showDetails) {
+    return {
+      title: "MeshKeep telemetry alert",
+      body: event.direction === "breach" ? "Open MeshKeep for details." : "Open MeshKeep — alert recovered.",
+    };
+  }
+  const subject = event.contactName ?? (event.contactKey ? shortKey(event.contactKey) : "This radio");
+  const comparison = event.comparator === "below" ? "below" : "above";
+  const title =
+    event.direction === "breach"
+      ? `${subject}: ${event.label} alert`
+      : `${subject}: ${event.label} recovered`;
+  const body =
+    event.direction === "breach"
+      ? `${event.label} is ${event.value} (${comparison} ${event.threshold})`
+      : `${event.label} is back to ${event.value}`;
+  return { title, body };
+}
+
 /**
  * Notify for an incoming message when the tab is hidden or the conversation
  * isn't the active one. Messages arriving in the active, visible conversation
@@ -102,19 +196,11 @@ export function notifyIncoming(
         ? { kind: "dm", contactKey: message.contactKey }
         : { kind: "dm", contactPrefix: message.contactPrefix ?? "" }
       : { kind: "channel", channelIdx: message.channelIdx ?? 0 };
-  // channel texts carry their sender inline as "name: msg" (group-text convention);
-  // displayMessage is the same helper the chat thread uses for this split (issue #22).
-  const display = displayMessage(message);
-  const sender =
-    display.sender ??
-    message.contactName ??
-    message.authorName ??
-    shortKey(message.contactKey ?? message.contactPrefix);
-  const title =
-    message.kind === "dm" ? sender : `${message.channelName ?? `channel ${message.channelIdx}`} · ${sender}`;
-  const body = display.text.length > 140 ? `${display.text.slice(0, 139)}…` : display.text;
+  const { title, body } = messageNotificationContent(message, savedNotifyDetails());
 
-  // one notification per conversation: newer messages replace older ones
+  // one notification per conversation: newer messages replace older ones.
+  // The click handler only focuses/navigates the already-authenticated tab —
+  // no conversation data travels in the notification payload or a URL.
   showNotification(title, { body, tag: `meshkeep-${conversationTag(id)}` }, () => {
     window.focus();
     navigate?.(id);
@@ -130,19 +216,22 @@ export function notifyAlert(event: TelemetryAlertEvent): void {
   if (savedNotifyPref() === "off") return;
   if (!notificationsSupported() || Notification.permission !== "granted") return;
 
-  const subject = event.contactName ?? (event.contactKey ? shortKey(event.contactKey) : "This radio");
-  const comparison = event.comparator === "below" ? "below" : "above";
-  const title =
-    event.direction === "breach"
-      ? `${subject}: ${event.label} alert`
-      : `${subject}: ${event.label} recovered`;
-  const body =
-    event.direction === "breach"
-      ? `${event.label} is ${event.value} (${comparison} ${event.threshold})`
-      : `${event.label} is back to ${event.value}`;
+  const { title, body } = alertNotificationContent(event, savedNotifyDetails());
 
   // one notification per rule: a later transition replaces the earlier one
   showNotification(title, { body, tag: `meshkeep-alert-${event.ruleId}` });
+}
+
+/**
+ * Whether the UI should show "notifications are blocked" guidance: the saved
+ * preference wants notifications, but the browser permission has been denied
+ * (initially or revoked mid-session). Callers should re-check this whenever
+ * the tab regains visibility, since permission can change via site settings
+ * without any in-page event.
+ */
+export function notificationPermissionBlocked(): boolean {
+  if (savedNotifyPref() === "off") return false;
+  return notificationsSupported() && Notification.permission === "denied";
 }
 
 function conversationTag(id: ConversationId): string {

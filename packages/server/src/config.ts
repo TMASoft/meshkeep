@@ -25,6 +25,10 @@ export interface ServerConfig {
   webhookMasterKey: Buffer | null;
   /** Consecutive terminal delivery failures before a subscription auto-pauses. */
   webhookFailureBurst: number;
+  /** Web Push (issue #76 prototype); null disables the feature entirely (no VAPID keys configured). */
+  vapid: { publicKey: string; privateKey: string; subject: string } | null;
+  /** Consecutive send failures before a dead push endpoint is removed (no operator to resume it). */
+  pushFailureBurst: number;
 }
 
 function env(name: string): string | null {
@@ -65,6 +69,22 @@ function tileUrl(): string | null {
 
 const TRANSPORTS: ConnectionTransport[] = ["serial", "tcp", "ble", "none"];
 
+function vapidConfig(): ServerConfig["vapid"] {
+  const publicKey = env("MESHKEEP_VAPID_PUBLIC_KEY");
+  const privateKey = env("MESHKEEP_VAPID_PRIVATE_KEY");
+  const subject = env("MESHKEEP_VAPID_SUBJECT");
+  if (publicKey === null && privateKey === null && subject === null) return null;
+  if (publicKey === null || privateKey === null || subject === null) {
+    throw new Error(
+      "MESHKEEP_VAPID_PUBLIC_KEY, MESHKEEP_VAPID_PRIVATE_KEY, and MESHKEEP_VAPID_SUBJECT must all be set to enable Web Push",
+    );
+  }
+  if (!subject.startsWith("mailto:") && !subject.startsWith("https://")) {
+    throw new Error("MESHKEEP_VAPID_SUBJECT must be a mailto: address or an https URL");
+  }
+  return { publicKey, privateKey, subject };
+}
+
 export function loadConfig(): ServerConfig {
   const connection = env("MESHKEEP_CONNECTION") as ConnectionTransport | null;
   if (connection !== null && !TRANSPORTS.includes(connection)) {
@@ -95,5 +115,7 @@ export function loadConfig(): ServerConfig {
         : (env("MESHKEEP_MAP_TILES_ATTRIBUTION") ?? "© OpenStreetMap contributors"),
     webhookMasterKey: parseWebhookMasterKey(env("MESHKEEP_WEBHOOK_MASTER_KEY")),
     webhookFailureBurst: envInt("MESHKEEP_WEBHOOK_FAILURE_BURST", 5, 1, 100),
+    vapid: vapidConfig(),
+    pushFailureBurst: envInt("MESHKEEP_PUSH_FAILURE_BURST", 5, 1, 100),
   };
 }

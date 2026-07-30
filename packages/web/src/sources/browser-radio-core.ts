@@ -34,6 +34,37 @@ export interface IngestQueue {
   takeAll(): Promise<QueueEntry[]>;
 }
 
+/** A queued entry as actually persisted, stamped with its enqueue time for TTL/eviction. */
+export interface StoredQueueEntry extends QueueEntry {
+  enqueuedAt: number;
+}
+
+/** docs/pwa-feasibility.md cache/storage policy for the browser-direct ingest retry queue (#74). */
+export const INGEST_QUEUE_MAX_RECORDS = 100;
+export const INGEST_QUEUE_MAX_BYTES = 1024 * 1024;
+export const INGEST_QUEUE_TTL_MS = 24 * 60 * 60 * 1000;
+
+function entryByteSize(entry: QueueEntry): number {
+  return new TextEncoder().encode(JSON.stringify(entry.payload)).length;
+}
+
+/**
+ * Expire and FIFO-evict a stored queue down to the documented caps. Entries
+ * are assumed to already be in oldest-first (insertion) order. Applied on
+ * every read and write so an idle queue never grows unbounded or serves
+ * stale data once connectivity returns.
+ */
+export function pruneQueue(entries: StoredQueueEntry[], now: number): StoredQueueEntry[] {
+  let result = entries.filter((entry) => now - entry.enqueuedAt < INGEST_QUEUE_TTL_MS);
+  if (result.length > INGEST_QUEUE_MAX_RECORDS) {
+    result = result.slice(result.length - INGEST_QUEUE_MAX_RECORDS);
+  }
+  while (result.length > 0 && result.reduce((sum, entry) => sum + entryByteSize(entry), 0) > INGEST_QUEUE_MAX_BYTES) {
+    result = result.slice(1);
+  }
+  return result;
+}
+
 export function bytesToHex(bytes: Uint8Array): string {
   return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }

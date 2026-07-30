@@ -503,6 +503,23 @@ export const MIGRATIONS: string[] = [
   `
   ALTER TABLE webhook_subscriptions ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0;
   `,
+  // 18: Web Push subscriptions (issue #76 prototype). One row per browser
+  // endpoint, bound to the authenticated session that created it — deleted on
+  // logout (api/auth.ts) or when delivery repeatedly fails (a dead endpoint has
+  // no operator to resume it, unlike a paused webhook). No durable delivery
+  // queue: push is explicitly best-effort, so failed sends are not retried.
+  `
+  CREATE TABLE push_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_token_hash TEXT NOT NULL,
+    endpoint TEXT NOT NULL UNIQUE,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX idx_push_subscriptions_session ON push_subscriptions (session_token_hash);
+  `,
 ];
 
 export type Db = Database.Database;

@@ -51,3 +51,12 @@ export function saveConversationPreferences(preferences: ConversationPreferences
     // Preference updates still apply for this session when storage is unavailable.
   }
 }
+
+/** Local-data reset (#74). */
+export function clearConversationPreferences(): void {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // nothing persisted to clear
+  }
+}

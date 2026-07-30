@@ -17,6 +17,16 @@ function savedPreference(key: string, fallback: string): string {
   }
 }
 
+// Versioned static-asset cache worker (#74). Registered eagerly and
+// unconditionally — independent of the notification permission/opt-in flow,
+// which separately reuses this same registration as a display fallback.
+if ("serviceWorker" in navigator && window.isSecureContext) {
+  const version = encodeURIComponent(__APP_VERSION__);
+  void navigator.serviceWorker.register(`/notification-sw.js?v=${version}`, { type: "module" }).catch(() => {
+    // best-effort enhancement; the app works uncached
+  });
+}
+
 const savedTheme = savedPreference("meshkeep-theme", "system");
 const savedDensity = savedPreference("meshkeep-density", "comfortable");
 document.documentElement.dataset.theme =

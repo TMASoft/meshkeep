@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationId } from "../src/stores/app";
 import {
+  clearConversationPreferences,
   conversationPreferenceKey,
   savedConversationPreferences,
   saveConversationPreferences,
@@ -17,6 +18,9 @@ beforeEach(() => {
     getItem: () => stored,
     setItem: (_key: string, value: string) => {
       stored = value;
+    },
+    removeItem: () => {
+      stored = null;
     },
   });
 });
@@ -38,5 +42,14 @@ describe("conversation preferences", () => {
     stored = JSON.stringify({ valid: { archived: true, muted: false }, invalid: { archived: "yes" } });
 
     expect(savedConversationPreferences()).toEqual({ valid: { archived: true, muted: false } });
+  });
+
+  it("clearConversationPreferences drops everything persisted (local-data reset, #74)", () => {
+    const key = conversationPreferenceKey(1, dm);
+    saveConversationPreferences({ [key]: { archived: true, muted: true } });
+
+    clearConversationPreferences();
+
+    expect(savedConversationPreferences()).toEqual({});
   });
 });

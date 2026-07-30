@@ -1,6 +1,6 @@
 {
   "name": "@meshkeep/shared",
-  "version": "0.1.4-beta.23",
+  "version": "0.1.4-beta.24",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",

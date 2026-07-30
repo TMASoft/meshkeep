@@ -4,11 +4,16 @@ import {
   contactFromRaw,
   flushQueueOnce,
   ingestItemFromSync,
+  INGEST_QUEUE_MAX_BYTES,
+  INGEST_QUEUE_MAX_RECORDS,
+  INGEST_QUEUE_TTL_MS,
   localMessageFromItem,
+  pruneQueue,
   selfInfoFromRaw,
   takePendingAck,
   type IngestQueue,
   type QueueEntry,
+  type StoredQueueEntry,
 } from "../src/sources/browser-radio-core";
 
 const contact = (publicKey: string, name: string): Contact => ({
@@ -148,6 +153,39 @@ describe("takePendingAck", () => {
     expect(pending).toHaveLength(1);
     expect(takePendingAck(pending, 99)).toBeNull();
     expect(pending).toHaveLength(1);
+  });
+});
+
+describe("pruneQueue", () => {
+  const entry = (enqueuedAt: number, payload: unknown = 1): StoredQueueEntry => ({
+    kind: "self",
+    payload,
+    enqueuedAt,
+  });
+
+  it("drops entries past the 24h TTL but keeps fresher ones", () => {
+    const now = 1_000_000;
+    const stale = entry(now - INGEST_QUEUE_TTL_MS - 1);
+    const fresh = entry(now - 1);
+    expect(pruneQueue([stale, fresh], now)).toEqual([fresh]);
+  });
+
+  it("FIFO-evicts down to the max record count, keeping the newest", () => {
+    const now = 0;
+    const entries = Array.from({ length: INGEST_QUEUE_MAX_RECORDS + 5 }, (_, i) => entry(now, i));
+    const pruned = pruneQueue(entries, now);
+    expect(pruned).toHaveLength(INGEST_QUEUE_MAX_RECORDS);
+    expect((pruned[0]!.payload as number)).toBe(5);
+    expect((pruned.at(-1)!.payload as number)).toBe(INGEST_QUEUE_MAX_RECORDS + 4);
+  });
+
+  it("FIFO-evicts down to the 1 MiB byte cap, oldest first", () => {
+    const now = 0;
+    const big = "x".repeat(INGEST_QUEUE_MAX_BYTES - 10);
+    const entries = [entry(now, big), entry(now, "small-1"), entry(now, "small-2")];
+    const pruned = pruneQueue(entries, now);
+    // the oversized oldest entry is evicted first; the small ones fit easily
+    expect(pruned.map((e) => e.payload)).toEqual(["small-1", "small-2"]);
   });
 });
 

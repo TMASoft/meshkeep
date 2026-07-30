@@ -15,6 +15,23 @@ describe("configuration bounds", () => {
     expect(config.telemetryMonitorMinutes).toBe(30);
     expect(config.timelineRetentionDays).toBe(90);
     expect(config.webhookMasterKey).toBeNull();
+    expect(config.vapid).toBeNull();
+    expect(config.pushFailureBurst).toBe(5);
+  });
+
+  it("requires all three VAPID env vars together, or none", () => {
+    vi.stubEnv("MESHKEEP_VAPID_PUBLIC_KEY", "pub");
+    expect(() => loadConfig()).toThrow(/MESHKEEP_VAPID_PUBLIC_KEY, MESHKEEP_VAPID_PRIVATE_KEY, and MESHKEEP_VAPID_SUBJECT must all be set/);
+    vi.stubEnv("MESHKEEP_VAPID_PRIVATE_KEY", "priv");
+    vi.stubEnv("MESHKEEP_VAPID_SUBJECT", "mailto:ops@example.test");
+    expect(loadConfig().vapid).toEqual({ publicKey: "pub", privateKey: "priv", subject: "mailto:ops@example.test" });
+  });
+
+  it("rejects a VAPID subject that isn't mailto: or https:", () => {
+    vi.stubEnv("MESHKEEP_VAPID_PUBLIC_KEY", "pub");
+    vi.stubEnv("MESHKEEP_VAPID_PRIVATE_KEY", "priv");
+    vi.stubEnv("MESHKEEP_VAPID_SUBJECT", "ops@example.test");
+    expect(() => loadConfig()).toThrow(/MESHKEEP_VAPID_SUBJECT must be a mailto: address or an https URL/);
   });
 
   it("accepts only a base64 32-byte webhook master key", () => {
@@ -45,6 +62,8 @@ describe("configuration bounds", () => {
     ["MESHKEEP_TIMELINE_RETENTION_DAYS", "4000"],
     ["MESHKEEP_WEBHOOK_FAILURE_BURST", "0"],
     ["MESHKEEP_WEBHOOK_FAILURE_BURST", "101"],
+    ["MESHKEEP_PUSH_FAILURE_BURST", "0"],
+    ["MESHKEEP_PUSH_FAILURE_BURST", "101"],
   ];
 
   for (const [name, value] of outOfRange) {

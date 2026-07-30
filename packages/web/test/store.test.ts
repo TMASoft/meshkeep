@@ -25,11 +25,17 @@ vi.mock("../src/api/client", () => ({
 
 const notifyIncomingMock = vi.hoisted(() => vi.fn());
 const notifyAlertMock = vi.hoisted(() => vi.fn());
+const clearNotifyPrefMock = vi.hoisted(() => vi.fn());
+const clearNotifyDetailsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../src/notifications", () => ({
   notifyIncoming: notifyIncomingMock,
   notifyAlert: notifyAlertMock,
+  clearNotifyPref: clearNotifyPrefMock,
+  clearNotifyDetails: clearNotifyDetailsMock,
 }));
+
+const clearIngestQueueMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
 vi.mock("../src/sources/browser-radio", () => ({
   BrowserRadioSource: class {
@@ -45,6 +51,7 @@ vi.mock("../src/sources/browser-radio", () => ({
       return browserRadioMock.getChannels();
     }
   },
+  clearIngestQueue: clearIngestQueueMock,
 }));
 
 import { useAppStore, conversationKey } from "../src/stores/app";
@@ -106,6 +113,9 @@ beforeEach(() => {
   browserRadioMock.stop.mockResolvedValue();
   browserRadioMock.getChannels.mockReset();
   browserRadioMock.getChannels.mockResolvedValue([]);
+  clearIngestQueueMock.mockClear();
+  clearNotifyPrefMock.mockClear();
+  clearNotifyDetailsMock.mockClear();
 });
 
 describe("bootstrap and auth state", () => {
@@ -354,6 +364,61 @@ describe("browser radio ownership", () => {
     await expect(store.startBrowserRadio("webserial", true)).rejects.toThrow("No device selected");
     expect(apiMock).toHaveBeenCalledWith("/connection/claim", { method: "POST" });
     expect(store.browserRadio).toBeNull();
+  });
+});
+
+describe("local-data hygiene (#74)", () => {
+  it("clears the ingest queue on browser-radio disconnect (also covers a private-session switch)", async () => {
+    apiMock.mockResolvedValue({ ok: true, state: "standby" });
+    const store = useAppStore();
+    await store.startBrowserRadio("webserial", true);
+
+    await store.stopBrowserRadio(false);
+
+    expect(clearIngestQueueMock).toHaveBeenCalled();
+  });
+
+  it("clears the ingest queue before reloading on logout", async () => {
+    apiMock.mockResolvedValue({});
+    const reload = vi.fn();
+    vi.stubGlobal("location", { reload });
+    const store = useAppStore();
+
+    await store.logout();
+
+    expect(clearIngestQueueMock).toHaveBeenCalled();
+    // the notification-details opt-in must never survive to the next session (#75)
+    expect(clearNotifyDetailsMock).toHaveBeenCalled();
+    expect(reload).toHaveBeenCalled();
+    expect(clearIngestQueueMock.mock.invocationCallOrder[0]).toBeLessThan(reload.mock.invocationCallOrder[0]!);
+    vi.unstubAllGlobals();
+  });
+
+  it("resetLocalData clears the queue, versioned static caches, and local preferences, then reloads", async () => {
+    const cacheDelete = vi.fn().mockResolvedValue(true);
+    vi.stubGlobal("caches", {
+      keys: vi.fn().mockResolvedValue(["meshkeep-static-v1", "meshkeep-static-v0", "unrelated-cache"]),
+      delete: cacheDelete,
+    });
+    const removeItem = vi.fn();
+    vi.stubGlobal("localStorage", { removeItem });
+    const reload = vi.fn();
+    vi.stubGlobal("location", { reload });
+    const store = useAppStore();
+
+    await store.resetLocalData();
+
+    expect(clearIngestQueueMock).toHaveBeenCalled();
+    expect(clearNotifyPrefMock).toHaveBeenCalled();
+    expect(clearNotifyDetailsMock).toHaveBeenCalled();
+    // only the versioned static-asset caches are touched, never unrelated CacheStorage entries
+    expect(cacheDelete).toHaveBeenCalledWith("meshkeep-static-v1");
+    expect(cacheDelete).toHaveBeenCalledWith("meshkeep-static-v0");
+    expect(cacheDelete).not.toHaveBeenCalledWith("unrelated-cache");
+    expect(removeItem).toHaveBeenCalledWith("meshkeep-theme");
+    expect(removeItem).toHaveBeenCalledWith("meshkeep-density");
+    expect(reload).toHaveBeenCalled();
+    vi.unstubAllGlobals();
   });
 });
 

@@ -7,13 +7,17 @@ import AppIcon from "./components/AppIcon.vue";
 import LoginGate from "./components/LoginGate.vue";
 import {
   clearNotificationNavigator,
+  notificationPermissionBlocked,
   notificationsSupported,
   requestNotifyPermission,
+  savedNotifyDetails,
   savedNotifyPref,
+  saveNotifyDetails,
   saveNotifyPref,
   setNotificationNavigator,
   type NotifyPref,
 } from "./notifications";
+import { pushAvailableOnServer, pushSubscribed, pushSupported, subscribeToPush, unsubscribeFromPush } from "./push";
 
 const version = __APP_VERSION__;
 const store = useAppStore();
@@ -57,12 +61,41 @@ const density = ref<"comfortable" | "compact">(
 const media = window.matchMedia("(prefers-color-scheme: dark)");
 
 const notify = ref<NotifyPref>(savedNotifyPref());
-const notifyBlocked = ref(false);
+const notifyDetails = ref(savedNotifyDetails());
+const notifyBlocked = ref(notificationPermissionBlocked());
 const canNotify = notificationsSupported();
+
+// Background push (issue #76 prototype): a separate, experimental, best-effort
+// channel from the in-page notify preference above — the server must have
+// VAPID keys configured, and this browser must support the Push API.
+const pushEnabled = ref(false);
+const pushBusy = ref(false);
+const canPush = ref(false);
+if (pushSupported()) {
+  void Promise.all([pushAvailableOnServer(), pushSubscribed()]).then(([available, subscribed]) => {
+    canPush.value = available;
+    pushEnabled.value = subscribed;
+  });
+}
+
+async function togglePush(value: boolean) {
+  pushBusy.value = true;
+  try {
+    if (value) {
+      pushEnabled.value = await subscribeToPush();
+    } else {
+      await unsubscribeFromPush();
+      pushEnabled.value = false;
+    }
+  } finally {
+    pushBusy.value = false;
+  }
+}
 
 watch(notify, async (value, previous) => {
   if (value === "off") {
     saveNotifyPref("off");
+    notifyBlocked.value = false;
     return;
   }
   if (await requestNotifyPermission()) {
@@ -74,6 +107,17 @@ watch(notify, async (value, previous) => {
     notify.value = previous ?? "off";
   }
 });
+
+watch(notifyDetails, (value) => saveNotifyDetails(value));
+
+/**
+ * A browser permission revocation (via site settings) doesn't fire any
+ * in-page event, so re-check whenever the tab regains focus/visibility
+ * instead of only reacting to this page's own permission requests (#75).
+ */
+function refreshNotifyBlocked() {
+  notifyBlocked.value = notificationPermissionBlocked();
+}
 
 const navLinks = [
   { to: "/chat", label: "Comms", icon: "chat" as const },
@@ -153,6 +197,8 @@ onMounted(() => {
   media.addEventListener("change", handleSystemTheme);
   document.addEventListener("pointerdown", handlePointerDown);
   document.addEventListener("keydown", handleKeydown);
+  document.addEventListener("visibilitychange", refreshNotifyBlocked);
+  window.addEventListener("focus", refreshNotifyBlocked);
   setNotificationNavigator((id) => {
     void router.push("/chat");
     void store.openConversation(id);
@@ -164,10 +210,25 @@ onBeforeUnmount(() => {
   media.removeEventListener("change", handleSystemTheme);
   document.removeEventListener("pointerdown", handlePointerDown);
   document.removeEventListener("keydown", handleKeydown);
+  document.removeEventListener("visibilitychange", refreshNotifyBlocked);
+  window.removeEventListener("focus", refreshNotifyBlocked);
   clearNotificationNavigator();
 });
 
 const canLogout = computed(() => store.session?.passwordRequired && store.session.authorized);
+
+const resettingLocalData = ref(false);
+async function resetLocalData() {
+  if (!window.confirm("Reset local data? This clears the offline retry queue, cached assets, and saved preferences on this device.")) {
+    return;
+  }
+  resettingLocalData.value = true;
+  try {
+    await store.resetLocalData();
+  } finally {
+    resettingLocalData.value = false;
+  }
+}
 
 const stateColor = computed(() => {
   switch (store.connectionState) {
@@ -370,14 +431,51 @@ const connectionLabel = computed(() => (store.connectionState === "error" ? "Nee
               <span>{{ option.label }}</span>
             </label>
           </div>
+          <label v-if="canNotify && !notifyBlocked && notify !== 'off'" class="notify-details-toggle">
+            <input v-model="notifyDetails" type="checkbox" name="notify-details" />
+            <span>Show notification details</span>
+          </label>
           <p v-if="!canNotify" class="notify-hint">
             Needs a secure context — open MeshKeep over HTTPS or localhost (see docs/https.md).
           </p>
           <p v-else-if="notifyBlocked" class="notify-hint" role="alert">
             Notifications are blocked for this site — allow them in the browser's site settings, then try again.
           </p>
+          <p v-else-if="notify !== 'off' && notifyDetails" class="notify-hint">
+            Shows sender, message text, and alert values on the lock screen. Notifies while the tab is
+            hidden or another conversation is open. Turns off on sign-out or local-data reset.
+          </p>
           <p v-else-if="notify !== 'off'" class="notify-hint">
-            Notifies while the tab is hidden or another conversation is open.
+            Notifies with a generic "New MeshKeep message" — no sender, text, or alert values shown.
+          </p>
+          <label v-if="canPush" class="notify-details-toggle">
+            <input
+              type="checkbox"
+              name="push-enabled"
+              :checked="pushEnabled"
+              :disabled="pushBusy"
+              @change="togglePush(($event.target as HTMLInputElement).checked)"
+            />
+            <span>Enable background push (experimental)</span>
+          </label>
+          <p v-if="canPush" class="notify-hint">
+            Best-effort only — not guaranteed while MeshKeep is fully closed. Always generic
+            ("New MeshKeep message"), regardless of the details setting above. Ends on sign-out.
+          </p>
+        </fieldset>
+        <fieldset>
+          <legend>Local data</legend>
+          <button
+            type="button"
+            class="reset-local-data"
+            :disabled="resettingLocalData"
+            @click="resetLocalData"
+          >
+            {{ resettingLocalData ? "Resetting…" : "Reset local data" }}
+          </button>
+          <p class="notify-hint">
+            Clears the offline retry queue, cached assets, and saved preferences on this device.
+            Server-side messages, contacts, and settings are unaffected.
           </p>
         </fieldset>
       </section>
@@ -436,6 +534,10 @@ const connectionLabel = computed(() => (store.connectionState === "error" ? "Nee
 .appearance-panel fieldset:last-child { margin-bottom: 0; }
 .appearance-panel legend { margin-bottom: 7px; color: var(--text-muted); font-size: 12px; font-weight: 650; }
 .notify-hint { margin: 6px 0 0; color: var(--text-faint); font-size: 11px; line-height: 1.5; }
+.notify-details-toggle { display: flex; align-items: center; gap: 7px; margin-top: 9px; color: var(--text-muted); font-size: 12px; font-weight: 600; cursor: pointer; }
+.reset-local-data { width: 100%; min-height: 40px; border: 1px solid color-mix(in srgb, var(--amber) 35%, var(--border)); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--amber) 10%, var(--surface-2)); color: var(--amber); font-size: 12px; font-weight: 700; cursor: pointer; }
+.reset-local-data:hover:not(:disabled) { filter: brightness(1.05); }
+.reset-local-data:disabled { opacity: .6; cursor: not-allowed; }
 .segmented-control { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-1); padding: 3px; }
 .segmented-control.two-up { grid-template-columns: repeat(2, 1fr); }
 .segmented-control label { cursor: pointer; }

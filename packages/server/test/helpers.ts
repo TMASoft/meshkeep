@@ -32,6 +32,9 @@ export function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     mapTilesUrl: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     mapTilesAttribution: "© OpenStreetMap contributors",
     webhookMasterKey: null,
+    webhookFailureBurst: 5,
+    vapid: null,
+    pushFailureBurst: 5,
     ...overrides,
   };
 }

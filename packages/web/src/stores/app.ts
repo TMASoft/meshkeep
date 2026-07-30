@@ -19,14 +19,33 @@ import type {
 } from "@meshkeep/shared";
 import { wsToTimelineEvent } from "../timeline";
 import { api, ApiError, connectEvents, type WsStatus } from "../api/client";
-import { BrowserRadioSource, type BrowserRadioKind } from "../sources/browser-radio";
-import { notifyAlert, notifyIncoming } from "../notifications";
+import { BrowserRadioSource, clearIngestQueue, type BrowserRadioKind } from "../sources/browser-radio";
+import { clearNotifyDetails, clearNotifyPref, notifyAlert, notifyIncoming } from "../notifications";
+import { unsubscribeFromPush } from "../push";
 import {
+  clearConversationPreferences,
   conversationPreferenceKey,
   savedConversationPreferences,
   saveConversationPreferences,
   type ConversationPreference,
 } from "../conversation-preferences";
+
+// Must match STATIC_CACHE_PREFIX in public/sw-cache-logic.js — the versioned
+// static-asset cache is CacheStorage, not something this module writes to.
+const STATIC_CACHE_PREFIX = "meshkeep-static-";
+
+/** Local preference keys cleared on an explicit local-data reset (#74), besides notify/conversation prefs. */
+const LOCAL_APPEARANCE_KEYS = ["meshkeep-theme", "meshkeep-density"];
+
+async function clearStaticAssetCaches(): Promise<void> {
+  try {
+    if (typeof caches === "undefined") return;
+    const names = await caches.keys();
+    await Promise.all(names.filter((name) => name.startsWith(STATIC_CACHE_PREFIX)).map((name) => caches.delete(name)));
+  } catch {
+    // best-effort; quota/availability is browser-owned
+  }
+}
 
 // lives outside the store: holds a live connection object, must not be reactive
 let browserSource: BrowserRadioSource | null = null;
@@ -301,8 +320,36 @@ export const useAppStore = defineStore("app", {
     },
 
     async logout() {
+      // the server also deletes any push subscription bound to this session,
+      // but unsubscribing here stops the browser side too, not just the DB row
+      await unsubscribeFromPush().catch(() => {});
       await api("/auth/logout", { method: "POST" }).catch(() => {});
+      await clearIngestQueue();
+      // the notification-details opt-in must never carry over to the next session (#75)
+      clearNotifyDetails();
       // drop all in-memory state along with the session
+      location.reload();
+    },
+
+    /**
+     * Explicit local-data reset (#74): clears the browser-direct ingest retry
+     * queue, the versioned static-asset cache, and local preferences. Unlike
+     * logout this doesn't touch the server session.
+     */
+    async resetLocalData() {
+      await unsubscribeFromPush().catch(() => {});
+      await clearIngestQueue();
+      await clearStaticAssetCaches();
+      clearNotifyPref();
+      clearNotifyDetails();
+      clearConversationPreferences();
+      for (const key of LOCAL_APPEARANCE_KEYS) {
+        try {
+          localStorage.removeItem(key);
+        } catch {
+          // nothing persisted to clear
+        }
+      }
       location.reload();
     },
 
@@ -644,12 +691,19 @@ export const useAppStore = defineStore("app", {
       await Promise.all(refreshes).catch(() => {});
     },
 
-    /** Stop driving the radio from this browser; optionally hand it back to the server. */
+    /**
+     * Stop driving the radio from this browser; optionally hand it back to the
+     * server. Also covers a private-session switch, since starting a new
+     * browser-radio session always stops the previous one first (#74: the
+     * non-private retry queue must not survive a disconnect or session
+     * boundary).
+     */
     async stopBrowserRadio(claimServer: boolean) {
       const source = browserSource;
       browserSource = null;
       if (source) await source.stop().catch(() => {});
       this.browserRadio = null;
+      await clearIngestQueue();
       if (claimServer) {
         await api("/connection/claim", { method: "POST" }).catch(() => {});
       }

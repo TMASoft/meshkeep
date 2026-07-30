@@ -106,10 +106,23 @@ export class Auth {
   logout(req: Request, res: Response): void {
     const session = this.readSessionCookie(req);
     if (session) {
-      this.db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(hashToken(session));
+      const tokenHash = hashToken(session);
+      this.db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(tokenHash);
+      // a push subscription is bound to this session and must not survive it (#76)
+      this.db.prepare("DELETE FROM push_subscriptions WHERE session_token_hash = ?").run(tokenHash);
     }
     const secure = this.secureRequest(req) ? "; Secure" : "";
     res.setHeader("Set-Cookie", `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`);
+  }
+
+  /**
+   * The current request's session identity, for callers that bind a resource
+   * to "this authenticated browser" (push subscriptions, issue #76). Only
+   * meaningful behind `sessionGuard`, which already guarantees a valid session.
+   */
+  sessionTokenHash(req: Request): string | null {
+    const session = this.readSessionCookie(req);
+    return session ? hashToken(session) : null;
   }
 
   private readSessionCookie(req: Request): string | null {

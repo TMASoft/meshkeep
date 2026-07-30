@@ -1242,6 +1242,57 @@ export function buildApi(
     }),
   );
 
+  // ---- Web Push subscriptions (issue #76 prototype; best-effort, no exactly-once delivery) ----
+  // Session-only, like token management: a push subscription binds to "this
+  // authenticated browser" and a scoped bearer token has no such identity.
+  // A no-password deployment has no login and thus no session cookie at all
+  // (sessionGuard still admits it, matching every other route); there is no
+  // per-browser boundary to enforce there, so subscriptions share one bucket.
+  const NO_AUTH_PUSH_BUCKET = "no-password-required";
+  const pushSessionKey = (req: Request): string => auth.sessionTokenHash(req) ?? NO_AUTH_PUSH_BUCKET;
+  api.get(
+    "/push/vapid-public-key",
+    auth.sessionGuard,
+    handle((_req, res) => {
+      if (!deps.config.vapid) {
+        res.status(404).json({ error: "push is not configured" });
+        return;
+      }
+      res.json({ publicKey: deps.config.vapid.publicKey });
+    }),
+  );
+  const pushSubscribeSchema = z.object({
+    endpoint: z.string().url().max(2048),
+    keys: z.object({ p256dh: z.string().min(1), auth: z.string().min(1) }),
+  });
+  api.post(
+    "/push/subscribe",
+    auth.sessionGuard,
+    handle((req, res) => {
+      if (!deps.config.vapid) {
+        res.status(404).json({ error: "push is not configured" });
+        return;
+      }
+      const body = pushSubscribeSchema.parse(req.body);
+      manager.store.upsertPushSubscription({
+        sessionTokenHash: pushSessionKey(req),
+        endpoint: body.endpoint,
+        p256dh: body.keys.p256dh,
+        auth: body.keys.auth,
+      });
+      res.status(201).json({ ok: true });
+    }),
+  );
+  api.delete(
+    "/push/subscribe",
+    auth.sessionGuard,
+    handle((req, res) => {
+      const body = z.object({ endpoint: z.string().url().max(2048) }).parse(req.body);
+      manager.store.deletePushSubscriptionForSession(body.endpoint, pushSessionKey(req));
+      res.json({ ok: true });
+    }),
+  );
+
   // ---- API tokens (for the HLL plugin and other integrations) ----
   // Session-only: bearer tokens can never mint, rotate, list, or revoke tokens.
   api.get(

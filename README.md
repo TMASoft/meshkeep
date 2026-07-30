@@ -124,6 +124,8 @@ a BLE radio near your _browsing_ device is often better served by browser-direct
 | `MESHKEEP_LOG_LEVEL`                      | `info`                                           | stdout log verbosity: `debug`, `info`, `warn`, `error`                                               |
 | `MESHKEEP_WEBHOOK_MASTER_KEY`              | unset                                            | base64-encoded 32-byte deployment secret required to create, rotate, or deliver webhooks             |
 | `MESHKEEP_WEBHOOK_FAILURE_BURST`          | `5`                                              | consecutive terminal delivery failures before a webhook subscription auto-pauses (1–100)             |
+| `MESHKEEP_VAPID_PUBLIC_KEY` / `MESHKEEP_VAPID_PRIVATE_KEY` / `MESHKEEP_VAPID_SUBJECT` | all unset | Web Push (issue #76 prototype); all three or none — see [pwa-feasibility.md](docs/pwa-feasibility.md#push-delivery-76-prototype) |
+| `MESHKEEP_PUSH_FAILURE_BURST`             | `5`                                              | consecutive send failures before a dead push endpoint is removed (1–100)                              |
 
 Connection settings can also be changed at runtime from Radio → Connection; a saved
 override wins over the environment until you reset it. Settings can also be saved as
@@ -165,6 +167,7 @@ The two endpoints the hll-meshkeep plugin consumes:
 - `GET /api/v1/messages/recent?limit=20` — newest messages with resolved names
 - `GET /api/v1/messages/unknown-senders` — latest message for each unresolved DM sender prefix; use `sender=<prefix>` on message history, search, export, and read routes to access its conversation
 - `POST /api/v1/ingest/messages` — browser-direct sync records require a UUID `ingestionId`; retry the same record with the same ID, and use a new ID for an intentional repeat. The response and `message.new` event include that ID so offline browser rows can be replaced by their server IDs without losing a delivered or failed status.
+- `GET /api/v1/telemetry/export` — CSV or JSON download of own-radio battery and contacts' numeric telemetry, up to a 30-day window. See [telemetry export format](docs/telemetry-export.md).
 
 Outbound sends are queued. `POST /api/v1/messages` (and `POST /api/v1/contacts/:key/cli`) accept a
 message into a persisted retry queue and return `201` immediately with status `pending` — they

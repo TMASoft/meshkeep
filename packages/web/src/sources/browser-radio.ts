@@ -7,10 +7,12 @@ import {
   ingestItemFromSync,
   localMessageFromItem,
   newIngestionId,
+  pruneQueue,
   selfInfoFromRaw,
   type IngestItem,
   type IngestQueue,
   type QueueEntry,
+  type StoredQueueEntry,
 } from "./browser-radio-core";
 
 /**
@@ -608,6 +610,8 @@ function acquireRadioLock(): Promise<() => void> {
 }
 
 // ---- tiny IndexedDB queue for offline sync-backs ----
+// Bounded per docs/pwa-feasibility.md: max 100 records and 1 MiB, FIFO
+// eviction, 24h TTL, pruned on every read and write (see pruneQueue).
 
 function openQueueDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -620,15 +624,33 @@ function openQueueDb(): Promise<IDBDatabase> {
   });
 }
 
+function readAllEntries(db: IDBDatabase): Promise<StoredQueueEntry[]> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("ingest-queue", "readonly");
+    const request = tx.objectStore("ingest-queue").getAll();
+    request.onsuccess = () => resolve(request.result as StoredQueueEntry[]);
+    request.onerror = () => reject(request.error ?? new Error("queue read failed"));
+  });
+}
+
+/** Replace the whole store's contents (order preserved) in one transaction. */
+function writeAllEntries(db: IDBDatabase, entries: StoredQueueEntry[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("ingest-queue", "readwrite");
+    const store = tx.objectStore("ingest-queue");
+    store.clear();
+    for (const entry of entries) store.add(entry);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error ?? new Error("queue write failed"));
+  });
+}
+
 async function queuePut(entry: QueueEntry): Promise<void> {
   try {
     const db = await openQueueDb();
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction("ingest-queue", "readwrite");
-      tx.objectStore("ingest-queue").add(entry);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error ?? new Error("queue write failed"));
-    });
+    const existing = await readAllEntries(db);
+    const stored: StoredQueueEntry = { ...entry, enqueuedAt: Date.now() };
+    await writeAllEntries(db, pruneQueue([...existing, stored], Date.now()));
     db.close();
   } catch {
     // storage unavailable (private browsing etc.) — sync-back is lost but the
@@ -639,19 +661,22 @@ async function queuePut(entry: QueueEntry): Promise<void> {
 async function queueTakeAll(): Promise<QueueEntry[]> {
   try {
     const db = await openQueueDb();
-    const entries = await new Promise<QueueEntry[]>((resolve, reject) => {
-      const tx = db.transaction("ingest-queue", "readwrite");
-      const store = tx.objectStore("ingest-queue");
-      const read = store.getAll();
-      read.onsuccess = () => {
-        store.clear();
-        resolve(read.result as QueueEntry[]);
-      };
-      read.onerror = () => reject(read.error ?? new Error("queue read failed"));
-    });
+    const pruned = pruneQueue(await readAllEntries(db), Date.now());
+    await writeAllEntries(db, []);
     db.close();
-    return entries;
+    return pruned;
   } catch {
     return [];
+  }
+}
+
+/** Drop all queued sync-backs: logout, browser-radio disconnect, private-session switch, local-data reset. */
+export async function clearIngestQueue(): Promise<void> {
+  try {
+    const db = await openQueueDb();
+    await writeAllEntries(db, []);
+    db.close();
+  } catch {
+    // nothing to clear
   }
 }

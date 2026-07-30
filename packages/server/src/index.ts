@@ -15,6 +15,7 @@ import { attachWs } from "./api/ws.js";
 import { gracefulShutdown } from "./shutdown.js";
 import { logger } from "./logger.js";
 import { WebhookWorker, systemWebhookResolver, systemWebhookTransport } from "./webhooks/worker.js";
+import { PushWorker, webPushSender } from "./push/worker.js";
 
 const log = logger("meshkeep");
 
@@ -45,6 +46,9 @@ const webhookWorker = config.webhookMasterKey
       systemWebhookTransport,
       { failureBurst: config.webhookFailureBurst },
     )
+  : null;
+const pushWorker = config.vapid
+  ? new PushWorker(manager.store, bus, webPushSender(config.vapid), { failureBurst: config.pushFailureBurst })
   : null;
 
 const app = express();
@@ -87,6 +91,7 @@ async function shutdown(): Promise<void> {
   shuttingDown = true;
   log.info("shutting down");
   webhookWorker?.stop();
+  pushWorker?.stop();
   const result = await gracefulShutdown({ manager, wss, server, db });
   process.exit(result === "clean" ? 0 : 1);
 }
