@@ -15,7 +15,7 @@
   "dependencies": {
     "@liamcottle/meshcore.js": "^1.13.0",
     "@meshkeep/shared": "*",
-    "better-sqlite3": "^12.0.0",
+    "better-sqlite3": "^13.0.2",
     "express": "^4.21.0",
     "node-ble": "^1.13.0",
     "serialport": "^13.0.0",
